@@ -4,15 +4,24 @@ export interface TicketTier {
   name: TierName;
   priceCents: number;
   totalInventory: number;
+  perk: string; // short line on what this tier includes, shown on the tier card
 }
+
+export type PosterColor = "flame" | "acid" | "violet";
 
 export interface EventRecord {
   id: string;
   name: string;
   artist: string;
-  date: string; // ISO 8601
+  date: string; // ISO 8601 — show start time
+  doorsMinutesBeforeShow: number;
   venue: string;
+  venueAddress: string;
+  ageRestriction: string;
+  genres: string[];
+  supportActs: string[];
   description: string;
+  posterColor: PosterColor;
   tiers: TicketTier[];
 }
 
