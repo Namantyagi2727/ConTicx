@@ -14,6 +14,11 @@ export async function hyperswitchFetch(path: string, init?: RequestInit) {
 
   return fetch(`${BASE_URL}${path}`, {
     ...init,
+    // Next.js extends fetch with its own caching layer even for
+    // external URLs called from route handlers. Payment status is the
+    // one thing here that must never be served stale, so every call
+    // through this helper (create, cancel, retrieve) opts out.
+    cache: "no-store",
     headers: {
       "Content-Type": "application/json",
       "api-key": API_KEY,
