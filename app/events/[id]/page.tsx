@@ -19,10 +19,12 @@ export default async function EventPage({
   const event = getEvent(id);
   if (!event) notFound();
 
-  const availability: TierAvailability[] = event.tiers.map((tier) => ({
-    ...tier,
-    remaining: getRemainingInventory(event.id, tier.name, tier.totalInventory),
-  }));
+  const availability: TierAvailability[] = await Promise.all(
+    event.tiers.map(async (tier) => ({
+      ...tier,
+      remaining: await getRemainingInventory(event.id, tier.name, tier.totalInventory),
+    }))
+  );
 
   return (
     <main className="mx-auto max-w-2xl p-8">

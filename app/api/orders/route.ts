@@ -33,7 +33,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const remaining = getRemainingInventory(event.id, tier.name, tier.totalInventory);
+  const remaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
   if (quantity > remaining) {
     return NextResponse.json(
       { error: `Only ${remaining} ${tier.name} ticket(s) left` },
@@ -59,7 +59,7 @@ export async function POST(request: Request) {
   // Reserve the inventory immediately by writing the pending order —
   // getRemainingInventory subtracts pending + succeeded orders from
   // total inventory on every read.
-  createOrder(order);
+  await createOrder(order);
 
   const response = await hyperswitchFetch("/payments", {
     method: "POST",
