@@ -2,6 +2,7 @@
 
 import { Suspense, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
+import Link from "next/link";
 import QRCode from "qrcode";
 import { getEvent } from "@/lib/events";
 import { formatCents, formatDateStamp, formatTime } from "@/lib/format";
@@ -200,20 +201,40 @@ function Ticket({
       </div>
 
       {refunded ? (
-        <p className="mt-6 text-center font-mono text-xs text-text-faint">
-          This ticket is no longer valid for entry.
-        </p>
+        <div className="mt-6 text-center">
+          <p className="font-mono text-xs font-bold tracking-wide text-acid">
+            ✓ REFUND CONFIRMED
+          </p>
+          <p className="mt-2 font-body text-sm text-text-muted">
+            Your {formatCents(ticket.amountCents)} is on its way back to you
+            — it can take 5–10 business days to show up, depending on your
+            bank. This ticket is no longer valid for entry.
+          </p>
+          <Link
+            href="/"
+            className="mt-4 inline-block font-mono text-xs text-text underline underline-offset-4"
+          >
+            ← Browse other shows
+          </Link>
+        </div>
       ) : (
         <div className="mt-6 text-center">
           <button
             onClick={handleRefund}
             disabled={isRefunding}
-            className="border border-flame-dim px-5 py-2 font-mono text-xs font-bold tracking-wide text-flame transition-colors hover:bg-flame hover:text-ink disabled:opacity-50"
+            className="inline-flex items-center gap-2 border border-flame-dim px-5 py-2 font-mono text-xs font-bold tracking-wide text-flame transition-colors hover:bg-flame hover:text-ink disabled:opacity-50"
           >
+            {isRefunding && <span className="spinner" aria-hidden />}
             {isRefunding ? "CANCELLING…" : "CANCEL TICKET & REFUND"}
           </button>
+          <p className="mt-2 font-body text-xs text-text-faint">
+            You&apos;ll get a full refund, released back for other buyers.
+          </p>
           {refundError && (
-            <p className="mt-2 font-mono text-xs text-flame">{refundError}</p>
+            <p className="mt-2 font-mono text-xs text-flame">
+              {refundError} Nothing changed — try again, or check back in a
+              moment.
+            </p>
           )}
         </div>
       )}
@@ -287,11 +308,21 @@ function ConfirmationContent() {
   }, [paymentId]);
 
   if (!paymentId) {
-    return <StatusLine>No payment found.</StatusLine>;
+    return (
+      <StatusLine>
+        We couldn&apos;t find that payment.
+        <Link
+          href="/"
+          className="mt-3 block font-mono text-xs text-text underline underline-offset-4"
+        >
+          ← Browse shows
+        </Link>
+      </StatusLine>
+    );
   }
 
   if (!payment || orderLookup.kind === "loading") {
-    return <StatusLine>Checking payment status…</StatusLine>;
+    return <StatusLine showSpinner>Checking your payment status…</StatusLine>;
   }
 
   if (orderLookup.kind === "found") {
@@ -311,9 +342,29 @@ function ConfirmationContent() {
       );
     }
     if (order.status === "pending") {
-      return <StatusLine>Still processing your payment — check back in a moment.</StatusLine>;
+      return (
+        <StatusLine showSpinner>
+          Still confirming your payment — this usually only takes a few
+          seconds.
+        </StatusLine>
+      );
     }
-    return <StatusLine>Order status: {order.status}</StatusLine>;
+    if (order.status === "failed" || order.status === "expired") {
+      const failedEvent = getEvent(order.eventId);
+      return (
+        <StatusLine>
+          That payment didn&apos;t go through, so nothing was charged.
+          {failedEvent && (
+            <Link
+              href={`/events/${failedEvent.id}`}
+              className="mt-4 inline-block bg-flame px-4 py-2 font-display text-sm font-bold tracking-wide text-ink no-underline"
+            >
+              TRY AGAIN — {failedEvent.name.toUpperCase()}
+            </Link>
+          )}
+        </StatusLine>
+      );
+    }
   }
 
   // Fallback: this instance never had the order (cold start, or a
@@ -342,17 +393,32 @@ function ConfirmationContent() {
 
   return (
     <StatusLine>
-      Status: {payment.status}
+      We can&apos;t confirm this payment right now (status: {payment.status}).
       <span className="mt-1 block font-mono text-xs text-text-faint">
         Payment ID: {payment.paymentId}
       </span>
+      <Link
+        href="/"
+        className="mt-3 block font-mono text-xs text-text underline underline-offset-4"
+      >
+        ← Browse shows
+      </Link>
     </StatusLine>
   );
 }
 
-function StatusLine({ children }: { children: React.ReactNode }) {
+function StatusLine({
+  children,
+  showSpinner,
+}: {
+  children: React.ReactNode;
+  showSpinner?: boolean;
+}) {
   return (
     <div className="mx-auto max-w-sm border border-ink-line bg-ink-raised p-6 text-center">
+      {showSpinner && (
+        <span className="spinner mb-2 inline-block text-text-muted" aria-hidden />
+      )}
       <p className="font-body text-sm text-text-muted">{children}</p>
     </div>
   );
@@ -361,7 +427,7 @@ function StatusLine({ children }: { children: React.ReactNode }) {
 export default function ConfirmationPage() {
   return (
     <main className="flex flex-1 items-center justify-center px-6 py-16">
-      <Suspense fallback={<StatusLine>Loading…</StatusLine>}>
+      <Suspense fallback={<StatusLine showSpinner>Loading…</StatusLine>}>
         <ConfirmationContent />
       </Suspense>
     </main>
