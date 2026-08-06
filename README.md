@@ -20,28 +20,46 @@ always `tier.priceCents × quantity`, computed from the hardcoded event
 catalog in [`lib/events.ts`](lib/events.ts), never trusted from the request
 body.
 
+### Storage: Redis for orders/inventory, hardcoded catalog for events
+
+Orders and tier inventory counters live in [Upstash Redis](https://upstash.com)
+([`lib/store.ts`](lib/store.ts)); the event catalog stays a hardcoded module
+([`lib/events.ts`](lib/events.ts)). That split is deliberate, not
+inconsistent:
+
+- Orders and inventory are read-modify-write state that changes on every
+  purchase, and every serverless instance needs to see the same, current
+  copy of it. This app started with that state in a single in-memory `Map`,
+  which works fine locally but breaks in production: a Hyperswitch webhook
+  can land on a completely different Vercel instance than the one that
+  created the order, so an in-memory update on instance A is simply
+  invisible to instance B. Shared storage is a correctness requirement here,
+  not an optimization.
+- The event catalog is static and read-only — three hardcoded events, never
+  written to at runtime. There's nothing to synchronize across instances, so
+  a database round trip would only add latency for no benefit.
+
+Orders are stored as JSON values keyed by order id (`order:{id}`), using the
+Upstash SDK's automatic JSON serialization. Inventory is a plain integer per
+`(eventId, tierName)` (`inventory:{eventId}:{tierName}`), mutated with
+atomic `DECRBY`/`INCRBY` rather than derived by scanning orders — see
+"Atomic oversell protection" below.
+
 ### Inventory holds + lazy expiry with intent cancellation
 
-Orders and inventory live in a single in-memory `Map`
-([`lib/store.ts`](lib/store.ts)) — deliberate prototype scope, not a
-database. It survives Next.js dev hot-reloads and warm serverless
-invocations (attached to `globalThis`), but resets on a cold start or
-redeploy. Fine for a live demo, not for production.
-
 Placing an order writes a `"pending"` order with a `holdExpiresAt` 10
-minutes out. Remaining inventory for a tier is computed on every read by
-summing the quantities of all `"pending"` + `"succeeded"` orders for that
-tier and subtracting from its total — not a separately maintained counter
-that could drift.
+minutes out and atomically reserves its inventory (decrements the counter).
 
 There's no background timer expiring holds (this runs on serverless —
 nothing guarantees a timer keeps firing between requests). Instead, expiry
-is lazy: every store read/write first checks for `"pending"` orders whose
-hold has passed, and for each one, **cancels the Hyperswitch payment intent
-before** marking the order expired:
+is lazy: every store read/write first checks a Redis sorted set of pending
+order ids scored by `holdExpiresAt` (`ZRANGEBYSCORE ... -inf <now>` finds
+exactly the expired ones, no scan of every order key needed), and for each
+expired one, **cancels the Hyperswitch payment intent before** marking the
+order expired:
 
 - Cancel succeeds → the intent was still genuinely unpaid → order becomes
-  `"expired"`, inventory releases.
+  `"expired"`, inventory releases (atomic `INCRBY`).
 - Cancel is rejected (Hyperswitch returns 400 because the intent already
   moved past a cancellable state — succeeded, or mid-flight) → the order is
   treated as paid and its inventory is **not** released. A later webhook or
@@ -52,11 +70,26 @@ before** marking the order expired:
 This ordering exists specifically to avoid reselling a seat that was paid
 for in the same window its hold happened to expire. See the comment above
 `reapExpiredHolds` in `lib/store.ts` for the full reasoning, including a
-concurrency bug that was caught and fixed during testing: two tiers'
+concurrency bug that was caught and fixed during testing (against the
+original in-memory version, still relevant to the Redis one): two tiers'
 availability checks running concurrently (`Promise.all`) could both see the
 same expired order and race to cancel the same payment twice. Fixed with a
-single in-flight promise so concurrent callers join one reap pass instead
-of starting duplicates.
+single in-flight promise per instance so concurrent callers on that
+instance join one reap pass instead of starting duplicates — Redis's own
+atomicity is what keeps two *different* instances reaping at the same
+moment from causing the same problem.
+
+### Atomic oversell protection
+
+`reserveInventory` decrements a tier's counter with a single atomic `DECRBY`
+— Redis serializes concurrent commands against the same key, so two
+simultaneous purchase requests (from the same instance or different ones)
+can never both read "1 left" and both succeed. If a decrement takes the
+counter below zero, it's immediately rolled back with a compensating
+`INCRBY` and that request is told the tier is sold out. The route handler
+also does a plain read-and-compare first, but only for a friendlier error
+message in the common case — the atomic decrement is what actually
+prevents overselling, not the pre-check.
 
 ### Webhook-driven status, never the browser alone
 
@@ -84,13 +117,14 @@ processing" message.
 
 Every Hyperswitch payment is created with `orderId`, `eventId`, `tierName`,
 `quantity`, and `unitPrice` attached as metadata. The confirmation page
-tries the in-memory order store first (authoritative — reflects
-webhook-driven updates), and only falls back to reconstructing the ticket
-display from the payment's own metadata if the order isn't found there —
-which happens if a different serverless instance created it and this one's
-memory never had it. The metadata travels with the payment regardless of
-which instance handles the request, so the ticket still renders correctly
-either way.
+tries the Redis order store first (authoritative — reflects webhook-driven
+updates), and only falls back to reconstructing the ticket display from the
+payment's own metadata if the order isn't found there. With shared Redis
+storage this fallback should be rare in practice (unlike the old in-memory
+version, where it was the normal path whenever a different instance handled
+the request) — it's kept as a last resort for something like the Redis
+database itself being unreachable. The metadata travels with the payment
+regardless, so the ticket still renders correctly either way.
 
 ## Local setup
 
@@ -107,6 +141,8 @@ keys on the dashboard):
 | `HYPERSWITCH_API_KEY` | Secret key — server-side only, never sent to the browser |
 | `NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY` | Publishable key — used by the checkout widget |
 | `HYPERSWITCH_BASE_URL` | `https://sandbox.hyperswitch.io` |
+| `UPSTASH_REDIS_REST_URL` | From an Upstash Redis database's "REST API" tab (console.upstash.com) |
+| `UPSTASH_REDIS_REST_TOKEN` | Same tab as above |
 
 ```bash
 npm run dev
