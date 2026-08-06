@@ -1,26 +1,112 @@
 @import "tailwindcss";
 
+/*
+  Design system: gig-poster / ticket-stub.
+  Dark ink chrome throughout (venues, night shows), paper-stock
+  surfaces reserved for ticket/receipt artifacts, and a small set of
+  riso-style spot colors — the idea being each show only gets one or
+  two "ink" colors, same as a real screen-printed flyer.
+*/
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --color-ink: #121016;
+  --color-ink-raised: #1d1a22;
+  --color-ink-line: #322d3a;
+
+  --color-paper: #f3eee1;
+  --color-paper-dim: #e6ded0;
+  --color-paper-ink: #1a1712;
+
+  --color-flame: #ff5a29;
+  --color-flame-dim: #c9431c;
+  --color-acid: #d7ff3e;
+  --color-violet: #8f7bff;
+
+  --color-text: #f3eee1;
+  --color-text-muted: #a89fb0;
+  --color-text-faint: #6f6779;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+  --color-ink: var(--color-ink);
+  --color-ink-raised: var(--color-ink-raised);
+  --color-ink-line: var(--color-ink-line);
+  --color-paper: var(--color-paper);
+  --color-paper-dim: var(--color-paper-dim);
+  --color-paper-ink: var(--color-paper-ink);
+  --color-flame: var(--color-flame);
+  --color-flame-dim: var(--color-flame-dim);
+  --color-acid: var(--color-acid);
+  --color-violet: var(--color-violet);
+  --color-text: var(--color-text);
+  --color-text-muted: var(--color-text-muted);
+  --color-text-faint: var(--color-text-faint);
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --font-display: var(--font-display);
+  --font-body: var(--font-body);
+  --font-mono: var(--font-mono);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-ink);
+  color: var(--color-text);
+  font-family: var(--font-body), ui-sans-serif, system-ui, sans-serif;
+}
+
+::selection {
+  background: var(--color-flame);
+  color: var(--color-ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-acid);
+  outline-offset: 2px;
+}
+
+/* Fine paper grain — used on paper-stock surfaces (ticket, receipt). */
+.grain {
+  position: relative;
+}
+.grain::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.05;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+}
+
+/* Halftone dot field — poster hero backgrounds. */
+.halftone {
+  background-image: radial-gradient(
+    currentColor 1px,
+    transparent 1.4px
+  );
+  background-size: 7px 7px;
+}
+
+/* Signature moment: the confirmation ticket "prints in" on load. */
+@keyframes ticket-print-in {
+  from {
+    opacity: 0;
+    transform: translateY(-28px) rotate(0deg);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) rotate(-1.5deg);
+  }
+}
+.ticket-print-in {
+  animation: ticket-print-in 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }
