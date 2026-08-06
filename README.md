@@ -16,9 +16,16 @@ only `NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY` is client-visible.
 
 The client never gets to say how much it's paying. `POST /api/orders`
 accepts only `eventId`, `tierName`, and `quantity` — the charge amount is
-always `tier.priceCents × quantity`, computed from the hardcoded event
-catalog in [`lib/events.ts`](lib/events.ts), never trusted from the request
-body.
+always computed here, from the hardcoded event catalog in
+[`lib/events.ts`](lib/events.ts), never trusted from the request body:
+subtotal is `tier.priceCents × quantity`, plus a flat `SERVICE_FEE_RATE`
+(10%, [`lib/constants.ts`](lib/constants.ts)) service fee on that
+subtotal. Both the fee and the subtotal are returned from the order-create
+response and shown as their own line items in the checkout order summary
+— nothing is folded silently into a bigger number. The Hyperswitch
+payment, and any later refund, both use the fee-inclusive total
+(`Order.amountCents`), so a refund always returns the full amount actually
+charged, fee included.
 
 ### Storage: Redis for orders/inventory, hardcoded catalog for events
 
@@ -224,7 +231,8 @@ dashboard's business profile settings.
 ## Testing a payment
 
 1. Go home → pick an event → pick a tier and quantity → **Get tickets**.
-2. On checkout, watch the countdown and pay with test card
+2. On checkout, check the order summary breaks out the ticket subtotal,
+   a 10% service fee, and the total separately — then pay with test card
    `4242 4242 4242 4242`, any future expiry date, any CVC.
 3. You should land on the confirmation page with a ticket: event details,
    tier, quantity, order ID, and a QR code encoding the order ID.
