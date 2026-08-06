@@ -11,7 +11,7 @@ import {
   useWidgets,
 } from "@juspay-tech/react-hyper-js";
 import { getEvent } from "@/lib/events";
-import { formatCents, formatEventDate } from "@/lib/format";
+import { formatCents } from "@/lib/format";
 
 // Load Hyper once, outside the component, so it isn't recreated on every render.
 // Guarded to the browser only — loadHyper touches `document`, which
@@ -23,6 +23,20 @@ const hyperPromise =
         { env: "SANDBOX" }
       )
     : null;
+
+// Matches the widget's built-in dark theme to the app's own palette,
+// so the hosted card iframe doesn't drop in as a bright rectangle on
+// an otherwise dark page.
+const HYPER_APPEARANCE = {
+  theme: "midnight",
+  variables: {
+    colorPrimary: "#ff5a29",
+    colorBackground: "#1d1a22",
+    colorText: "#f3eee1",
+    colorDanger: "#ff5a29",
+    borderRadius: "2px",
+  },
+};
 
 interface OrderCreateResponse {
   clientSecret: string;
@@ -78,79 +92,139 @@ function CheckoutContent() {
   }, [order]);
 
   if (!event || !tier || !Number.isInteger(quantity) || quantity < 1) {
-    return <p>Invalid order — go back and pick an event.</p>;
+    return (
+      <StatusCard title="Invalid order" tone="flame">
+        Go back and pick an event.
+        <Link href="/" className="mt-4 block underline underline-offset-4">
+          ← All shows
+        </Link>
+      </StatusCard>
+    );
   }
 
   if (error) {
     return (
-      <div>
-        <p className="text-red-600">{error}</p>
-        <Link href={`/events/${event.id}`} className="mt-4 inline-block underline">
+      <StatusCard title="Couldn't reserve those tickets" tone="flame">
+        {error}
+        <Link
+          href={`/events/${event.id}`}
+          className="mt-4 block underline underline-offset-4"
+        >
           Back to {event.name}
         </Link>
-      </div>
+      </StatusCard>
     );
   }
 
   if (!order) {
-    return <p>Reserving your tickets…</p>;
+    return <StatusCard title="Reserving your tickets…" tone="muted" />;
   }
 
   const expired = secondsLeft !== null && secondsLeft <= 0;
 
   if (expired) {
     return (
-      <div>
-        <h1 className="text-xl font-semibold">Reservation expired</h1>
-        <p className="mt-2 text-gray-600">
-          Your 10-minute hold ran out, so the tickets were released back into
-          the pool.
-        </p>
-        <Link href={`/events/${event.id}`} className="mt-4 inline-block underline">
+      <StatusCard title="Reservation expired" tone="flame">
+        Your 10-minute hold ran out, so the tickets were released back into
+        the pool.
+        <Link
+          href={`/events/${event.id}`}
+          className="mt-4 block underline underline-offset-4"
+        >
           Back to {event.name}
         </Link>
-      </div>
+      </StatusCard>
     );
   }
 
   const minutes = secondsLeft !== null ? Math.floor(secondsLeft / 60) : 10;
   const seconds = secondsLeft !== null ? secondsLeft % 60 : 0;
+  const urgent = secondsLeft !== null && secondsLeft <= 60;
 
   return (
     <div>
-      <h1 className="text-xl font-semibold">Checkout</h1>
-
-      <div className="mt-4 rounded-md border border-gray-200 p-4">
-        <p className="font-medium">{event.name}</p>
-        <p className="text-sm text-gray-600">
-          {formatEventDate(event.date)} · {event.venue}
-        </p>
-        <p className="mt-2 text-sm">
-          {quantity} × {tier.name} ({formatCents(tier.priceCents)} each)
-        </p>
-        <p className="mt-1 font-medium">Total: {formatCents(order.amountCents)}</p>
-      </div>
-
-      <p className="mt-4 text-sm text-gray-600">
-        Reservation held for{" "}
-        <span className="font-mono">
+      <div className="flex items-baseline justify-between">
+        <h1 className="font-display text-2xl font-bold tracking-wide">
+          CHECKOUT
+        </h1>
+        <div
+          className={`font-mono text-2xl font-bold tabular-nums ${
+            urgent ? "animate-pulse text-flame" : "text-text"
+          }`}
+        >
           {String(minutes).padStart(2, "0")}:{String(seconds).padStart(2, "0")}
-        </span>
+        </div>
+      </div>
+      <p className="text-right font-mono text-[11px] text-text-faint">
+        RESERVATION HOLDS
       </p>
 
-      <div className="mt-4">
+      {/* Receipt-style order summary */}
+      <div className="grain relative mt-6 border border-ink-line bg-ink-raised p-5">
+        <p className="font-display text-xl font-extrabold tracking-tight">
+          {event.name}
+        </p>
+        <p className="font-mono text-xs text-text-faint">
+          {event.artist} · {event.venue}
+        </p>
+
+        <div className="mt-4 border-t border-dashed border-ink-line pt-4">
+          <div className="flex items-center justify-between font-mono text-sm">
+            <span className="text-text-muted">
+              {quantity} × {tier.name} @ {formatCents(tier.priceCents)}
+            </span>
+            <span>{formatCents(order.amountCents)}</span>
+          </div>
+        </div>
+
+        <div className="mt-3 flex items-center justify-between border-t border-ink-line pt-3">
+          <span className="font-display text-sm font-bold tracking-wide text-text-faint">
+            TOTAL
+          </span>
+          <span className="font-mono text-xl font-bold text-flame">
+            {formatCents(order.amountCents)}
+          </span>
+        </div>
+      </div>
+
+      <div className="mt-6 border border-ink-line bg-ink-raised p-5">
         <HyperElements
-          options={{ clientSecret: order.clientSecret }}
+          options={{ clientSecret: order.clientSecret, appearance: HYPER_APPEARANCE }}
           hyper={hyperPromise}
         >
-          <PaymentForm />
+          <PaymentForm total={formatCents(order.amountCents)} />
         </HyperElements>
       </div>
     </div>
   );
 }
 
-function PaymentForm() {
+function StatusCard({
+  title,
+  tone,
+  children,
+}: {
+  title: string;
+  tone: "flame" | "muted";
+  children?: React.ReactNode;
+}) {
+  return (
+    <div className="border border-ink-line bg-ink-raised p-6">
+      <h1
+        className={`font-display text-xl font-bold ${
+          tone === "flame" ? "text-flame" : "text-text"
+        }`}
+      >
+        {title}
+      </h1>
+      {children && (
+        <div className="mt-2 font-body text-sm text-text-muted">{children}</div>
+      )}
+    </div>
+  );
+}
+
+function PaymentForm({ total }: { total: string }) {
   const hyper = useHyper();
   const widgets = useWidgets();
   const router = useRouter();
@@ -207,12 +281,12 @@ function PaymentForm() {
       <button
         type="submit"
         disabled={isSubmitting}
-        className="mt-4 w-full rounded-md bg-black px-4 py-2 text-white disabled:opacity-50"
+        className="mt-4 w-full bg-flame py-3 text-center font-display text-lg font-bold tracking-wide text-ink transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50"
       >
-        {isSubmitting ? "Processing…" : "Pay"}
+        {isSubmitting ? "PROCESSING…" : `PAY ${total}`}
       </button>
       {errorMessage && (
-        <p className="mt-2 text-sm text-red-600">{errorMessage}</p>
+        <p className="mt-2 font-mono text-xs text-flame">{errorMessage}</p>
       )}
     </form>
   );
@@ -220,8 +294,8 @@ function PaymentForm() {
 
 export default function CheckoutPage() {
   return (
-    <main className="mx-auto max-w-md p-8">
-      <Suspense fallback={<p>Loading…</p>}>
+    <main className="mx-auto w-full max-w-md flex-1 px-6 py-10 sm:py-16">
+      <Suspense fallback={<StatusCard title="Loading…" tone="muted" />}>
         <CheckoutContent />
       </Suspense>
     </main>
