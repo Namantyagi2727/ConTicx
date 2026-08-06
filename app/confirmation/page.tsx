@@ -2,12 +2,16 @@
 
 import { Suspense, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
+import QRCode from "qrcode";
+import { getEvent } from "@/lib/events";
+import { formatCents, formatEventDate } from "@/lib/format";
 
 interface PaymentStatus {
   paymentId: string;
   status: string;
   amount: number;
   currency: string;
+  metadata: Record<string, string> | null;
 }
 
 // After a 3DS challenge, Hyperswitch redirects here with
@@ -24,10 +28,62 @@ function extractPaymentId(searchParams: URLSearchParams): string | null {
   return null;
 }
 
+function Ticket({ payment }: { payment: PaymentStatus }) {
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const orderId = payment.metadata?.orderId;
+  const eventId = payment.metadata?.eventId;
+  const tierName = payment.metadata?.tierName;
+  const quantity = payment.metadata?.quantity;
+
+  // Event details come from the static catalog via metadata.eventId
+  // rather than the in-memory order store, so the ticket still renders
+  // correctly even if that store lost the order (cold start, redeploy).
+  const event = eventId ? getEvent(eventId) : undefined;
+
+  useEffect(() => {
+    if (!orderId) return;
+    QRCode.toDataURL(orderId, { width: 220 }).then(setQrDataUrl);
+  }, [orderId]);
+
+  return (
+    <div className="rounded-lg border border-gray-200 p-6 text-center">
+      <h1 className="text-xl font-semibold text-green-700">
+        Payment successful
+      </h1>
+
+      {event && (
+        <div className="mt-4 text-left">
+          <p className="font-medium">{event.name}</p>
+          <p className="text-sm text-gray-600">
+            {formatEventDate(event.date)} · {event.venue}
+          </p>
+          <p className="mt-2 text-sm">
+            {quantity} × {tierName}
+          </p>
+          <p className="text-sm">Total paid: {formatCents(payment.amount)}</p>
+        </div>
+      )}
+
+      {qrDataUrl && (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={qrDataUrl}
+          alt="Ticket QR code"
+          className="mx-auto mt-4"
+          width={220}
+          height={220}
+        />
+      )}
+
+      <p className="mt-4 text-xs text-gray-400">Order ID: {orderId}</p>
+    </div>
+  );
+}
+
 function ConfirmationContent() {
   const searchParams = useSearchParams();
   const paymentId = extractPaymentId(searchParams);
-  const [status, setStatus] = useState<PaymentStatus | null>(null);
+  const [payment, setPayment] = useState<PaymentStatus | null>(null);
 
   useEffect(() => {
     if (!paymentId) return;
@@ -36,30 +92,25 @@ function ConfirmationContent() {
     // source of truth.
     fetch(`/api/payments/${paymentId}`)
       .then((res) => res.json())
-      .then(setStatus);
+      .then(setPayment);
   }, [paymentId]);
 
   if (!paymentId) {
     return <p>No payment found.</p>;
   }
 
-  if (!status) {
+  if (!payment) {
     return <p>Checking payment status…</p>;
+  }
+
+  if (payment.status === "succeeded") {
+    return <Ticket payment={payment} />;
   }
 
   return (
     <div>
-      <h1 className="text-xl font-semibold">
-        {status.status === "succeeded"
-          ? "Payment successful"
-          : `Status: ${status.status}`}
-      </h1>
-      <p className="mt-2 text-sm text-gray-600">
-        Payment ID: {status.paymentId}
-      </p>
-      <p className="text-sm text-gray-600">
-        Amount: {(status.amount / 100).toFixed(2)} {status.currency}
-      </p>
+      <h1 className="text-xl font-semibold">Status: {payment.status}</h1>
+      <p className="mt-2 text-sm text-gray-600">Payment ID: {payment.paymentId}</p>
     </div>
   );
 }
