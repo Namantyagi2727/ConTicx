@@ -85,6 +85,24 @@ body {
   background-size: 7px 7px;
 }
 
+/* Small inline loading indicator for async buttons/status lines —
+   currentColor so it matches whatever text it sits next to. */
+.spinner {
+  display: inline-block;
+  width: 0.9em;
+  height: 0.9em;
+  vertical-align: -0.15em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* Signature moment: the confirmation ticket "prints in" on load. */
 @keyframes ticket-print-in {
   from {
