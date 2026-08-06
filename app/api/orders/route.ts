@@ -2,7 +2,12 @@ import { randomUUID } from "crypto";
 import { NextResponse } from "next/server";
 import { getEvent } from "@/lib/events";
 import { HOLD_DURATION_MS, MAX_QUANTITY_PER_ORDER } from "@/lib/constants";
-import { createOrder, getRemainingInventory, updateOrderStatus } from "@/lib/store";
+import {
+  createOrder,
+  getRemainingInventory,
+  reserveInventory,
+  updateOrderStatus,
+} from "@/lib/store";
 import { hyperswitchFetch } from "@/lib/hyperswitch";
 import type { Order } from "@/lib/types";
 
@@ -33,10 +38,24 @@ export async function POST(request: Request) {
     );
   }
 
+  // Friendly pre-check for a nice error message in the common case —
+  // the atomic reserve below is what actually prevents overselling
+  // under real concurrency; this just avoids a wasted Hyperswitch call
+  // when it's obviously sold out.
   const remaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
   if (quantity > remaining) {
     return NextResponse.json(
       { error: `Only ${remaining} ${tier.name} ticket(s) left` },
+      { status: 400 }
+    );
+  }
+
+  const reserved = await reserveInventory(event.id, tier.name, quantity, tier.totalInventory);
+  if (!reserved) {
+    // Lost a race with another buyer between the check above and here.
+    const nowRemaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
+    return NextResponse.json(
+      { error: `Only ${nowRemaining} ${tier.name} ticket(s) left` },
       { status: 400 }
     );
   }
@@ -56,9 +75,6 @@ export async function POST(request: Request) {
     createdAt: Date.now(),
   };
 
-  // Reserve the inventory immediately by writing the pending order —
-  // getRemainingInventory subtracts pending + succeeded orders from
-  // total inventory on every read.
   await createOrder(order);
 
   const response = await hyperswitchFetch("/payments", {
@@ -80,12 +96,19 @@ export async function POST(request: Request) {
   const data = await response.json();
 
   if (!response.ok) {
-    // Free the hold immediately instead of waiting for it to expire.
-    updateOrderStatus(order.id, "failed");
+    // updateOrderStatus releases the reservation as a side effect of
+    // moving a pending order to "failed" — see lib/store.ts.
+    await updateOrderStatus(order.id, "failed");
     return NextResponse.json({ error: data }, { status: response.status });
   }
 
+  // The order was already persisted as "pending" above (before we knew
+  // paymentId, since order.id needs to exist to embed in Hyperswitch's
+  // metadata). Persist again now that paymentId is known — Redis has
+  // no shared object reference to mutate in place the way the old
+  // in-memory Map did.
   order.paymentId = data.payment_id;
+  await createOrder(order);
 
   return NextResponse.json({
     clientSecret: data.client_secret,
