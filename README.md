@@ -113,6 +113,72 @@ times, 2s apart) if status is still `"pending"` when it first loads, giving
 the webhook a short window to land before falling back to a "still
 processing" message.
 
+### Redirect-based payment methods (PayPal)
+
+Card payments confirm in-page — `hyper.confirmPayment({ redirect: "if_required" })`
+resolves with a status directly, no navigation. Wallet methods (PayPal,
+GPay, Apple Pay) don't: they render as their own button inside the
+Unified Checkout widget and handle their own click-to-redirect
+internally, which means they **never call our `confirmPayment()` handler
+at all** and never see `confirmParams.return_url`. Hyperswitch's docs
+call this out as a separate, mandatory option — `options.wallets.walletReturnUrl`
+on `<UnifiedCheckout>` itself — and the checkout page was missing it
+entirely (`<UnifiedCheckout id="unified-checkout" />`, no options) until
+this was reviewed for the PayPal routing change. Both return URLs now
+point at `/confirmation`.
+
+The confirmation page's redirect handling itself didn't need to change:
+Hyperswitch appends `payment_intent_client_secret` to the return URL for
+*any* redirect it initiates — 3DS challenges and wallet flows alike — and
+`extractPaymentId` already fell back to parsing that (it was only the
+comment above it that wrongly implied this was 3DS-specific). Everything
+downstream of extracting a payment id is agnostic to how the shopper got
+there: no client-side state from the checkout page carries over (the
+browser fully navigates away to PayPal and back), so the confirmation
+page re-derives everything from Redis and payment metadata rather than
+anything left over in memory — which was already true before this
+change, since a hard reload needed to work regardless.
+
+If a PayPal hold happens to run past its 10-minute window while the
+shopper is off on PayPal's site, the existing cancel-first reap logic
+above handles it exactly like a slow card confirmation would: no
+PayPal-specific case was needed.
+
+### Refunds
+
+`POST /api/orders/[id]/refund` — full refunds only, no partial amounts
+and no refund-window policy (e.g. "only up to 24h before the event");
+those would be checks added in front of this route using data it already
+has, not changes to how the refund call itself works. Flow:
+
+1. Reject if the order isn't `"succeeded"` — except `"refunded"` already,
+   which returns success immediately without calling Hyperswitch again.
+   This is the primary idempotency guard: a duplicate or retried request
+   is a safe no-op.
+2. Call Hyperswitch `POST /refunds` with `payment_id` and the order's
+   full `amountCents` explicitly (never omitted/implicit).
+3. Only a `status: "succeeded"` response is treated as done.
+   `"pending"`/`"review"` are surfaced as an error instead of tracked
+   further — resolving those asynchronously would need a refund webhook
+   handler, which is out of scope here.
+4. On success, `markOrderRefunded` flips the order and releases its
+   inventory with the same atomic `INCRBY` used elsewhere.
+
+Verified live against the real sandbox (not just the happy path): a
+genuinely-confirmed test-card payment refunded successfully and released
+its seat; the identical request repeated afterward returned the same
+success without a second Hyperswitch call or a second inventory release;
+and refunding a payment before it had actually succeeded at Hyperswitch
+was correctly rejected — Hyperswitch validates refunds against its own
+true payment state, which caught a real gap in one of the test setups
+along the way (a synthetic webhook had marked an order `"succeeded"` in
+Redis without the underlying payment ever actually being confirmed).
+
+The confirmation page shows a "Cancel ticket & refund" button on any
+`"succeeded"` ticket; a `"refunded"` order renders the same ticket in a
+visibly inactive state (greyed out, QR code desaturated, "no longer valid
+for entry") rather than disappearing.
+
 ### Metadata fallback
 
 Every Hyperswitch payment is created with `orderId`, `eventId`, `tierName`,
@@ -165,6 +231,51 @@ dashboard's business profile settings.
 4. To see the expired-hold state, let a checkout session's 10-minute
    countdown run out without paying — the payment widget is replaced with
    a "reservation expired" message linking back to the event.
+5. On the confirmation page, click **Cancel ticket & refund** to test the
+   refund flow — the ticket should switch to a greyed-out "refunded"
+   state.
 
-Verify the payment in the Hyperswitch sandbox dashboard to confirm it
-actually cleared, not just that the UI looked right.
+Verify both the payment and the refund in the Hyperswitch sandbox
+dashboard to confirm they actually cleared, not just that the UI looked
+right.
+
+## Spike test
+
+`scripts/spike-test.ts` fires a configurable number of concurrent
+`POST /api/orders` requests at one event/tier and reports how many
+succeeded vs. were rejected as sold out, plus the tier's inventory count
+before and after — read straight from Redis, not from the UI, so it's
+checking the actual counter rather than a display value. This formalizes
+the concurrency test that was originally run by hand (backgrounded curl
+requests) while moving inventory to Redis; see "Atomic oversell
+protection" above for what it's actually testing.
+
+Run it with the dev server up in another terminal:
+
+```bash
+npm run dev            # terminal 1
+npm run spike-test -- --event=midnight-parade --tier=VIP --requests=15   # terminal 2
+```
+
+All flags are optional (defaults: `midnight-parade`/`VIP`/15 requests/
+quantity 1). `--quantity=<n>` and `--base-url=<url>` are also available.
+
+A correct run looks like this — note the tier only had 10 VIP tickets
+left, so 15 requests should produce exactly 10 successes:
+
+```
+Firing 15 concurrent requests for 1x VIP @ Midnight Parade
+Available before: 10 (tier total: 10)
+
+Results:
+  succeeded: 10
+  rejected (sold out): 5
+  inventory: 10 -> 0 (expected 0)
+
+OK — inventory accounting is exact, no oversell.
+```
+
+If `reserveInventory`'s atomic `DECRBY` were ever replaced with a
+non-atomic read-then-write, this is the test that would catch it: the
+final inventory count would land below zero, or `succeeded` would exceed
+what was actually available.
