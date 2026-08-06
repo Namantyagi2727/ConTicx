@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useState, type FormEvent } from "react";
+import { Suspense, useEffect, useMemo, useState, type FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { loadHyper } from "@juspay-tech/hyper-js";
@@ -157,6 +157,23 @@ function PaymentForm() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  // Wallet payment methods (PayPal, GPay, Apple Pay) render as their own
+  // button inside the widget and handle their own click-to-redirect
+  // internally — they don't go through handleSubmit/confirmPayment below
+  // at all, so confirmParams.return_url never reaches them. Hyperswitch
+  // docs call walletReturnUrl a mandatory option for these flows; without
+  // it, a wallet button has nowhere valid to send the shopper back to.
+  // Memoized so the widget doesn't see a new options object (and
+  // potentially reset) on every unrelated re-render (isSubmitting, etc).
+  const unifiedCheckoutOptions = useMemo(
+    () => ({
+      wallets: {
+        walletReturnUrl: `${window.location.origin}/confirmation`,
+      },
+    }),
+    []
+  );
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (!hyper || !widgets) return;
@@ -186,7 +203,7 @@ function PaymentForm() {
 
   return (
     <form onSubmit={handleSubmit}>
-      <UnifiedCheckout id="unified-checkout" />
+      <UnifiedCheckout id="unified-checkout" options={unifiedCheckoutOptions} />
       <button
         type="submit"
         disabled={isSubmitting}
