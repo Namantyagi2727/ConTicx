@@ -37,7 +37,8 @@ export interface Order {
   tierName: TierName;
   quantity: number;
   unitPriceCents: number;
-  amountCents: number;
+  feeCents: number; // server-computed service fee, already folded into amountCents
+  amountCents: number; // total charged: (unitPriceCents × quantity) + feeCents
   currency: string;
   status: OrderStatus;
   paymentId?: string;

@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import { NextResponse } from "next/server";
 import { getEvent } from "@/lib/events";
-import { HOLD_DURATION_MS, MAX_QUANTITY_PER_ORDER } from "@/lib/constants";
+import { HOLD_DURATION_MS, MAX_QUANTITY_PER_ORDER, SERVICE_FEE_RATE } from "@/lib/constants";
 import {
   createOrder,
   getRemainingInventory,
@@ -12,8 +12,9 @@ import { hyperswitchFetch } from "@/lib/hyperswitch";
 import type { Order } from "@/lib/types";
 
 // Creates an order: reserves inventory with a 10-minute hold, then
-// creates a matching Hyperswitch payment. The amount is always
-// computed here from the tier's price × quantity — the client only
+// creates a matching Hyperswitch payment. The charged amount is
+// always computed here — tier price × quantity, plus a flat
+// SERVICE_FEE_RATE service fee on that subtotal — the client only
 // ever sends eventId, tierName, and quantity, never an amount.
 export async function POST(request: Request) {
   const body = await request.json().catch(() => null);
@@ -60,7 +61,9 @@ export async function POST(request: Request) {
     );
   }
 
-  const amountCents = tier.priceCents * quantity;
+  const subtotalCents = tier.priceCents * quantity;
+  const feeCents = Math.round(subtotalCents * SERVICE_FEE_RATE);
+  const amountCents = subtotalCents + feeCents;
 
   const order: Order = {
     id: randomUUID(),
@@ -68,6 +71,7 @@ export async function POST(request: Request) {
     tierName: tier.name,
     quantity,
     unitPriceCents: tier.priceCents,
+    feeCents,
     amountCents,
     currency: "USD",
     status: "pending",
@@ -115,6 +119,7 @@ export async function POST(request: Request) {
     paymentId: data.payment_id,
     orderId: order.id,
     holdExpiresAt: order.holdExpiresAt,
+    feeCents: order.feeCents,
     amountCents: order.amountCents,
   });
 }
