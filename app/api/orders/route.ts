@@ -5,6 +5,7 @@ import { HOLD_DURATION_MS, MAX_QUANTITY_PER_ORDER, SERVICE_FEE_RATE } from "@/li
 import {
   createOrder,
   getRemainingInventory,
+  recordDemandSignal,
   reserveInventory,
   updateOrderStatus,
 } from "@/lib/store";
@@ -60,6 +61,12 @@ export async function POST(request: Request) {
       { status: 400 }
     );
   }
+
+  // Fire-and-forget-ish: counts toward the event page's "N reserved
+  // recently" demand signal. Not awaited-for-correctness the way
+  // reserveInventory is — worst case this fails silently and the
+  // badge just under-counts, it never blocks or fails the purchase.
+  await recordDemandSignal(event.id).catch(() => {});
 
   const subtotalCents = tier.priceCents * quantity;
   const feeCents = Math.round(subtotalCents * SERVICE_FEE_RATE);

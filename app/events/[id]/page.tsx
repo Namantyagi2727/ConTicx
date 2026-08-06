@@ -1,10 +1,12 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getEvent } from "@/lib/events";
-import { getRemainingInventory } from "@/lib/store";
+import { getRecentDemand, getRemainingInventory } from "@/lib/store";
+import { DEMAND_DISPLAY_THRESHOLD } from "@/lib/constants";
 import { formatDateStamp, formatDoorsTime, formatTime } from "@/lib/format";
 import { posterColorClasses } from "@/lib/theme";
 import { TierPicker } from "@/components/TierPicker";
+import { PosterArt } from "@/components/PosterArt";
 import type { TierAvailability } from "@/lib/types";
 
 // Remaining inventory comes from an in-memory store that changes as
@@ -21,12 +23,17 @@ export default async function EventPage({
   const event = getEvent(id);
   if (!event) notFound();
 
-  const availability: TierAvailability[] = await Promise.all(
-    event.tiers.map(async (tier) => ({
-      ...tier,
-      remaining: await getRemainingInventory(event.id, tier.name, tier.totalInventory),
-    }))
-  );
+  const [availability, recentDemand] = await Promise.all([
+    Promise.all(
+      event.tiers.map(
+        async (tier): Promise<TierAvailability> => ({
+          ...tier,
+          remaining: await getRemainingInventory(event.id, tier.name, tier.totalInventory),
+        })
+      )
+    ),
+    getRecentDemand(event.id),
+  ]);
 
   const stamp = formatDateStamp(event.date);
   const colors = posterColorClasses[event.posterColor];
@@ -45,7 +52,8 @@ export default async function EventPage({
       </div>
 
       {/* Poster hero */}
-      <div className={`halftone relative border-b border-ink-line ${colors.text}`}>
+      <div className={`relative overflow-hidden border-b border-ink-line bg-ink ${colors.text}`}>
+        <PosterArt seed={event.id} className="absolute inset-0 h-full w-full" />
         <div className="absolute inset-0 bg-gradient-to-b from-ink/75 via-ink/85 to-ink" />
         <div className="relative mx-auto max-w-3xl px-6 py-14 sm:px-10 sm:py-20">
           <div className="flex flex-wrap items-center gap-2">
@@ -117,9 +125,16 @@ export default async function EventPage({
 
         {/* Tickets */}
         <section className="mt-12">
-          <h2 className="font-display text-sm font-bold tracking-[0.15em] text-text-faint">
-            PICK YOUR TICKET
-          </h2>
+          <div className="flex flex-wrap items-center gap-3">
+            <h2 className="font-display text-sm font-bold tracking-[0.15em] text-text-faint">
+              PICK YOUR TICKET
+            </h2>
+            {recentDemand >= DEMAND_DISPLAY_THRESHOLD && (
+              <span className="rounded-full bg-acid px-2 py-0.5 font-mono text-[11px] font-bold text-ink">
+                {recentDemand} PEOPLE GRABBED TICKETS IN THE LAST HOUR
+              </span>
+            )}
+          </div>
           <TierPicker event={event} availability={availability} />
         </section>
       </div>

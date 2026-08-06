@@ -21,6 +21,7 @@
 
 import { redis } from "./redis";
 import { hyperswitchFetch } from "./hyperswitch";
+import { DEMAND_WINDOW_SECONDS } from "./constants";
 import type { Order, OrderStatus } from "./types";
 
 // ZSET of still-pending order ids, scored by holdExpiresAt. Lets reap
@@ -34,6 +35,10 @@ function orderKey(id: string) {
 
 function inventoryKey(eventId: string, tierName: string) {
   return `inventory:${eventId}:${tierName}`;
+}
+
+function demandKey(eventId: string) {
+  return `demand:${eventId}`;
 }
 
 // Raw read, no reap side effect. Used internally by updateOrderStatus
@@ -165,7 +170,16 @@ export async function getRemainingInventory(
   const key = inventoryKey(eventId, tierName);
   await ensureInventoryInitialized(key, totalInventory);
   const remaining = await redis.get<number>(key);
-  return Math.max(0, remaining ?? totalInventory);
+  // Clamped on both ends: never below 0 (already was), and never above
+  // totalInventory either. The counter should never legitimately drift
+  // outside [0, totalInventory] — every reserve/release pairs a
+  // matching decrement/increment — but this was only clamped on the
+  // low end until manual test-database interventions (interrupted
+  // processes mid-reap, direct Redis edits during testing) drifted it
+  // above total on a couple of tiers. Clamping is a display/read-time
+  // safety net, not a fix for whatever caused the drift — it just
+  // guarantees nothing downstream ever has to handle "112% sold."
+  return Math.min(totalInventory, Math.max(0, remaining ?? totalInventory));
 }
 
 // Atomically reserves `quantity` units. DECRBY is a single atomic
@@ -242,4 +256,29 @@ export async function markOrderRefunded(id: string): Promise<boolean> {
   await saveOrder(order);
   await releaseInventory(order.eventId, order.tierName, order.quantity);
   return true;
+}
+
+// Lightweight "how much interest is this event getting right now"
+// counter, purely for the event page's demand signal — not tied to
+// inventory or order status. Counts reservation attempts (not just
+// completed payments), since the point is "people are actively trying
+// to buy this," the same thing a real ticketing site's "N people
+// looking at this" or "N sold in the last hour" badge is signaling.
+//
+// This is an approximate rolling window, not a true sliding one: the
+// counter resets to 0 (via EXPIRE) roughly DEMAND_WINDOW_SECONDS after
+// the *first* reservation in the current window, not exactly N seconds
+// before "now" for every read. Good enough for a demand badge; not
+// something to build billing or analytics on.
+export async function recordDemandSignal(eventId: string): Promise<void> {
+  const key = demandKey(eventId);
+  const count = await redis.incr(key);
+  if (count === 1) {
+    await redis.expire(key, DEMAND_WINDOW_SECONDS);
+  }
+}
+
+export async function getRecentDemand(eventId: string): Promise<number> {
+  const count = await redis.get<number>(demandKey(eventId));
+  return count ?? 0;
 }
