@@ -11,6 +11,7 @@
   "dependencies": {
     "@juspay-tech/hyper-js": "^2.1.0",
     "@juspay-tech/react-hyper-js": "^2.3.0",
+    "@upstash/redis": "^1.38.2",
     "next": "16.3.0",
     "qrcode": "^1.5.4",
     "react": "19.2.8",
