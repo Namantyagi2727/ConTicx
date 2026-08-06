@@ -224,3 +224,22 @@ export async function updateOrderStatus(id: string, status: OrderStatus): Promis
     await releaseInventory(order.eventId, order.tierName, order.quantity);
   }
 }
+
+// Marks a succeeded order refunded and releases its inventory back to
+// the tier. Only acts on an order that's still "succeeded" — calling
+// this twice (a duplicate/retried refund request) is a safe no-op the
+// second time (returns false), not a double release of inventory.
+// This is the primary idempotency guard the refund route relies on;
+// Hyperswitch's own refund API is a second line of defense (it
+// rejects a second full refund against the same payment with
+// "refund amount exceeds amount captured"), but that's not something
+// this route depends on to stay correct.
+export async function markOrderRefunded(id: string): Promise<boolean> {
+  const order = await readOrder(id);
+  if (!order || order.status !== "succeeded") return false;
+
+  order.status = "refunded";
+  await saveOrder(order);
+  await releaseInventory(order.eventId, order.tierName, order.quantity);
+  return true;
+}

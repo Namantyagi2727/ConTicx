@@ -31,10 +31,14 @@ type OrderLookup =
 const POLL_INTERVAL_MS = 2000;
 const MAX_POLL_ATTEMPTS = 5;
 
-// After a 3DS challenge, Hyperswitch redirects here with
+// Any Hyperswitch-initiated redirect — a 3DS challenge, or a
+// redirect-based/wallet payment method like PayPal that never touches
+// our own confirmPayment() call at all — lands here with
 // `payment_intent_client_secret` in the URL instead of our own
-// `payment_id` param. The payment id is just the part of the client
-// secret before "_secret_", so we can recover it either way.
+// `payment_id` param (that one only shows up when we build the URL
+// ourselves after an in-page confirmPayment() resolves without a
+// redirect). The payment id is just the part of the client secret
+// before "_secret_", so we can recover it either way.
 function extractPaymentId(searchParams: URLSearchParams): string | null {
   const direct = searchParams.get("payment_id");
   if (direct) return direct;
@@ -49,18 +53,54 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function Ticket({ ticket }: { ticket: TicketData }) {
+function Ticket({
+  ticket,
+  initiallyRefunded,
+}: {
+  ticket: TicketData;
+  initiallyRefunded: boolean;
+}) {
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [refunded, setRefunded] = useState(initiallyRefunded);
+  const [isRefunding, setIsRefunding] = useState(false);
+  const [refundError, setRefundError] = useState<string | null>(null);
   const event = getEvent(ticket.eventId);
 
   useEffect(() => {
     QRCode.toDataURL(ticket.orderId, { width: 220 }).then(setQrDataUrl);
   }, [ticket.orderId]);
 
+  const handleRefund = async () => {
+    setIsRefunding(true);
+    setRefundError(null);
+
+    const res = await fetch(`/api/orders/${ticket.orderId}/refund`, {
+      method: "POST",
+    });
+    const data = await res.json();
+
+    setIsRefunding(false);
+
+    if (!res.ok) {
+      setRefundError(data.error?.message ?? "Refund failed — try again.");
+      return;
+    }
+
+    setRefunded(true);
+  };
+
   return (
-    <div className="rounded-lg border border-gray-200 p-6 text-center">
-      <h1 className="text-xl font-semibold text-green-700">
-        Payment successful
+    <div
+      className={`rounded-lg border p-6 text-center ${
+        refunded ? "border-gray-200 opacity-60" : "border-gray-200"
+      }`}
+    >
+      <h1
+        className={`text-xl font-semibold ${
+          refunded ? "text-gray-500" : "text-green-700"
+        }`}
+      >
+        {refunded ? "Ticket refunded" : "Payment successful"}
       </h1>
 
       {event && (
@@ -73,7 +113,7 @@ function Ticket({ ticket }: { ticket: TicketData }) {
             {ticket.quantity} × {ticket.tierName}
           </p>
           <p className="text-sm">
-            Total paid: {formatCents(ticket.amountCents)}
+            {refunded ? "Refunded" : "Total paid"}: {formatCents(ticket.amountCents)}
           </p>
         </div>
       )}
@@ -83,13 +123,32 @@ function Ticket({ ticket }: { ticket: TicketData }) {
         <img
           src={qrDataUrl}
           alt="Ticket QR code"
-          className="mx-auto mt-4"
+          className={`mx-auto mt-4 ${refunded ? "grayscale" : ""}`}
           width={220}
           height={220}
         />
       )}
 
       <p className="mt-4 text-xs text-gray-400">Order ID: {ticket.orderId}</p>
+
+      {refunded ? (
+        <p className="mt-4 text-sm text-gray-500">
+          This ticket is no longer valid for entry.
+        </p>
+      ) : (
+        <div className="mt-4">
+          <button
+            onClick={handleRefund}
+            disabled={isRefunding}
+            className="rounded-md border border-red-300 px-4 py-2 text-sm text-red-600 disabled:opacity-50"
+          >
+            {isRefunding ? "Cancelling…" : "Cancel ticket & refund"}
+          </button>
+          {refundError && (
+            <p className="mt-2 text-sm text-red-600">{refundError}</p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -129,13 +188,12 @@ function ConfirmationContent() {
         return;
       }
 
-      // The in-memory order store is authoritative — it's kept in
-      // sync by the webhook and by the call above. Poll it briefly in
-      // case status is still "pending" (payment settling
-      // asynchronously, webhook not delivered yet). Only fall back to
-      // reconstructing from payment metadata if this serverless
-      // instance never had the order to begin with (a different
-      // instance created it).
+      // The order store is authoritative — it's kept in sync by the
+      // webhook and by the call above. Poll it briefly in case status
+      // is still "pending" (payment settling asynchronously, webhook
+      // not delivered yet). Only fall back to reconstructing from
+      // payment metadata if this serverless instance never had the
+      // order to begin with.
       for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
         const orderRes = await fetch(`/api/orders/${orderId}`);
         if (cancelled.current) return;
@@ -166,7 +224,7 @@ function ConfirmationContent() {
 
   if (orderLookup.kind === "found") {
     const { order } = orderLookup;
-    if (order.status === "succeeded") {
+    if (order.status === "succeeded" || order.status === "refunded") {
       return (
         <Ticket
           ticket={{
@@ -176,6 +234,7 @@ function ConfirmationContent() {
             quantity: order.quantity,
             amountCents: order.amountCents,
           }}
+          initiallyRefunded={order.status === "refunded"}
         />
       );
     }
@@ -189,7 +248,10 @@ function ConfirmationContent() {
   // different instance created it). Reconstruct ticket display data
   // from the payment's own metadata instead — it travels with the
   // payment regardless of which serverless instance handles the
-  // request.
+  // request. Refund status isn't part of that metadata (it's set once
+  // at payment creation and never updated), so this path always shows
+  // an un-refunded ticket — an acceptable gap for what's already
+  // documented as a rare last resort.
   if (payment.status === "succeeded" && payment.metadata) {
     const { orderId, eventId, tierName, quantity } = payment.metadata;
     return (
@@ -201,6 +263,7 @@ function ConfirmationContent() {
           quantity: Number(quantity),
           amountCents: payment.amount,
         }}
+        initiallyRefunded={false}
       />
     );
   }

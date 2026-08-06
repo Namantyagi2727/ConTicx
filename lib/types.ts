@@ -20,7 +20,7 @@ export interface TierAvailability extends TicketTier {
   remaining: number;
 }
 
-export type OrderStatus = "pending" | "succeeded" | "failed" | "expired";
+export type OrderStatus = "pending" | "succeeded" | "failed" | "expired" | "refunded";
 
 export interface Order {
   id: string;
