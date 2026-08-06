@@ -2,6 +2,7 @@ import Link from "next/link";
 import { events } from "@/lib/events";
 import { formatCents, formatDateStamp } from "@/lib/format";
 import { posterColorClasses } from "@/lib/theme";
+import { PosterArt } from "@/components/PosterArt";
 
 // Tailwind's default rotate scale only covers a few steps (1, 2, 3, 6,
 // 12...) — "-rotate-0.5" isn't one of them and gets silently dropped,
@@ -67,8 +68,12 @@ export default function Home() {
                 />
                 <div className="grain relative overflow-hidden border border-ink-line bg-ink-raised">
                   <div
-                    className={`halftone relative h-28 ${colors.text} border-b border-ink-line`}
+                    className={`relative h-32 overflow-hidden bg-ink ${colors.text} border-b border-ink-line`}
                   >
+                    <PosterArt
+                      seed={event.id}
+                      className="absolute inset-0 h-full w-full"
+                    />
                     <div className="absolute inset-0 bg-gradient-to-b from-transparent to-ink-raised" />
                   </div>
 
@@ -125,6 +130,53 @@ export default function Home() {
           })}
         </div>
       </section>
+
+      <footer className="border-t border-ink-line px-6 py-12 sm:px-10">
+        <div className="mx-auto max-w-5xl">
+          <div className="grid gap-8 sm:grid-cols-3">
+            <div>
+              <p className="font-display text-sm font-bold tracking-wide">
+                HOW IT WORKS
+              </p>
+              <p className="mt-2 font-body text-xs leading-relaxed text-text-muted">
+                Pick a tier and we hold your seat for ten minutes at
+                checkout. Pay by card or PayPal — nothing&apos;s reserved
+                until you do.
+              </p>
+            </div>
+            <div>
+              <p className="font-display text-sm font-bold tracking-wide">
+                REFUNDS
+              </p>
+              <p className="mt-2 font-body text-xs leading-relaxed text-text-muted">
+                Full refund, any time before the show, no questions asked
+                — cancel from your ticket page.
+              </p>
+            </div>
+            <div>
+              <p className="font-display text-sm font-bold tracking-wide">
+                SANDBOX NOTICE
+              </p>
+              <p className="mt-2 font-body text-xs leading-relaxed text-text-muted">
+                This is a test environment. Payments run through
+                Hyperswitch&apos;s sandbox — no real cards, no real charges.
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-10 flex flex-wrap items-center justify-between gap-4 border-t border-ink-line pt-6">
+            <p className="font-mono text-[10px] text-text-faint">
+              CONTICX · BROOKLYN · BUILT FOR A HACKATHON
+            </p>
+            <Link
+              href="/my-tickets"
+              className="font-mono text-xs text-text underline underline-offset-4"
+            >
+              Already have a ticket? Find it →
+            </Link>
+          </div>
+        </div>
+      </footer>
     </main>
   );
 }
