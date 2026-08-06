@@ -1,10 +1,11 @@
 "use client";
 
-import { Suspense, useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import QRCode from "qrcode";
 import { getEvent } from "@/lib/events";
-import { formatCents, formatEventDate } from "@/lib/format";
+import { formatCents, formatDateStamp, formatTime } from "@/lib/format";
+import { posterColorClasses } from "@/lib/theme";
 import type { Order } from "@/lib/types";
 
 interface PaymentStatus {
@@ -65,9 +66,15 @@ function Ticket({
   const [isRefunding, setIsRefunding] = useState(false);
   const [refundError, setRefundError] = useState<string | null>(null);
   const event = getEvent(ticket.eventId);
+  const colors = event ? posterColorClasses[event.posterColor] : null;
+  const stamp = event ? formatDateStamp(event.date) : null;
 
   useEffect(() => {
-    QRCode.toDataURL(ticket.orderId, { width: 220 }).then(setQrDataUrl);
+    QRCode.toDataURL(ticket.orderId, {
+      width: 220,
+      margin: 0,
+      color: { dark: "#1a1712", light: "#00000000" },
+    }).then(setQrDataUrl);
   }, [ticket.orderId]);
 
   const handleRefund = async () => {
@@ -90,62 +97,123 @@ function Ticket({
   };
 
   return (
-    <div
-      className={`rounded-lg border p-6 text-center ${
-        refunded ? "border-gray-200 opacity-60" : "border-gray-200"
-      }`}
-    >
-      <h1
-        className={`text-xl font-semibold ${
-          refunded ? "text-gray-500" : "text-green-700"
+    <div className="mx-auto max-w-sm">
+      <div
+        className={`ticket-print-in grain relative overflow-hidden border border-black/10 bg-paper text-paper-ink shadow-[0_20px_50px_-15px_rgba(0,0,0,0.6)] ${
+          refunded ? "grayscale" : ""
         }`}
       >
-        {refunded ? "Ticket refunded" : "Payment successful"}
-      </h1>
+        {/* edge notches */}
+        <span className="absolute top-[168px] -left-3 h-6 w-6 rounded-full bg-ink" />
+        <span className="absolute top-[168px] -right-3 h-6 w-6 rounded-full bg-ink" />
 
-      {event && (
-        <div className="mt-4 text-left">
-          <p className="font-medium">{event.name}</p>
-          <p className="text-sm text-gray-600">
-            {formatEventDate(event.date)} · {event.venue}
-          </p>
-          <p className="mt-2 text-sm">
-            {ticket.quantity} × {ticket.tierName}
-          </p>
-          <p className="text-sm">
-            {refunded ? "Refunded" : "Total paid"}: {formatCents(ticket.amountCents)}
+        <div className="p-6 pb-5">
+          <div className="flex items-center justify-between">
+            <span className="font-mono text-[11px] font-bold tracking-widest text-paper-ink/50">
+              CONTICX · E-TICKET
+            </span>
+            {colors && (
+              <span className={`h-2.5 w-2.5 rounded-full ${colors.bg}`} />
+            )}
+          </div>
+
+          {event ? (
+            <>
+              <h1 className="mt-3 font-display text-4xl leading-[0.95] font-black tracking-tight">
+                {event.name}
+              </h1>
+              <p className="mt-1 font-body text-sm text-paper-ink/70">
+                {event.artist}
+              </p>
+              {stamp && (
+                <p className="mt-3 font-mono text-[11px] font-bold tracking-wide text-paper-ink/70">
+                  {stamp.weekday} {stamp.month} {stamp.day} · DOORS{" "}
+                  {formatTime(event.date)} · {event.venue.toUpperCase()}
+                </p>
+              )}
+            </>
+          ) : (
+            <h1 className="mt-3 font-display text-3xl font-black">
+              Your ticket
+            </h1>
+          )}
+
+          <p className="mt-3 font-mono text-xs font-bold text-paper-ink/70">
+            {ticket.quantity} × {ticket.tierName} —{" "}
+            {refunded ? "REFUNDED" : formatCents(ticket.amountCents)}
           </p>
         </div>
-      )}
 
-      {qrDataUrl && (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img
-          src={qrDataUrl}
-          alt="Ticket QR code"
-          className={`mx-auto mt-4 ${refunded ? "grayscale" : ""}`}
-          width={220}
-          height={220}
+        {/* perforation */}
+        <div
+          className="relative h-4 w-full"
+          style={{
+            backgroundImage:
+              "radial-gradient(circle at center, var(--color-ink) 0 5px, transparent 5.5px)",
+            backgroundSize: "18px 100%",
+            backgroundRepeat: "repeat-x",
+            backgroundPosition: "center",
+          }}
         />
-      )}
 
-      <p className="mt-4 text-xs text-gray-400">Order ID: {ticket.orderId}</p>
+        <div className="flex items-center gap-5 p-6 pt-5">
+          <div className="shrink-0">
+            {qrDataUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={qrDataUrl}
+                alt="Ticket QR code"
+                width={96}
+                height={96}
+                className="bg-paper"
+              />
+            ) : (
+              <div className="h-24 w-24 animate-pulse bg-paper-dim" />
+            )}
+          </div>
+          <div className="min-w-0">
+            <p className="font-mono text-[10px] tracking-widest text-paper-ink/50">
+              ORDER
+            </p>
+            <p className="truncate font-mono text-sm font-bold">
+              {ticket.orderId}
+            </p>
+            <p className="mt-3 font-mono text-[10px] tracking-widest text-paper-ink/50">
+              STATUS
+            </p>
+            <p className="font-mono text-sm font-bold">
+              {refunded ? "VOID — REFUNDED" : "VALID FOR ENTRY"}
+            </p>
+          </div>
+        </div>
+
+        {refunded && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 -rotate-12 border-4 border-flame-dim px-4 py-1 mix-blend-multiply"
+          >
+            <span className="font-display text-3xl font-black tracking-widest text-flame-dim">
+              REFUNDED
+            </span>
+          </div>
+        )}
+      </div>
 
       {refunded ? (
-        <p className="mt-4 text-sm text-gray-500">
+        <p className="mt-6 text-center font-mono text-xs text-text-faint">
           This ticket is no longer valid for entry.
         </p>
       ) : (
-        <div className="mt-4">
+        <div className="mt-6 text-center">
           <button
             onClick={handleRefund}
             disabled={isRefunding}
-            className="rounded-md border border-red-300 px-4 py-2 text-sm text-red-600 disabled:opacity-50"
+            className="border border-flame-dim px-5 py-2 font-mono text-xs font-bold tracking-wide text-flame transition-colors hover:bg-flame hover:text-ink disabled:opacity-50"
           >
-            {isRefunding ? "Cancelling…" : "Cancel ticket & refund"}
+            {isRefunding ? "CANCELLING…" : "CANCEL TICKET & REFUND"}
           </button>
           {refundError && (
-            <p className="mt-2 text-sm text-red-600">{refundError}</p>
+            <p className="mt-2 font-mono text-xs text-flame">{refundError}</p>
           )}
         </div>
       )}
@@ -161,16 +229,17 @@ function ConfirmationContent() {
   const [orderLookup, setOrderLookup] = useState<OrderLookup>({
     kind: "loading",
   });
-  const cancelled = useRef(false);
-
-  useEffect(() => {
-    return () => {
-      cancelled.current = true;
-    };
-  }, []);
 
   useEffect(() => {
     if (!paymentId) return;
+
+    // Scoped to this specific effect run rather than a ref shared
+    // across separate effects — React (Strict Mode especially) can
+    // mount/cleanup/mount an effect before its async work resolves,
+    // and a cleanup flag shared with another effect can end up
+    // permanently true, silently dropping every setState call below
+    // forever. A plain closure variable resets correctly on every run.
+    let cancelled = false;
 
     async function run() {
       // GET /api/payments/[id] hits Hyperswitch directly and, as a
@@ -179,7 +248,7 @@ function ConfirmationContent() {
       // in this sandbox setup.
       const paymentRes = await fetch(`/api/payments/${paymentId}`);
       const paymentData: PaymentStatus = await paymentRes.json();
-      if (cancelled.current) return;
+      if (cancelled) return;
       setPayment(paymentData);
 
       const orderId = paymentData.metadata?.orderId;
@@ -196,7 +265,7 @@ function ConfirmationContent() {
       // order to begin with.
       for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
         const orderRes = await fetch(`/api/orders/${orderId}`);
-        if (cancelled.current) return;
+        if (cancelled) return;
 
         if (orderRes.status === 404) {
           setOrderLookup({ kind: "not_found" });
@@ -212,14 +281,17 @@ function ConfirmationContent() {
     }
 
     run();
+    return () => {
+      cancelled = true;
+    };
   }, [paymentId]);
 
   if (!paymentId) {
-    return <p>No payment found.</p>;
+    return <StatusLine>No payment found.</StatusLine>;
   }
 
   if (!payment || orderLookup.kind === "loading") {
-    return <p>Checking payment status…</p>;
+    return <StatusLine>Checking payment status…</StatusLine>;
   }
 
   if (orderLookup.kind === "found") {
@@ -239,9 +311,9 @@ function ConfirmationContent() {
       );
     }
     if (order.status === "pending") {
-      return <p>Still processing your payment — check back in a moment.</p>;
+      return <StatusLine>Still processing your payment — check back in a moment.</StatusLine>;
     }
-    return <p>Order status: {order.status}</p>;
+    return <StatusLine>Order status: {order.status}</StatusLine>;
   }
 
   // Fallback: this instance never had the order (cold start, or a
@@ -269,17 +341,27 @@ function ConfirmationContent() {
   }
 
   return (
-    <div>
-      <h1 className="text-xl font-semibold">Status: {payment.status}</h1>
-      <p className="mt-2 text-sm text-gray-600">Payment ID: {payment.paymentId}</p>
+    <StatusLine>
+      Status: {payment.status}
+      <span className="mt-1 block font-mono text-xs text-text-faint">
+        Payment ID: {payment.paymentId}
+      </span>
+    </StatusLine>
+  );
+}
+
+function StatusLine({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="mx-auto max-w-sm border border-ink-line bg-ink-raised p-6 text-center">
+      <p className="font-body text-sm text-text-muted">{children}</p>
     </div>
   );
 }
 
 export default function ConfirmationPage() {
   return (
-    <main className="mx-auto max-w-md p-8">
-      <Suspense fallback={<p>Loading…</p>}>
+    <main className="flex flex-1 items-center justify-center px-6 py-16">
+      <Suspense fallback={<StatusLine>Loading…</StatusLine>}>
         <ConfirmationContent />
       </Suspense>
     </main>
