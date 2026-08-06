@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { MAX_QUANTITY_PER_ORDER } from "@/lib/constants";
 import { formatCents } from "@/lib/format";
 import { posterColorClasses } from "@/lib/theme";
@@ -30,6 +31,7 @@ export function TierPicker({
   const selected = availability.find((t) => t.name === tierName)!;
   const maxSelectable = Math.min(MAX_QUANTITY_PER_ORDER, selected.remaining);
   const [quantity, setQuantity] = useState(maxSelectable > 0 ? 1 : 0);
+  const [isNavigating, setIsNavigating] = useState(false);
 
   function handleTierChange(tier: TierAvailability) {
     setTierName(tier.name);
@@ -37,10 +39,18 @@ export function TierPicker({
   }
 
   function handleBuy() {
+    // The reservation itself happens on /checkout (it needs to exist
+    // before the widget can mount), so this button can't show a
+    // meaningful result yet — just enough feedback that the click
+    // registered instead of appearing to do nothing while the route
+    // transition and the reservation call are in flight.
+    setIsNavigating(true);
     router.push(
       `/checkout?eventId=${event.id}&tierName=${tierName}&quantity=${quantity}`
     );
   }
+
+  const allSoldOut = availability.every((t) => t.remaining === 0);
 
   return (
     <div className="mt-5">
@@ -129,14 +139,32 @@ export function TierPicker({
 
           <button
             onClick={handleBuy}
-            className="flex-1 bg-flame py-3 text-center font-display text-lg font-bold tracking-wide text-ink transition-transform hover:-translate-y-0.5 active:translate-y-0"
+            disabled={isNavigating}
+            className="flex flex-1 items-center justify-center gap-2 bg-flame py-3 text-center font-display text-lg font-bold tracking-wide text-ink transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-60"
           >
-            GET TICKETS — {formatCents(selected.priceCents * quantity)}
+            {isNavigating && <span className="spinner" aria-hidden />}
+            {isNavigating
+              ? "RESERVING…"
+              : `GET TICKETS — ${formatCents(selected.priceCents * quantity)}`}
           </button>
         </div>
+      ) : allSoldOut ? (
+        <div className="mt-6">
+          <p className="font-body text-sm text-text-muted">
+            This show is completely sold out — sorry! New tickets sometimes
+            open up if a hold expires, so it&apos;s worth checking back.
+          </p>
+          <Link
+            href="/"
+            className="mt-2 inline-block font-mono text-xs text-text underline underline-offset-4"
+          >
+            ← Browse other shows
+          </Link>
+        </div>
       ) : (
-        <p className="mt-6 font-mono text-sm text-text-faint">
-          This tier is sold out.
+        <p className="mt-6 font-body text-sm text-text-muted">
+          {tierName} just sold out — pick the other tier above to keep
+          going.
         </p>
       )}
     </div>
