@@ -4,7 +4,10 @@ A concert ticket booking prototype: browse events, pick a GA or VIP tier, hold
 your seat for 10 minutes, pay through [Hyperswitch](https://hyperswitch.io)'s
 Unified Checkout, and get a ticket with a QR code. Built as a hackathon-scoped
 prototype — real payment flow against Hyperswitch's sandbox, everything else
-kept intentionally minimal.
+kept intentionally minimal. Each event's poster art
+([`components/PosterArt.tsx`](components/PosterArt.tsx)) is a small
+deterministic SVG generator seeded from the event id, standing in for real
+photography this prototype doesn't have.
 
 ## Architecture
 
@@ -97,6 +100,19 @@ counter below zero, it's immediately rolled back with a compensating
 also does a plain read-and-compare first, but only for a friendlier error
 message in the common case — the atomic decrement is what actually
 prevents overselling, not the pre-check.
+
+`getRemainingInventory` also clamps the counter to `[0, totalInventory]`
+on read, not just `>= 0` as before. This isn't a fix for an active bug in
+the reserve/release path — that path was already verified live under real
+concurrency (see the spike test below) — but building the organizer view
+(below) surfaced actual drift on two VIP counters in the long-lived dev
+database this project used throughout building it: extensive ad-hoc
+testing (interrupted dev-server restarts mid-reap, direct Redis edits for
+screenshots) had pushed two counters 1 unit above their seeded total,
+which the old floor-only clamp let through as a negative "reserved" count.
+The counters were reset once the clamp was added; the clamp itself stays,
+as a read-time safety net against whatever future test-database mess
+produces the same symptom.
 
 ### Webhook-driven status, never the browser alone
 
@@ -199,6 +215,44 @@ the request) — it's kept as a last resort for something like the Redis
 database itself being unreachable. The metadata travels with the payment
 regardless, so the ticket still renders correctly either way.
 
+### Organizer view
+
+`/admin` — not linked from anywhere on the customer-facing site, no auth
+on it either (matches the rest of this prototype: no accounts anywhere).
+Reads live reserved/remaining counts and ticket/fee revenue per event and
+tier straight from the same store the checkout flow uses, so there's no
+separate report that can drift out of sync with reality. It's explicit
+that "reserved" includes tickets still mid-checkout, not just confirmed
+sales — a hold that hasn't expired yet counts here, so the number can run
+a little ahead of what's actually been paid for. This is the page that
+caught the counter-drift bug described above: it's a genuinely useful
+piece of internal tooling, not just a demo screen.
+
+### Live demand signal
+
+The event page shows "N people grabbed tickets in the last hour" once
+reservation attempts for that event cross a small threshold
+(`DEMAND_DISPLAY_THRESHOLD`, `lib/constants.ts`) — revives the "show a
+spike in demand" idea from the original project scope that got cut for
+time earlier on. `recordDemandSignal` does a plain Redis `INCR` on
+`demand:{eventId}` every time an order is created, `EXPIRE`-ing the key
+only on the first increment of a window (`DEMAND_WINDOW_SECONDS`, default
+1 hour) — an approximate rolling window, not a true sliding one, and
+counts reservation *attempts* rather than confirmed sales (the same
+"people are actively trying to buy this" signal a real site's urgency
+badge is usually making). Good enough for a demand badge; not something
+to build billing or analytics on top of.
+
+### Find your ticket
+
+`/my-tickets` — since there's no login anywhere in this app, this is a
+plain "enter your order ID" form for someone who closed their
+confirmation tab and wants it back. It doesn't duplicate any ticket
+rendering: on a successful lookup it just reads the order's `paymentId`
+and hands off to the existing confirmation page
+(`router.push('/confirmation?payment_id=...')`), the same page a fresh
+payment lands on.
+
 ## Local setup
 
 ```bash
@@ -242,6 +296,10 @@ dashboard's business profile settings.
 5. On the confirmation page, click **Cancel ticket & refund** to test the
    refund flow — the ticket should switch to a greyed-out "refunded"
    state.
+6. Copy the order ID off a ticket, go to `/my-tickets`, and look it up —
+   it should land you back on that same confirmation page.
+7. Check `/admin` — the tier you just bought from should show a higher
+   "reserved" count and non-zero revenue.
 
 Verify both the payment and the refund in the Hyperswitch sandbox
 dashboard to confirm they actually cleared, not just that the UI looked
