@@ -59,16 +59,17 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.test.yml down
 
-      # Build with placeholder, sandbox-shaped values set in the
-      # environment. Next does not override already-set process.env
-      # values from .env files, so no real credential is used; these are
-      # never sent anywhere (all routes that touch a service are dynamic
-      # and are not executed during the build).
+      # Build with placeholder values on unreachable `.invalid` hosts.
+      # The CI checkout has no .env.local, and these hosts never resolve,
+      # so build-time code cannot reach real Redis or the payment provider
+      # — and every service-touching route is dynamic and is not executed
+      # during the build anyway. (The only external request `next build`
+      # makes is to Google Fonts: a UI build input, no credentials.)
       - name: Build (isolated configuration)
         env:
-          UPSTASH_REDIS_REST_URL: https://build-placeholder.invalid
+          UPSTASH_REDIS_REST_URL: https://redis.invalid
           UPSTASH_REDIS_REST_TOKEN: placeholder_build_token
-          HYPERSWITCH_BASE_URL: https://sandbox.hyperswitch.io
+          HYPERSWITCH_BASE_URL: https://hyperswitch.invalid
           HYPERSWITCH_API_KEY: snd_placeholder_build
           NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY: pk_snd_placeholder_build
         run: npm run build
