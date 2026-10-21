@@ -14,6 +14,7 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { Redis } from "@upstash/redis";
 import { events } from "../lib/events";
 
@@ -50,8 +51,57 @@ function parseArgs() {
   };
 }
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+function hostOf(url: string | undefined): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return null;
+  }
+}
+
+// Safety guard: this script fires many real order requests and reads the
+// inventory counter straight from Redis. It must never be aimed at a
+// deployed app or a hosted database. Refuse any non-loopback target —
+// both the HTTP base URL and the Redis URL the Upstash client will use —
+// before a single request or Redis command runs. Exported so it can be
+// unit-tested with fixtures instead of by contacting a host.
+export function assertLocalSpikeTarget(opts: {
+  baseUrl: string;
+  redisUrl: string | undefined;
+}): void {
+  const baseHost = hostOf(opts.baseUrl);
+  if (!baseHost || !LOOPBACK_HOSTS.has(baseHost)) {
+    throw new Error(
+      `spike-test refuses a non-local --base-url (${opts.baseUrl}). ` +
+        `Point it at a local dev server only.`
+    );
+  }
+
+  const redisHost = hostOf(opts.redisUrl);
+  if (!opts.redisUrl) {
+    throw new Error(
+      "spike-test found no UPSTASH_REDIS_REST_URL. Run it only against a local test Redis."
+    );
+  }
+  if (/\.upstash\.io$/i.test(redisHost ?? "") || !redisHost || !LOOPBACK_HOSTS.has(redisHost)) {
+    throw new Error(
+      `spike-test refuses a non-local Redis target (${opts.redisUrl}). ` +
+        `It would mutate that database. Use a local test Redis only.`
+    );
+  }
+}
+
 async function main() {
   const { eventId, tierName, requestCount, quantity, baseUrl } = parseArgs();
+
+  // Refuse remote targets before touching Redis or firing any request.
+  assertLocalSpikeTarget({
+    baseUrl,
+    redisUrl: process.env.UPSTASH_REDIS_REST_URL ?? process.env.KV_REST_API_URL,
+  });
 
   const event = events.find((e) => e.id === eventId);
   const tier = event?.tiers.find((t) => t.name === tierName);
@@ -103,4 +153,12 @@ async function main() {
   }
 }
 
-main();
+// Only run when executed directly (npm run spike-test), not when
+// imported by a test that just wants to exercise the safety guard.
+const isDirectRun =
+  typeof process.argv[1] === "string" &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isDirectRun) {
+  main();
+}
