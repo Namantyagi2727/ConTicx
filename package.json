@@ -13,9 +13,6 @@
     "test:integration": "vitest run --project integration",
     "spike-test": "tsx scripts/spike-test.ts"
   },
-  "engines": {
-    "node": "^20.9.0 || ^22.0.0 || >=24.0.0"
-  },
   "dependencies": {
     "@juspay-tech/hyper-js": "^2.1.0",
     "@juspay-tech/react-hyper-js": "^2.3.0",
