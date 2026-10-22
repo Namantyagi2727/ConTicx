@@ -74,6 +74,38 @@ describe("reservation replay and order-id collision", () => {
     expect(await r.get<Order>(`order:${order.id}`)).toEqual(storedFirst); // original intact
   });
 
+  it("same total but different currency is CONFLICT without mutation", async () => {
+    const r = makeTestRedis();
+    const order = makeOrder({ quantity: 1 }); // USD, amountCents 11000
+    expect(await reserveAndCreateOrder(order, CAPACITY)).toBe("created");
+    const afterFirst = (await r.get<number>(INV_KEY))!;
+    const storedFirst = (await r.get<Order>(`order:${order.id}`))!;
+
+    // Same total amount, different currency — must not match.
+    const differentCurrency = makeOrder({ id: order.id, currency: "EUR" });
+    expect(differentCurrency.amountCents).toBe(order.amountCents);
+    expect(await reserveAndCreateOrder(differentCurrency, CAPACITY)).toBe("conflict");
+
+    expect(await r.get<number>(INV_KEY)).toBe(afterFirst);
+    expect(await r.get<Order>(`order:${order.id}`)).toEqual(storedFirst);
+  });
+
+  it("same total but different pricing breakdown is CONFLICT without mutation", async () => {
+    const r = makeTestRedis();
+    const order = makeOrder({ quantity: 1 }); // unit 10000 + fee 1000 = 11000
+    expect(await reserveAndCreateOrder(order, CAPACITY)).toBe("created");
+    const afterFirst = (await r.get<number>(INV_KEY))!;
+    const storedFirst = (await r.get<Order>(`order:${order.id}`))!;
+
+    // Same total amount, different unit-price / fee split — must not match.
+    const differentSplit = makeOrder({ id: order.id, unitPriceCents: 9000, feeCents: 2000 });
+    expect(differentSplit.amountCents).toBe(order.amountCents);
+    expect(await reserveAndCreateOrder(differentSplit, CAPACITY)).toBe("conflict");
+
+    expect(await r.get<number>(INV_KEY)).toBe(afterFirst);
+    expect(await r.get<Order>(`order:${order.id}`)).toEqual(storedFirst);
+  });
+
   it("resubmission after the order advanced beyond pending is EXISTS and never resurrects it", async () => {
     const r = makeTestRedis();
     const order = makeOrder({ quantity: 1 });

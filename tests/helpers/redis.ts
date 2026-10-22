@@ -23,3 +23,23 @@ export async function pingTestRedis(): Promise<boolean> {
     return false;
   }
 }
+
+// Write an EXACT string value, bypassing the SDK's value serialization,
+// so a numeric-looking fixture ("1.5", "1e2", a huge integer) lands in
+// Redis as those literal bytes rather than a normalized/quoted form. Used
+// only by the numeric-validation tests.
+export async function setRawString(r: Redis, key: string, value: string): Promise<void> {
+  await r.eval("redis.call('SET', KEYS[1], ARGV[1]) return 'OK'", [key], [value]);
+}
+
+// Compare a key's raw stored bytes to an expected string INSIDE Redis, so
+// the SDK never deserializes (and thus never normalizes) the value on the
+// way back. Returns true iff the stored value is exactly `expected`.
+export async function rawEquals(r: Redis, key: string, expected: string): Promise<boolean> {
+  const res = await r.eval(
+    "if redis.call('GET', KEYS[1]) == ARGV[1] then return 1 else return 0 end",
+    [key],
+    [expected]
+  );
+  return res === 1;
+}
