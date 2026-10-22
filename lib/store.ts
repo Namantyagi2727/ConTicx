@@ -157,10 +157,15 @@ local needSeed = false
 if invType == 'string' then
   -- The counter must be a CANONICAL non-negative integer string that
   -- Redis integer ops accept — not merely something tonumber parses.
-  -- This rejects corrupt values like "1.5", "1.0", or "1e2" instead of
-  -- silently normalizing them, and it is not reseeded.
+  -- This rejects corrupt values like "1.5", "1.0", "1e2", or a
+  -- leading-zero form like "01" (Redis integer parsing rejects leading
+  -- zeros; only "0" itself is a zero) instead of silently normalizing
+  -- them, and it is not reseeded. Lua patterns have no alternation, so
+  -- "canonical" is: exactly "0", or 1-9 then any digits.
   local cs = redis.call('GET', invKey)
-  if type(cs) ~= 'string' or not string.match(cs, '^%d+$') then return {'ERR', 'inv_nan'} end
+  if type(cs) ~= 'string' or not (cs == '0' or string.match(cs, '^[1-9]%d*$')) then
+    return {'ERR', 'inv_nan'}
+  end
   remaining = tonumber(cs)
   if not remaining or remaining > maxInv then return {'ERR', 'inv_range'} end
 else
@@ -239,10 +244,11 @@ if release then
   -- The counter must EXIST and be a canonical non-negative integer string
   -- (a missing counter here means a lost counter: refuse, don't recreate).
   -- And the result must not exceed the safe bound, so INCRBY cannot
-  -- overflow.
+  -- overflow. "Canonical" rejects leading-zero forms like "01" that Redis
+  -- integer ops reject; only "0" itself is a zero.
   if redis.call('TYPE', invKey).ok ~= 'string' then return {'ERR', 'inv_missing'} end
   local cs = redis.call('GET', invKey)
-  if not string.match(cs, '^%d+$') then return {'ERR', 'inv_nan'} end
+  if not (cs == '0' or string.match(cs, '^[1-9]%d*$')) then return {'ERR', 'inv_nan'} end
   local curCount = tonumber(cs)
   if not curCount or curCount > maxInv then return {'ERR', 'inv_range'} end
   if curCount + qty > maxInv then return {'ERR', 'inv_overflow'} end
@@ -307,9 +313,13 @@ if invType ~= 'string' and invType ~= 'none' then return {'ERR', 'inv_type'} end
 
 if invType == 'string' then
   -- Reject (don't normalize) a counter that isn't a canonical non-negative
-  -- integer string in range, e.g. "1.5", "1.0", "1e2", or an overflow.
+  -- integer string in range, e.g. "1.5", "1.0", "1e2", a leading-zero form
+  -- like "01", or an overflow. "Canonical" is exactly "0", or 1-9 then any
+  -- digits (Lua patterns have no alternation).
   local cs = redis.call('GET', invKey)
-  if type(cs) ~= 'string' or not string.match(cs, '^%d+$') then return {'ERR', 'inv_nan'} end
+  if type(cs) ~= 'string' or not (cs == '0' or string.match(cs, '^[1-9]%d*$')) then
+    return {'ERR', 'inv_nan'}
+  end
   local v = tonumber(cs)
   if not v or v > maxInv then return {'ERR', 'inv_range'} end
   return {'OK', v}
