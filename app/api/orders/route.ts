@@ -3,20 +3,20 @@ import { NextResponse } from "next/server";
 import { getEvent } from "@/lib/events";
 import { HOLD_DURATION_MS, MAX_QUANTITY_PER_ORDER, SERVICE_FEE_RATE } from "@/lib/constants";
 import {
-  createOrder,
+  attachPaymentId,
   getRemainingInventory,
   recordDemandSignal,
-  reserveInventory,
+  reserveAndCreateOrder,
   updateOrderStatus,
 } from "@/lib/store";
 import { hyperswitchFetch } from "@/lib/hyperswitch";
 import type { Order } from "@/lib/types";
 
-// Creates an order: reserves inventory with a 10-minute hold, then
-// creates a matching Hyperswitch payment. The charged amount is
-// always computed here — tier price × quantity, plus a flat
-// SERVICE_FEE_RATE service fee on that subtotal — the client only
-// ever sends eventId, tierName, and quantity, never an amount.
+// Creates an order: atomically reserves inventory with a 10-minute hold
+// AND persists the order, then creates a matching Hyperswitch payment.
+// The charged amount is always computed here — tier price × quantity,
+// plus a flat SERVICE_FEE_RATE service fee on that subtotal — the client
+// only ever sends eventId, tierName, and quantity, never an amount.
 export async function POST(request: Request) {
   const body = await request.json().catch(() => null);
   const eventId = body?.eventId;
@@ -40,10 +40,10 @@ export async function POST(request: Request) {
     );
   }
 
-  // Friendly pre-check for a nice error message in the common case —
-  // the atomic reserve below is what actually prevents overselling
-  // under real concurrency; this just avoids a wasted Hyperswitch call
-  // when it's obviously sold out.
+  // Friendly pre-check for a nice error message in the common case — the
+  // atomic reserve below is what actually prevents overselling under
+  // real concurrency; this just avoids a wasted Hyperswitch call when
+  // it's obviously sold out.
   const remaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
   if (quantity > remaining) {
     return NextResponse.json(
@@ -51,22 +51,6 @@ export async function POST(request: Request) {
       { status: 400 }
     );
   }
-
-  const reserved = await reserveInventory(event.id, tier.name, quantity, tier.totalInventory);
-  if (!reserved) {
-    // Lost a race with another buyer between the check above and here.
-    const nowRemaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
-    return NextResponse.json(
-      { error: `Only ${nowRemaining} ${tier.name} ticket(s) left` },
-      { status: 400 }
-    );
-  }
-
-  // Fire-and-forget-ish: counts toward the event page's "N reserved
-  // recently" demand signal. Not awaited-for-correctness the way
-  // reserveInventory is — worst case this fails silently and the
-  // badge just under-counts, it never blocks or fails the purchase.
-  await recordDemandSignal(event.id).catch(() => {});
 
   const subtotalCents = tier.priceCents * quantity;
   const feeCents = Math.round(subtotalCents * SERVICE_FEE_RATE);
@@ -86,7 +70,31 @@ export async function POST(request: Request) {
     createdAt: Date.now(),
   };
 
-  await createOrder(order);
+  // Atomic reserve + persist: either the seat is reserved AND the order
+  // and its hold entry are stored, or nothing is. This closes the old
+  // gap where a crash (or lost response) between the inventory decrement
+  // and the order write would strand a seat with no recoverable order to
+  // reap. The order is persisted here, before the provider call, because
+  // its id has to exist to embed in Hyperswitch's metadata.orderId.
+  const reservation = await reserveAndCreateOrder(order, tier.totalInventory);
+  if (reservation === "sold_out") {
+    // Lost a race with another buyer between the pre-check above and
+    // here — report the current count.
+    const nowRemaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
+    return NextResponse.json(
+      { error: `Only ${nowRemaining} ${tier.name} ticket(s) left` },
+      { status: 400 }
+    );
+  }
+  if (reservation === "error") {
+    return NextResponse.json({ error: "Could not create order" }, { status: 500 });
+  }
+
+  // Fire-and-forget-ish: counts toward the event page's "N reserved
+  // recently" demand signal. Not awaited-for-correctness the way the
+  // reservation is — worst case it fails silently and the badge just
+  // under-counts; it never blocks or fails the purchase.
+  await recordDemandSignal(event.id).catch(() => {});
 
   const response = await hyperswitchFetch("/payments", {
     method: "POST",
@@ -107,19 +115,28 @@ export async function POST(request: Request) {
   const data = await response.json();
 
   if (!response.ok) {
-    // updateOrderStatus releases the reservation as a side effect of
-    // moving a pending order to "failed" — see lib/store.ts.
+    // Atomic pending -> failed transition releases the reservation and
+    // removes the hold (see lib/store.ts). Safe no-op if something else
+    // already resolved the order in the meantime.
     await updateOrderStatus(order.id, "failed");
     return NextResponse.json({ error: data }, { status: response.status });
   }
 
-  // The order was already persisted as "pending" above (before we knew
-  // paymentId, since order.id needs to exist to embed in Hyperswitch's
-  // metadata). Persist again now that paymentId is known — Redis has
-  // no shared object reference to mutate in place the way the old
-  // in-memory Map did.
-  order.paymentId = data.payment_id;
-  await createOrder(order);
+  // Attach ONLY the payment id to the current stored order — never a
+  // whole-object rewrite. The old rewrite re-persisted the in-memory
+  // pending snapshot, which could reset a status a webhook or the
+  // payment-status poll had already advanced in the sub-second window
+  // between the create above and here, resurrecting a resolved hold.
+  const attached = await attachPaymentId(order.id, data.payment_id);
+  if (attached !== "ok" && attached !== "noop") {
+    // conflict/not_found/error: the order was resolved or removed out
+    // from under us in that window. The payment exists and carries
+    // metadata.orderId, so the webhook / payment-status route will
+    // reconcile by order id; log and return the payment either way.
+    console.warn(
+      `[orders] payment attach '${attached}' for order ${order.id} (payment ${data.payment_id})`
+    );
+  }
 
   return NextResponse.json({
     clientSecret: data.client_secret,

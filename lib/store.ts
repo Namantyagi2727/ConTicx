@@ -13,11 +13,20 @@
 //     synchronize, so a database round trip would only add latency
 //     for no correctness benefit.
 //
-// Orders are stored as JSON values keyed by order id. Inventory is
-// tracked as a plain Redis integer per (eventId, tierName), mutated
-// with atomic INCRBY/DECRBY rather than derived by scanning orders —
-// see reserveInventory for why that atomicity is what actually
-// prevents overselling.
+// Orders are stored as a single JSON value keyed by order id. Inventory
+// is a plain Redis integer per (eventId, tierName).
+//
+// Phase 1B.1 — atomicity. The business operations that mutate this
+// state (reserve-and-create, status transitions + inventory release,
+// payment-id attachment) run as Redis-side Lua scripts, not as separate
+// read/check/write round trips in application code. A single script
+// executes with nothing else interleaved, so two competing requests
+// cannot both pass the same check before either writes. Each script
+// validates its inputs, key types, and transition preconditions BEFORE
+// any write — a Lua script is NOT a transaction that rolls back, so a
+// write that runs before a later error is not undone; the discipline is
+// to check first and write last. See reserveAndCreateOrder /
+// transitionOrder / attachPaymentId below.
 
 import { redis } from "./redis";
 import { hyperswitchFetch } from "./hyperswitch";
@@ -41,40 +50,168 @@ function demandKey(eventId: string) {
   return `demand:${eventId}`;
 }
 
-// Raw read, no reap side effect. Used internally by updateOrderStatus
-// and by reap itself — both already know a fresh reap pass doesn't
-// need to run again on their behalf, and in updateOrderStatus's case,
-// going through the public getOrder (which reaps first) would
-// deadlock: reap awaits updateOrderStatus, which would be awaiting the
-// same in-flight reap pass to finish first.
+// ---------------------------------------------------------------------------
+// Atomic Redis-side operations (Lua). KEYS are passed explicitly so the
+// key layout stays visible here, and every branch that could fail is
+// evaluated before the first write.
+// ---------------------------------------------------------------------------
+
+// reserve-and-create: validate quantity, initialize the counter on first
+// touch only, check availability, then (and only then) decrement
+// inventory, persist the order JSON, and index its hold — together.
+// Insufficient inventory leaves no inventory mutation, no order, and no
+// hold entry.
+//
+// Returns: {'OK', remaining} | {'SOLD_OUT', remaining} | {'ERR', reason}
+const RESERVE_AND_CREATE_SCRIPT = `
+local invKey = KEYS[1]
+local orderKey = KEYS[2]
+local holdsKey = KEYS[3]
+local qty = tonumber(ARGV[1])
+local total = tonumber(ARGV[2])
+local orderJson = ARGV[3]
+local orderId = ARGV[4]
+local holdExpiresAt = tonumber(ARGV[5])
+
+if not qty or qty < 1 then return {'ERR', 'bad_quantity'} end
+if not total or total < 0 then return {'ERR', 'bad_total'} end
+if not holdExpiresAt then return {'ERR', 'bad_hold'} end
+if not orderJson or orderJson == '' then return {'ERR', 'bad_order'} end
+
+local invType = redis.call('TYPE', invKey).ok
+if invType ~= 'string' and invType ~= 'none' then return {'ERR', 'inv_type'} end
+
+-- Determine current availability WITHOUT mutating anything, so an
+-- insufficient request leaves the counter exactly as it found it (no
+-- seed, no decrement). An absent counter means an untouched tier, whose
+-- availability is its full total. We never reseed an EXISTING counter,
+-- so a counter lost out-of-band surfaces as 'inv_nan' rather than
+-- silently resetting availability to full while holds may still exist.
+local remaining
+if invType == 'none' then
+  remaining = total
+else
+  remaining = tonumber(redis.call('GET', invKey))
+  if not remaining then return {'ERR', 'inv_nan'} end
+end
+
+if remaining < qty then
+  return {'SOLD_OUT', remaining}
+end
+
+-- Writes only below this line; none can fail on the validated inputs.
+-- Explicit first-touch initialization happens here, only on the path
+-- that actually reserves.
+if invType == 'none' then
+  redis.call('SET', invKey, total)
+end
+local after = redis.call('DECRBY', invKey, qty)
+redis.call('SET', orderKey, orderJson)
+redis.call('ZADD', holdsKey, holdExpiresAt, orderId)
+return {'OK', after}
+`;
+
+// guarded status transition (compare-and-set) with its inventory effect.
+// Applies ONLY when the order is currently in the expected 'from' state;
+// if it is already in the 'to' state the call is an idempotent no-op
+// (NOOP), and any other state is an incompatible transition (CONFLICT).
+// Status change, hold removal, and the optional inventory release happen
+// together, so a retried or concurrent caller can never apply the
+// inventory effect twice.
+//
+// Returns: {'OK', prevStatus} | {'NOOP', curStatus} | {'CONFLICT', curStatus}
+//        | {'NOT_FOUND'} | {'ERR', reason}
+const TRANSITION_SCRIPT = `
+local orderKey = KEYS[1]
+local invKey = KEYS[2]
+local holdsKey = KEYS[3]
+local orderId = ARGV[1]
+local expectedFrom = ARGV[2]
+local toStatus = ARGV[3]
+local release = ARGV[4] == '1'
+
+local raw = redis.call('GET', orderKey)
+if not raw then return {'NOT_FOUND'} end
+local ok, order = pcall(cjson.decode, raw)
+if not ok or type(order) ~= 'table' then return {'ERR', 'bad_order_json'} end
+
+local cur = order['status']
+if cur == toStatus then return {'NOOP', tostring(cur)} end
+if cur ~= expectedFrom then return {'CONFLICT', tostring(cur)} end
+
+local qty = tonumber(order['quantity'])
+if release then
+  if not qty or qty < 0 then return {'ERR', 'bad_quantity'} end
+  local invType = redis.call('TYPE', invKey).ok
+  if invType ~= 'string' and invType ~= 'none' then return {'ERR', 'inv_type'} end
+end
+
+-- Writes only below this line.
+order['status'] = toStatus
+redis.call('SET', orderKey, cjson.encode(order))
+redis.call('ZREM', holdsKey, orderId)
+if release then
+  redis.call('INCRBY', invKey, qty)
+end
+return {'OK', tostring(cur)}
+`;
+
+// payment-id attachment: set ONLY the paymentId field on whatever the
+// current stored order is. Never rewrites status or re-adds a hold (so
+// it cannot resurrect a resolved order), treats re-attaching the same id
+// as a no-op, and refuses to overwrite a different id.
+//
+// Returns: {'OK'} | {'NOOP'} | {'CONFLICT', existing} | {'NOT_FOUND'}
+//        | {'ERR', reason}
+const ATTACH_PAYMENT_SCRIPT = `
+local orderKey = KEYS[1]
+local paymentId = ARGV[1]
+
+if not paymentId or paymentId == '' then return {'ERR', 'bad_payment_id'} end
+
+local raw = redis.call('GET', orderKey)
+if not raw then return {'NOT_FOUND'} end
+local ok, order = pcall(cjson.decode, raw)
+if not ok or type(order) ~= 'table' then return {'ERR', 'bad_order_json'} end
+
+local existing = order['paymentId']
+if existing == paymentId then return {'NOOP'} end
+if existing ~= nil and existing ~= cjson.null then return {'CONFLICT', tostring(existing)} end
+
+order['paymentId'] = paymentId
+redis.call('SET', orderKey, cjson.encode(order))
+return {'OK'}
+`;
+
+export type ReserveResult = "created" | "sold_out" | "error";
+export type TransitionResult = "applied" | "noop" | "conflict" | "not_found" | "error";
+export type AttachResult = "ok" | "noop" | "conflict" | "not_found" | "error";
+
+async function evalScript(script: string, keys: string[], args: string[]): Promise<unknown[]> {
+  const result = (await redis.eval(script, keys, args)) as unknown;
+  return Array.isArray(result) ? result : [result];
+}
+
+function resultCode(result: unknown[]): string {
+  return typeof result[0] === "string" ? result[0] : String(result[0]);
+}
+
+// Raw read, no reap side effect. Used internally by the transition
+// helpers and by reap itself — both already know a fresh reap pass
+// doesn't need to run again on their behalf, and going through the
+// public getOrder (which reaps first) would deadlock reap, which awaits
+// these helpers.
 async function readOrder(id: string): Promise<Order | undefined> {
   const order = await redis.get<Order>(orderKey(id));
   return order ?? undefined;
 }
 
-async function saveOrder(order: Order): Promise<void> {
-  await redis.set(orderKey(order.id), order);
-  if (order.status === "pending") {
-    await redis.zadd(PENDING_HOLDS_KEY, {
-      score: order.holdExpiresAt,
-      member: order.id,
-    });
-  } else {
-    await redis.zrem(PENDING_HOLDS_KEY, order.id);
-  }
-}
-
 // Seeds the inventory counter to the tier's total the first time it's
-// touched. SETNX is atomic: if two requests race to initialize the
-// same tier, only one write wins and the other silently no-ops, so
-// both still end up decrementing against the same correctly-seeded
-// counter rather than one clobbering the other's seed.
+// read for display. SETNX is atomic: concurrent initializers don't
+// clobber each other. (reserveAndCreateOrder does its own first-touch
+// seed inside the script; this exists for the read path below.)
 async function ensureInventoryInitialized(key: string, totalInventory: number) {
   await redis.setnx(key, totalInventory);
-}
-
-async function releaseInventory(eventId: string, tierName: string, quantity: number) {
-  await redis.incrby(inventoryKey(eventId, tierName), quantity);
 }
 
 // Cancels the Hyperswitch intent for a genuinely-expired pending hold
@@ -134,6 +271,12 @@ async function reapExpiredHolds(): Promise<void> {
       //   - cancel fails for any other reason (network error, 401,
       //     5xx) -> inconclusive. Leave the order pending and retry
       //     on the next reap instead of guessing either way.
+      //
+      // NOTE (tracked defect INV-01): reading a 400 as "paid" is an
+      // over-broad inference a 400 does not justify. Phase 1B.1 does
+      // not change this interpretation — it only makes the resulting
+      // transition atomic. Re-fetching the real payment status after a
+      // non-2xx cancel is deferred to a later subphase.
       try {
         const response = await hyperswitchFetch(
           `/payments/${order.paymentId}/cancel`,
@@ -170,92 +313,114 @@ export async function getRemainingInventory(
   const key = inventoryKey(eventId, tierName);
   await ensureInventoryInitialized(key, totalInventory);
   const remaining = await redis.get<number>(key);
-  // Clamped on both ends: never below 0 (already was), and never above
-  // totalInventory either. The counter should never legitimately drift
-  // outside [0, totalInventory] — every reserve/release pairs a
-  // matching decrement/increment — but this was only clamped on the
-  // low end until manual test-database interventions (interrupted
-  // processes mid-reap, direct Redis edits during testing) drifted it
-  // above total on a couple of tiers. Clamping is a display/read-time
-  // safety net, not a fix for whatever caused the drift — it just
-  // guarantees nothing downstream ever has to handle "112% sold."
+  // Clamped on both ends for DISPLAY only: never below 0, never above
+  // totalInventory. This is a read-time presentation safety net, not
+  // evidence that accounting is correct — the integration tests assert
+  // the RAW counter, never this clamped value. The counter should never
+  // legitimately drift outside [0, totalInventory]; clamping only keeps
+  // a drifted value (e.g. from a manual test-DB edit) from showing
+  // "112% sold" downstream.
   return Math.min(totalInventory, Math.max(0, remaining ?? totalInventory));
 }
 
-// Atomically reserves `quantity` units. DECRBY is a single atomic
-// Redis command, so concurrent reservations are serialized by Redis
-// itself rather than racing in application code — this is what
-// actually prevents overselling, not the friendly pre-check in the
-// route handler (that's just a nicer error message in the common
-// case, not a safety mechanism). If the decrement takes the counter
-// below zero, the reservation is rolled back with a compensating
-// increment and the caller is told no.
-export async function reserveInventory(
-  eventId: string,
-  tierName: string,
-  quantity: number,
+// Atomically reserve `quantity` units AND persist the order and its hold
+// together (see RESERVE_AND_CREATE_SCRIPT). Either all of it happens or
+// none of it does, closing the old gap where a decrement could land with
+// no recoverable order to reap.
+export async function reserveAndCreateOrder(
+  order: Order,
   totalInventory: number
-): Promise<boolean> {
+): Promise<ReserveResult> {
   await reapExpiredHolds();
-  const key = inventoryKey(eventId, tierName);
-  await ensureInventoryInitialized(key, totalInventory);
-
-  const remaining = await redis.decrby(key, quantity);
-  if (remaining < 0) {
-    await redis.incrby(key, quantity); // undo
-    return false;
-  }
-  return true;
+  const result = await evalScript(
+    RESERVE_AND_CREATE_SCRIPT,
+    [inventoryKey(order.eventId, order.tierName), orderKey(order.id), PENDING_HOLDS_KEY],
+    [
+      String(order.quantity),
+      String(totalInventory),
+      JSON.stringify(order),
+      order.id,
+      String(order.holdExpiresAt),
+    ]
+  );
+  const code = resultCode(result);
+  if (code === "OK") return "created";
+  if (code === "SOLD_OUT") return "sold_out";
+  return "error";
 }
 
-export async function createOrder(order: Order): Promise<void> {
-  await reapExpiredHolds();
-  await saveOrder(order);
+// Guarded compare-and-set status transition with its inventory effect.
+// Exposed for callers that need the precise outcome (and for tests);
+// updateOrderStatus and markOrderRefunded wrap it with fixed semantics.
+export async function transitionOrder(
+  id: string,
+  from: OrderStatus,
+  to: OrderStatus,
+  releasesInventory: boolean
+): Promise<TransitionResult> {
+  // Read once to derive the inventory key (eventId/tierName never change
+  // for an order). The transition's correctness does not depend on this
+  // read — the script re-checks the status atomically — so a status that
+  // changes between here and the eval is handled as NOOP/CONFLICT.
+  const order = await readOrder(id);
+  if (!order) return "not_found";
+
+  const result = await evalScript(
+    TRANSITION_SCRIPT,
+    [orderKey(id), inventoryKey(order.eventId, order.tierName), PENDING_HOLDS_KEY],
+    [id, from, to, releasesInventory ? "1" : "0"]
+  );
+  const code = resultCode(result);
+  if (code === "OK") return "applied";
+  if (code === "NOOP") return "noop";
+  if (code === "CONFLICT") return "conflict";
+  if (code === "NOT_FOUND") return "not_found";
+  return "error";
+}
+
+// Statuses whose transition from pending releases the held inventory
+// back to the tier. succeeded keeps the seat.
+const RELEASING_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>(["failed", "expired"]);
+
+// Authoritative pending -> terminal transition driven by the payment
+// status route, the webhook handler, the reaper, or the order route's
+// own provider-failure path. Atomic and idempotent by construction: a
+// redelivered webhook, a reconcile racing the webhook, or a reap racing
+// either one all resolve to a single applied transition — the others see
+// a non-pending status and no-op, never a second inventory release.
+export async function updateOrderStatus(id: string, status: OrderStatus): Promise<void> {
+  await transitionOrder(id, "pending", status, RELEASING_STATUSES.has(status));
+}
+
+// Marks a succeeded order refunded and releases its inventory, exactly
+// once. Returns true only when THIS call performed the transition; a
+// duplicate/retried/concurrent refund returns false (already refunded,
+// or not in a refundable state) and causes no second release. This is
+// the local idempotency guard the refund route relies on. It does NOT
+// make the provider-side refund idempotent — two concurrent refund
+// requests can still each reach Hyperswitch (deferred to a later
+// subphase); this guarantee is only about local inventory accounting.
+export async function markOrderRefunded(id: string): Promise<boolean> {
+  return (await transitionOrder(id, "succeeded", "refunded", true)) === "applied";
+}
+
+// Attaches the provider payment id to an existing order without
+// rewriting any other field. Safe to repeat (same id -> noop) and
+// refuses to clobber a different id (conflict); never resurrects a
+// resolved order's status or hold.
+export async function attachPaymentId(id: string, paymentId: string): Promise<AttachResult> {
+  const result = await evalScript(ATTACH_PAYMENT_SCRIPT, [orderKey(id)], [paymentId]);
+  const code = resultCode(result);
+  if (code === "OK") return "ok";
+  if (code === "NOOP") return "noop";
+  if (code === "CONFLICT") return "conflict";
+  if (code === "NOT_FOUND") return "not_found";
+  return "error";
 }
 
 export async function getOrder(id: string): Promise<Order | undefined> {
   await reapExpiredHolds();
   return readOrder(id);
-}
-
-// Direct status transitions driven by an authoritative source (the
-// payment-status route or the webhook handler). Idempotent by
-// construction: it only acts on an order that's still "pending", so
-// calling it twice for the same event — a redelivered webhook, or the
-// payment-status route and the webhook both reconciling the same
-// payment — is a safe no-op the second time, not a double-release of
-// inventory. This also means a terminal state, once reached, never
-// gets overwritten by a later conflicting signal.
-export async function updateOrderStatus(id: string, status: OrderStatus): Promise<void> {
-  const order = await readOrder(id);
-  if (!order) return;
-  if (order.status !== "pending") return;
-
-  order.status = status;
-  await saveOrder(order);
-
-  if (status === "failed" || status === "expired") {
-    await releaseInventory(order.eventId, order.tierName, order.quantity);
-  }
-}
-
-// Marks a succeeded order refunded and releases its inventory back to
-// the tier. Only acts on an order that's still "succeeded" — calling
-// this twice (a duplicate/retried refund request) is a safe no-op the
-// second time (returns false), not a double release of inventory.
-// This is the primary idempotency guard the refund route relies on;
-// Hyperswitch's own refund API is a second line of defense (it
-// rejects a second full refund against the same payment with
-// "refund amount exceeds amount captured"), but that's not something
-// this route depends on to stay correct.
-export async function markOrderRefunded(id: string): Promise<boolean> {
-  const order = await readOrder(id);
-  if (!order || order.status !== "succeeded") return false;
-
-  order.status = "refunded";
-  await saveOrder(order);
-  await releaseInventory(order.eventId, order.tierName, order.quantity);
-  return true;
 }
 
 // Lightweight "how much interest is this event getting right now"
