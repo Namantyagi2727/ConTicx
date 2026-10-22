@@ -5,6 +5,7 @@ import { HOLD_DURATION_MS, MAX_QUANTITY_PER_ORDER, SERVICE_FEE_RATE } from "@/li
 import {
   attachPaymentId,
   getRemainingInventory,
+  InventoryStateError,
   recordDemandSignal,
   reserveAndCreateOrder,
   updateOrderStatus,
@@ -43,8 +44,17 @@ export async function POST(request: Request) {
   // Friendly pre-check for a nice error message in the common case — the
   // atomic reserve below is what actually prevents overselling under
   // real concurrency; this just avoids a wasted Hyperswitch call when
-  // it's obviously sold out.
-  const remaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
+  // it's obviously sold out. If inventory state can't be established
+  // safely (e.g. a lost counter), refuse rather than guess.
+  let remaining: number;
+  try {
+    remaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
+  } catch (err) {
+    if (err instanceof InventoryStateError) {
+      return NextResponse.json({ error: "Inventory temporarily unavailable" }, { status: 503 });
+    }
+    throw err;
+  }
   if (quantity > remaining) {
     return NextResponse.json(
       { error: `Only ${remaining} ${tier.name} ticket(s) left` },
@@ -76,17 +86,29 @@ export async function POST(request: Request) {
   // and the order write would strand a seat with no recoverable order to
   // reap. The order is persisted here, before the provider call, because
   // its id has to exist to embed in Hyperswitch's metadata.orderId.
+  // order.id is a fresh UUID, so "exists"/"conflict" are not expected on
+  // this path; they're handled defensively. "lost" means the counter for
+  // an initialized tier is missing — refuse rather than reset to full.
   const reservation = await reserveAndCreateOrder(order, tier.totalInventory);
   if (reservation === "sold_out") {
     // Lost a race with another buyer between the pre-check above and
-    // here — report the current count.
-    const nowRemaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
+    // here — report the current count (guarding the re-read too).
+    let nowRemaining = 0;
+    try {
+      nowRemaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
+    } catch (err) {
+      if (!(err instanceof InventoryStateError)) throw err;
+    }
     return NextResponse.json(
       { error: `Only ${nowRemaining} ${tier.name} ticket(s) left` },
       { status: 400 }
     );
   }
-  if (reservation === "error") {
+  if (reservation === "lost") {
+    return NextResponse.json({ error: "Inventory temporarily unavailable" }, { status: 503 });
+  }
+  if (reservation !== "created") {
+    // exists / conflict / error
     return NextResponse.json({ error: "Could not create order" }, { status: 500 });
   }
 

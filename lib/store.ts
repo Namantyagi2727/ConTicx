@@ -46,6 +46,15 @@ function inventoryKey(eventId: string, tierName: string) {
   return `inventory:${eventId}:${tierName}`;
 }
 
+// Persistent evidence that a tier's inventory was initialized. Set once,
+// atomically, the first time a tier is seeded, and never deleted by the
+// app. It lets us tell a genuinely new tier (no counter AND no init
+// record) apart from a tier whose counter was lost out-of-band (no
+// counter BUT init record present) — an absent counter alone cannot.
+function inventoryInitKey(eventId: string, tierName: string) {
+  return `inventory_init:${eventId}:${tierName}`;
+}
+
 function demandKey(eventId: string) {
   return `demand:${eventId}`;
 }
@@ -62,47 +71,84 @@ function demandKey(eventId: string) {
 // Insufficient inventory leaves no inventory mutation, no order, and no
 // hold entry.
 //
-// Returns: {'OK', remaining} | {'SOLD_OUT', remaining} | {'ERR', reason}
+// Returns: {'OK', remaining} | {'SOLD_OUT', remaining} | {'EXISTS', status}
+//        | {'CONFLICT', status} | {'LOST'} | {'ERR', reason}
 const RESERVE_AND_CREATE_SCRIPT = `
 local invKey = KEYS[1]
 local orderKey = KEYS[2]
 local holdsKey = KEYS[3]
-local qty = tonumber(ARGV[1])
+local initKey = KEYS[4]
+local orderJson = ARGV[1]
 local total = tonumber(ARGV[2])
-local orderJson = ARGV[3]
-local orderId = ARGV[4]
-local holdExpiresAt = tonumber(ARGV[5])
 
-if not qty or qty < 1 then return {'ERR', 'bad_quantity'} end
-if not total or total < 0 then return {'ERR', 'bad_total'} end
-if not holdExpiresAt then return {'ERR', 'bad_hold'} end
 if not orderJson or orderJson == '' then return {'ERR', 'bad_order'} end
+if not total or total < 0 then return {'ERR', 'bad_total'} end
 
+local okIn, incoming = pcall(cjson.decode, orderJson)
+if not okIn or type(incoming) ~= 'table' then return {'ERR', 'bad_order_json'} end
+local orderId = incoming['id']
+local qty = tonumber(incoming['quantity'])
+local holdExpiresAt = tonumber(incoming['holdExpiresAt'])
+local eventId = incoming['eventId']
+local tierName = incoming['tierName']
+local amount = tonumber(incoming['amountCents'])
+if not orderId or orderId == '' then return {'ERR', 'bad_order_id'} end
+if not qty or qty < 1 then return {'ERR', 'bad_quantity'} end
+if not holdExpiresAt then return {'ERR', 'bad_hold'} end
+
+-- Type-check every key we may write BEFORE any mutation, so a corrupt
+-- key surfaces as an error rather than a partial write (Lua does not roll
+-- back writes that ran before a later error).
 local invType = redis.call('TYPE', invKey).ok
 if invType ~= 'string' and invType ~= 'none' then return {'ERR', 'inv_type'} end
+local holdsType = redis.call('TYPE', holdsKey).ok
+if holdsType ~= 'zset' and holdsType ~= 'none' then return {'ERR', 'holds_type'} end
 
--- Determine current availability WITHOUT mutating anything, so an
--- insufficient request leaves the counter exactly as it found it (no
--- seed, no decrement). An absent counter means an untouched tier, whose
--- availability is its full total. We never reseed an EXISTING counter,
--- so a counter lost out-of-band surfaces as 'inv_nan' rather than
--- silently resetting availability to full while holds may still exist.
+-- Replay / order-id collision guard. Never overwrite an existing order,
+-- reset its status, recreate its hold, or decrement again. A matching
+-- resubmission of the same booking returns EXISTS with the order's
+-- CURRENT status (the existing-operation result); a different booking
+-- under the same id is a CONFLICT. Either way: no mutation.
+local existingRaw = redis.call('GET', orderKey)
+if existingRaw then
+  local okEx, existing = pcall(cjson.decode, existingRaw)
+  if not okEx or type(existing) ~= 'table' then return {'ERR', 'bad_existing_json'} end
+  local sameBooking =
+    existing['eventId'] == eventId and
+    existing['tierName'] == tierName and
+    tonumber(existing['quantity']) == qty and
+    tonumber(existing['amountCents']) == amount
+  if sameBooking then
+    return {'EXISTS', tostring(existing['status'])}
+  end
+  return {'CONFLICT', tostring(existing['status'])}
+end
+
+-- Availability WITHOUT mutation, distinguishing a genuinely new tier from
+-- a lost counter. counter present -> use it; counter absent + init record
+-- present -> LOST (initialized before, counter now gone: refuse, do not
+-- reseed); neither present -> genuinely new (seed on the reserving path).
 local remaining
-if invType == 'none' then
-  remaining = total
-else
+local needSeed = false
+if invType == 'string' then
   remaining = tonumber(redis.call('GET', invKey))
   if not remaining then return {'ERR', 'inv_nan'} end
+else
+  if redis.call('EXISTS', initKey) == 1 then
+    return {'LOST'}
+  end
+  remaining = total
+  needSeed = true
 end
 
 if remaining < qty then
   return {'SOLD_OUT', remaining}
 end
 
--- Writes only below this line; none can fail on the validated inputs.
--- Explicit first-touch initialization happens here, only on the path
--- that actually reserves.
-if invType == 'none' then
+-- Writes only below this line. Every key was type-checked above, so none
+-- of these can error midway and strand a partial write.
+if needSeed then
+  redis.call('SET', initKey, total)
   redis.call('SET', invKey, total)
 end
 local after = redis.call('DECRBY', invKey, qty)
@@ -139,14 +185,25 @@ local cur = order['status']
 if cur == toStatus then return {'NOOP', tostring(cur)} end
 if cur ~= expectedFrom then return {'CONFLICT', tostring(cur)} end
 
-local qty = tonumber(order['quantity'])
+-- Validate every key we will write BEFORE mutating. We always ZREM the
+-- hold, so the hold index must be a zset (or absent). For a releasing
+-- transition, the counter must EXIST and hold a number: a missing counter
+-- means the tier was initialized (this order was reserved) but its
+-- counter is now gone, so we refuse rather than recreate it from
+-- incomplete accounting via INCRBY.
+local holdsType = redis.call('TYPE', holdsKey).ok
+if holdsType ~= 'zset' and holdsType ~= 'none' then return {'ERR', 'holds_type'} end
+
+local qty
 if release then
+  qty = tonumber(order['quantity'])
   if not qty or qty < 0 then return {'ERR', 'bad_quantity'} end
-  local invType = redis.call('TYPE', invKey).ok
-  if invType ~= 'string' and invType ~= 'none' then return {'ERR', 'inv_type'} end
+  if redis.call('TYPE', invKey).ok ~= 'string' then return {'ERR', 'inv_missing'} end
+  if not tonumber(redis.call('GET', invKey)) then return {'ERR', 'inv_nan'} end
 end
 
--- Writes only below this line.
+-- Writes only below this line; every key above was validated, so none of
+-- these can error midway and strand a partial write.
 order['status'] = toStatus
 redis.call('SET', orderKey, cjson.encode(order))
 redis.call('ZREM', holdsKey, orderId)
@@ -183,7 +240,53 @@ redis.call('SET', orderKey, cjson.encode(order))
 return {'OK'}
 `;
 
-export type ReserveResult = "created" | "sold_out" | "error";
+// read-only availability resolver. Counter present -> return it. Counter
+// absent + init record present -> LOST (initialized before, counter now
+// missing: refuse, no mutation). Neither present -> genuinely new tier,
+// so seed the init record and counter together and return the total.
+//
+// Returns: {'OK', remaining} | {'LOST'} | {'ERR', reason}
+const READ_AVAILABILITY_SCRIPT = `
+local invKey = KEYS[1]
+local initKey = KEYS[2]
+local total = tonumber(ARGV[1])
+if not total or total < 0 then return {'ERR', 'bad_total'} end
+
+local invType = redis.call('TYPE', invKey).ok
+if invType ~= 'string' and invType ~= 'none' then return {'ERR', 'inv_type'} end
+
+if invType == 'string' then
+  local v = tonumber(redis.call('GET', invKey))
+  if not v then return {'ERR', 'inv_nan'} end
+  return {'OK', v}
+end
+
+if redis.call('EXISTS', initKey) == 1 then
+  return {'LOST'}
+end
+
+redis.call('SET', initKey, total)
+redis.call('SET', invKey, total)
+return {'OK', total}
+`;
+
+// Thrown when inventory state cannot be established safely — e.g. a tier
+// that was initialized but whose counter is now missing. We surface this
+// rather than silently resetting availability to full capacity.
+export class InventoryStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InventoryStateError";
+  }
+}
+
+export type ReserveResult =
+  | "created"
+  | "sold_out"
+  | "exists"
+  | "conflict"
+  | "lost"
+  | "error";
 export type TransitionResult = "applied" | "noop" | "conflict" | "not_found" | "error";
 export type AttachResult = "ok" | "noop" | "conflict" | "not_found" | "error";
 
@@ -204,14 +307,6 @@ function resultCode(result: unknown[]): string {
 async function readOrder(id: string): Promise<Order | undefined> {
   const order = await redis.get<Order>(orderKey(id));
   return order ?? undefined;
-}
-
-// Seeds the inventory counter to the tier's total the first time it's
-// read for display. SETNX is atomic: concurrent initializers don't
-// clobber each other. (reserveAndCreateOrder does its own first-touch
-// seed inside the script; this exists for the read path below.)
-async function ensureInventoryInitialized(key: string, totalInventory: number) {
-  await redis.setnx(key, totalInventory);
 }
 
 // Cancels the Hyperswitch intent for a genuinely-expired pending hold
@@ -310,23 +405,42 @@ export async function getRemainingInventory(
   totalInventory: number
 ): Promise<number> {
   await reapExpiredHolds();
-  const key = inventoryKey(eventId, tierName);
-  await ensureInventoryInitialized(key, totalInventory);
-  const remaining = await redis.get<number>(key);
+  const result = await evalScript(
+    READ_AVAILABILITY_SCRIPT,
+    [inventoryKey(eventId, tierName), inventoryInitKey(eventId, tierName)],
+    [String(totalInventory)]
+  );
+  const code = resultCode(result);
+  if (code === "LOST") {
+    throw new InventoryStateError(
+      `inventory counter for ${eventId}:${tierName} is missing but the tier was initialized; ` +
+        `refusing to reset availability to full`
+    );
+  }
+  if (code !== "OK") {
+    throw new InventoryStateError(
+      `inventory state for ${eventId}:${tierName} could not be read (${String(result[1] ?? code)})`
+    );
+  }
+  const remaining = Number(result[1]);
   // Clamped on both ends for DISPLAY only: never below 0, never above
   // totalInventory. This is a read-time presentation safety net, not
   // evidence that accounting is correct — the integration tests assert
-  // the RAW counter, never this clamped value. The counter should never
-  // legitimately drift outside [0, totalInventory]; clamping only keeps
-  // a drifted value (e.g. from a manual test-DB edit) from showing
-  // "112% sold" downstream.
-  return Math.min(totalInventory, Math.max(0, remaining ?? totalInventory));
+  // the RAW counter, never this clamped value. It does NOT paper over a
+  // missing counter: that case throws above rather than clamping.
+  return Math.min(totalInventory, Math.max(0, remaining));
 }
 
-// Atomically reserve `quantity` units AND persist the order and its hold
+// Atomically reserve inventory AND persist the order and its hold
 // together (see RESERVE_AND_CREATE_SCRIPT). Either all of it happens or
 // none of it does, closing the old gap where a decrement could land with
-// no recoverable order to reap.
+// no recoverable order to reap. Resubmitting the SAME order id never
+// decrements twice or overwrites the stored order: a matching booking
+// returns "exists" (the order already exists, with whatever status it has
+// now), a different booking under the same id returns "conflict", and a
+// tier whose counter was lost returns "lost" — all without mutation.
+// This is internal-operation replay safety, NOT client checkout
+// idempotency (a fresh HTTP checkout still mints a new order id).
 export async function reserveAndCreateOrder(
   order: Order,
   totalInventory: number
@@ -334,18 +448,20 @@ export async function reserveAndCreateOrder(
   await reapExpiredHolds();
   const result = await evalScript(
     RESERVE_AND_CREATE_SCRIPT,
-    [inventoryKey(order.eventId, order.tierName), orderKey(order.id), PENDING_HOLDS_KEY],
     [
-      String(order.quantity),
-      String(totalInventory),
-      JSON.stringify(order),
-      order.id,
-      String(order.holdExpiresAt),
-    ]
+      inventoryKey(order.eventId, order.tierName),
+      orderKey(order.id),
+      PENDING_HOLDS_KEY,
+      inventoryInitKey(order.eventId, order.tierName),
+    ],
+    [JSON.stringify(order), String(totalInventory)]
   );
   const code = resultCode(result);
   if (code === "OK") return "created";
   if (code === "SOLD_OUT") return "sold_out";
+  if (code === "EXISTS") return "exists";
+  if (code === "CONFLICT") return "conflict";
+  if (code === "LOST") return "lost";
   return "error";
 }
 
