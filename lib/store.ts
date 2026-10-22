@@ -30,7 +30,7 @@
 
 import { redis } from "./redis";
 import { hyperswitchFetch } from "./hyperswitch";
-import { DEMAND_WINDOW_SECONDS } from "./constants";
+import { DEMAND_WINDOW_SECONDS, MAX_INVENTORY } from "./constants";
 import type { Order, OrderStatus } from "./types";
 
 // ZSET of still-pending order ids, scored by holdExpiresAt. Lets reap
@@ -80,20 +80,33 @@ local holdsKey = KEYS[3]
 local initKey = KEYS[4]
 local orderJson = ARGV[1]
 local total = tonumber(ARGV[2])
+local maxInv = tonumber(ARGV[3])
 
 if not orderJson or orderJson == '' then return {'ERR', 'bad_order'} end
-if not total or total < 0 then return {'ERR', 'bad_total'} end
+if not maxInv or maxInv < 1 then return {'ERR', 'bad_max'} end
+-- Capacity must be a non-negative integer within the explicit safe bound.
+if not total or total ~= math.floor(total) or total < 0 or total > maxInv then
+  return {'ERR', 'bad_total'}
+end
 
 local okIn, incoming = pcall(cjson.decode, orderJson)
 if not okIn or type(incoming) ~= 'table' then return {'ERR', 'bad_order_json'} end
 local orderId = incoming['id']
-local qty = tonumber(incoming['quantity'])
+local qty = incoming['quantity']
 local holdExpiresAt = tonumber(incoming['holdExpiresAt'])
 local eventId = incoming['eventId']
 local tierName = incoming['tierName']
+local currency = incoming['currency']
+local unitPrice = tonumber(incoming['unitPriceCents'])
+local fee = tonumber(incoming['feeCents'])
 local amount = tonumber(incoming['amountCents'])
 if not orderId or orderId == '' then return {'ERR', 'bad_order_id'} end
-if not qty or qty < 1 then return {'ERR', 'bad_quantity'} end
+-- Quantity must be a POSITIVE INTEGER within the safe bound: a value Lua
+-- could parse numerically (e.g. 1.5) is not enough — DECRBY needs a whole
+-- number and the result must stay in range.
+if type(qty) ~= 'number' or qty ~= math.floor(qty) or qty < 1 or qty > maxInv then
+  return {'ERR', 'bad_quantity'}
+end
 if not holdExpiresAt then return {'ERR', 'bad_hold'} end
 
 -- Type-check every key we may write BEFORE any mutation, so a corrupt
@@ -113,10 +126,21 @@ local existingRaw = redis.call('GET', orderKey)
 if existingRaw then
   local okEx, existing = pcall(cjson.decode, existingRaw)
   if not okEx or type(existing) ~= 'table' then return {'ERR', 'bad_existing_json'} end
+  -- Immutable booking fields compared on replay. Differing currency or
+  -- any part of the pricing breakdown (unit price / fee / total) is a
+  -- CONFLICT, never a matching result — even when the totals coincide.
+  -- Timestamps (createdAt) and holdExpiresAt are deliberately NOT
+  -- compared: they belong to the original attempt and are retained from
+  -- the stored order (EXISTS returns without overwriting), so a matching
+  -- retry preserves the original hold window, progressed status, and any
+  -- payment association.
   local sameBooking =
     existing['eventId'] == eventId and
     existing['tierName'] == tierName and
+    existing['currency'] == currency and
     tonumber(existing['quantity']) == qty and
+    tonumber(existing['unitPriceCents']) == unitPrice and
+    tonumber(existing['feeCents']) == fee and
     tonumber(existing['amountCents']) == amount
   if sameBooking then
     return {'EXISTS', tostring(existing['status'])}
@@ -131,8 +155,14 @@ end
 local remaining
 local needSeed = false
 if invType == 'string' then
-  remaining = tonumber(redis.call('GET', invKey))
-  if not remaining then return {'ERR', 'inv_nan'} end
+  -- The counter must be a CANONICAL non-negative integer string that
+  -- Redis integer ops accept — not merely something tonumber parses.
+  -- This rejects corrupt values like "1.5", "1.0", or "1e2" instead of
+  -- silently normalizing them, and it is not reseeded.
+  local cs = redis.call('GET', invKey)
+  if type(cs) ~= 'string' or not string.match(cs, '^%d+$') then return {'ERR', 'inv_nan'} end
+  remaining = tonumber(cs)
+  if not remaining or remaining > maxInv then return {'ERR', 'inv_range'} end
 else
   if redis.call('EXISTS', initKey) == 1 then
     return {'LOST'}
@@ -175,6 +205,9 @@ local orderId = ARGV[1]
 local expectedFrom = ARGV[2]
 local toStatus = ARGV[3]
 local release = ARGV[4] == '1'
+local maxInv = tonumber(ARGV[5])
+
+if not maxInv or maxInv < 1 then return {'ERR', 'bad_max'} end
 
 local raw = redis.call('GET', orderKey)
 if not raw then return {'NOT_FOUND'} end
@@ -196,10 +229,23 @@ if holdsType ~= 'zset' and holdsType ~= 'none' then return {'ERR', 'holds_type'}
 
 local qty
 if release then
-  qty = tonumber(order['quantity'])
-  if not qty or qty < 0 then return {'ERR', 'bad_quantity'} end
+  -- The released quantity (from the stored order) must be a POSITIVE
+  -- INTEGER within the safe bound — rejecting zero/fractional/out-of-range
+  -- stored quantities before INCRBY.
+  qty = order['quantity']
+  if type(qty) ~= 'number' or qty ~= math.floor(qty) or qty < 1 or qty > maxInv then
+    return {'ERR', 'bad_quantity'}
+  end
+  -- The counter must EXIST and be a canonical non-negative integer string
+  -- (a missing counter here means a lost counter: refuse, don't recreate).
+  -- And the result must not exceed the safe bound, so INCRBY cannot
+  -- overflow.
   if redis.call('TYPE', invKey).ok ~= 'string' then return {'ERR', 'inv_missing'} end
-  if not tonumber(redis.call('GET', invKey)) then return {'ERR', 'inv_nan'} end
+  local cs = redis.call('GET', invKey)
+  if not string.match(cs, '^%d+$') then return {'ERR', 'inv_nan'} end
+  local curCount = tonumber(cs)
+  if not curCount or curCount > maxInv then return {'ERR', 'inv_range'} end
+  if curCount + qty > maxInv then return {'ERR', 'inv_overflow'} end
 end
 
 -- Writes only below this line; every key above was validated, so none of
@@ -250,14 +296,22 @@ const READ_AVAILABILITY_SCRIPT = `
 local invKey = KEYS[1]
 local initKey = KEYS[2]
 local total = tonumber(ARGV[1])
-if not total or total < 0 then return {'ERR', 'bad_total'} end
+local maxInv = tonumber(ARGV[2])
+if not maxInv or maxInv < 1 then return {'ERR', 'bad_max'} end
+if not total or total ~= math.floor(total) or total < 0 or total > maxInv then
+  return {'ERR', 'bad_total'}
+end
 
 local invType = redis.call('TYPE', invKey).ok
 if invType ~= 'string' and invType ~= 'none' then return {'ERR', 'inv_type'} end
 
 if invType == 'string' then
-  local v = tonumber(redis.call('GET', invKey))
-  if not v then return {'ERR', 'inv_nan'} end
+  -- Reject (don't normalize) a counter that isn't a canonical non-negative
+  -- integer string in range, e.g. "1.5", "1.0", "1e2", or an overflow.
+  local cs = redis.call('GET', invKey)
+  if type(cs) ~= 'string' or not string.match(cs, '^%d+$') then return {'ERR', 'inv_nan'} end
+  local v = tonumber(cs)
+  if not v or v > maxInv then return {'ERR', 'inv_range'} end
   return {'OK', v}
 end
 
@@ -408,7 +462,7 @@ export async function getRemainingInventory(
   const result = await evalScript(
     READ_AVAILABILITY_SCRIPT,
     [inventoryKey(eventId, tierName), inventoryInitKey(eventId, tierName)],
-    [String(totalInventory)]
+    [String(totalInventory), String(MAX_INVENTORY)]
   );
   const code = resultCode(result);
   if (code === "LOST") {
@@ -454,7 +508,7 @@ export async function reserveAndCreateOrder(
       PENDING_HOLDS_KEY,
       inventoryInitKey(order.eventId, order.tierName),
     ],
-    [JSON.stringify(order), String(totalInventory)]
+    [JSON.stringify(order), String(totalInventory), String(MAX_INVENTORY)]
   );
   const code = resultCode(result);
   if (code === "OK") return "created";
@@ -484,7 +538,7 @@ export async function transitionOrder(
   const result = await evalScript(
     TRANSITION_SCRIPT,
     [orderKey(id), inventoryKey(order.eventId, order.tierName), PENDING_HOLDS_KEY],
-    [id, from, to, releasesInventory ? "1" : "0"]
+    [id, from, to, releasesInventory ? "1" : "0", String(MAX_INVENTORY)]
   );
   const code = resultCode(result);
   if (code === "OK") return "applied";
