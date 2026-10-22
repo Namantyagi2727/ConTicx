@@ -194,8 +194,15 @@ build still succeeds. CI runs this same build with the same
   retry — decrements inventory at most once and returns an `exists`
   result without overwriting the order, resetting its status, or
   recreating a resolved hold; a different booking under the same id is
-  rejected (`conflict`) with no mutation. (Internal-operation replay
-  safety, not client checkout idempotency, which is deferred.)
+  rejected (`conflict`) with no mutation. The compared immutable booking
+  fields are `eventId`, `tierName`, `currency`, `quantity`,
+  `unitPriceCents`, `feeCents`, and `amountCents`, so a differing currency
+  or pricing breakdown conflicts even when the total matches. `createdAt`
+  and `holdExpiresAt` are deliberately **not** compared — they belong to
+  the original attempt and are retained from the stored order, so a
+  matching retry preserves the original hold window, progressed status,
+  and any payment association. (Internal-operation replay safety, not
+  client checkout idempotency, which is deferred.)
 - **Initialization vs lost counter (Phase 1B.1).** A persistent per-tier
   `inventory_init:<event>:<tier>` record distinguishes a genuinely new
   tier (seed to full) from a tier whose counter was lost (an absent
@@ -205,11 +212,19 @@ build still succeeds. CI runs this same build with the same
   full or fabricate a counter.
 - **Pre-write validation (Phase 1B.1).** A Lua script does **not** roll
   back writes that ran before a later error, so these guarantees rest on
-  each script validating every key it writes — order existence, hold-index
-  type, inventory type and numeric content, and numeric inputs — *before*
-  the first mutation, not on Lua atomicity by itself. Tests corrupt a
-  late-written key (hold index, counter content) and assert the operation
-  is rejected with no partial write.
+  each script validating — *before* the first mutation — every key it
+  writes and every value it computes: order existence, hold-index type,
+  the counter's type **and canonical-integer representation** (a value
+  `tonumber()` parses but Redis integer ops reject — `"1.5"`, `"1.0"`,
+  `"1e2"` — is rejected, not silently normalized), positive-integer
+  quantities, and capacities/results within an explicit safe bound
+  (`MAX_INVENTORY`) so `DECRBY`/`INCRBY` cannot overflow. This validates
+  the inputs and stored shapes these scripts touch; it is **not** a claim
+  that a Redis script can never fail mid-sequence under any operational
+  condition (e.g. an out-of-memory rejection, eviction, or a killed
+  instance). Tests feed raw numeric-looking invalid values (written as
+  raw bytes so the SDK can't normalize them) and corrupt keys, and assert
+  the operation is rejected with no partial write.
 
 These prove the **harness** and the **oversell path** behave as
 expected. They do **not** prove the application is secure or correct —
