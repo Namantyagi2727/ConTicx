@@ -179,6 +179,17 @@ build still succeeds. CI runs this same build with the same
   loopback URL — verified with a local fixture server that records
   whether the redirect target was requested; no remote host is
   contacted.
+- **Atomic store operations (Phase 1B.1).** Reserve-and-create, status
+  transitions + inventory release, and payment-id attachment each run as
+  a single Redis Lua script. Regression tests assert, on raw Redis
+  state: concurrent reservations never exceed capacity and reserves =
+  orders = holds = inventory; an insufficient reserve writes nothing;
+  two concurrent refunds (and a retried one) release a seat exactly once
+  (INV-02 fixed); two conflicting transitions apply exactly one inventory
+  effect; a payment-id attach racing a transition never resurrects
+  pending state; duplicate attaches no-op and conflicting ones are
+  refused; and invalid state, wrong key types, or malformed records are
+  rejected with no partial write.
 
 These prove the **harness** and the **oversell path** behave as
 expected. They do **not** prove the application is secure or correct —
@@ -196,14 +207,19 @@ present**. They are evidence of a bug, not a guarantee:
 | --- | --- | --- |
 | `webhook-forgery.characterization` | SEC-01 | An unsigned webhook promotes an order to `succeeded`. |
 | `expiry-cancel-400.characterization` | INV-01 | A hold whose cancel is rejected with 400 is marked `succeeded` and keeps its seat. |
-| `double-release.characterization` | INV-02 | Two concurrent refunds both release the same seat (forced interleaving). |
 | `refund-authorization.characterization` | SEC-02 | A refund succeeds for a caller with no ownership proof. |
 
-**Phase 1B must convert each of these into a regression test that
-asserts the corrected behavior** (invalid signature rejected; real
-payment status re-fetched after a non-2xx cancel; a single atomic
-release; unauthorized refund gets a uniform 404). Until then, do not
-read a passing characterization test as a passing security control.
+The **INV-02** double-release characterization was **converted** into a
+regression test in Phase 1B.1
+(`concurrent-refund-release.regression.test.ts`): it now asserts a single
+atomic release. The three rows above remain characterizations — Phase
+1B.1 deliberately did **not** touch webhook authenticity (SEC-01), the
+cancel-400 interpretation (INV-01), or refund authorization (SEC-02), so
+those defects are still present and these tests still pass because of it.
+Do not read a passing characterization test as a passing security
+control. Converting the remaining three is the job of later subphases
+(invalid signature rejected; real payment status re-fetched after a
+non-2xx cancel; unauthorized refund gets a uniform 404).
 
 ## Emulator and provider-fake limitations
 
