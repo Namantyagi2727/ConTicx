@@ -24,12 +24,18 @@ defects from the Phase 0 audit. It changes no application runtime code.
 
 ```bash
 npm run lint           # eslint
-npm run typecheck      # tsc --noEmit (includes tests)
+npm run typecheck      # next typegen && tsc --noEmit (includes tests)
 npm run test:unit      # unit tests only — no Docker needed
 npm run test:integration   # integration tests — Docker services required
 npm test               # unit + integration
 npm run build          # production build (see "Isolated build" below)
 ```
+
+`typecheck` runs `next typegen` first because the App Router's route types
+(`LayoutProps`, `PageProps`, …) are generated into `.next/types`, not
+committed. A fresh checkout — such as CI — has no `.next/`, so a bare
+`tsc --noEmit` fails there even when it passes in a working copy that has
+already run `next dev` or `next build`.
 
 Start the local services before the integration tests:
 
