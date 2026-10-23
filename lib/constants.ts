@@ -10,3 +10,13 @@ export const DEMAND_DISPLAY_THRESHOLD = 3; // don't show the badge below this â€
 // inventory arithmetic (DECRBY/INCRBY) cannot overflow. Used by the store
 // scripts to reject out-of-range or unsafe values before any write.
 export const MAX_INVENTORY = 1_000_000_000;
+
+// Retention for the webhook-event dedup marker (see the Hyperswitch webhook
+// handler). Hyperswitch retries an undelivered webhook for up to 24 hours,
+// so the "already processed" marker must outlive that window for a late
+// retry of an already-handled delivery to be recognized and skipped; after
+// that it expires so the keyspace does not grow without bound. 7 days = the
+// 24h retry window plus generous slack. The marker is an optimization to
+// skip duplicate provider reads, NOT the mechanism that prevents duplicate
+// business effects â€” the atomic Phase 1B.1 transitions are.
+export const WEBHOOK_EVENT_TTL_SECONDS = 7 * 24 * 60 * 60;

@@ -30,7 +30,7 @@
 
 import { redis } from "./redis";
 import { hyperswitchFetch } from "./hyperswitch";
-import { DEMAND_WINDOW_SECONDS, MAX_INVENTORY } from "./constants";
+import { DEMAND_WINDOW_SECONDS, MAX_INVENTORY, WEBHOOK_EVENT_TTL_SECONDS } from "./constants";
 import type { Order, OrderStatus } from "./types";
 
 // ZSET of still-pending order ids, scored by holdExpiresAt. Lets reap
@@ -157,10 +157,15 @@ local needSeed = false
 if invType == 'string' then
   -- The counter must be a CANONICAL non-negative integer string that
   -- Redis integer ops accept — not merely something tonumber parses.
-  -- This rejects corrupt values like "1.5", "1.0", or "1e2" instead of
-  -- silently normalizing them, and it is not reseeded.
+  -- This rejects corrupt values like "1.5", "1.0", "1e2", or a
+  -- leading-zero form like "01" (Redis integer parsing rejects leading
+  -- zeros; only "0" itself is a zero) instead of silently normalizing
+  -- them, and it is not reseeded. Lua patterns have no alternation, so
+  -- "canonical" is: exactly "0", or 1-9 then any digits.
   local cs = redis.call('GET', invKey)
-  if type(cs) ~= 'string' or not string.match(cs, '^%d+$') then return {'ERR', 'inv_nan'} end
+  if type(cs) ~= 'string' or not (cs == '0' or string.match(cs, '^[1-9]%d*$')) then
+    return {'ERR', 'inv_nan'}
+  end
   remaining = tonumber(cs)
   if not remaining or remaining > maxInv then return {'ERR', 'inv_range'} end
 else
@@ -239,10 +244,11 @@ if release then
   -- The counter must EXIST and be a canonical non-negative integer string
   -- (a missing counter here means a lost counter: refuse, don't recreate).
   -- And the result must not exceed the safe bound, so INCRBY cannot
-  -- overflow.
+  -- overflow. "Canonical" rejects leading-zero forms like "01" that Redis
+  -- integer ops reject; only "0" itself is a zero.
   if redis.call('TYPE', invKey).ok ~= 'string' then return {'ERR', 'inv_missing'} end
   local cs = redis.call('GET', invKey)
-  if not string.match(cs, '^%d+$') then return {'ERR', 'inv_nan'} end
+  if not (cs == '0' or string.match(cs, '^[1-9]%d*$')) then return {'ERR', 'inv_nan'} end
   local curCount = tonumber(cs)
   if not curCount or curCount > maxInv then return {'ERR', 'inv_range'} end
   if curCount + qty > maxInv then return {'ERR', 'inv_overflow'} end
@@ -307,9 +313,13 @@ if invType ~= 'string' and invType ~= 'none' then return {'ERR', 'inv_type'} end
 
 if invType == 'string' then
   -- Reject (don't normalize) a counter that isn't a canonical non-negative
-  -- integer string in range, e.g. "1.5", "1.0", "1e2", or an overflow.
+  -- integer string in range, e.g. "1.5", "1.0", "1e2", a leading-zero form
+  -- like "01", or an overflow. "Canonical" is exactly "0", or 1-9 then any
+  -- digits (Lua patterns have no alternation).
   local cs = redis.call('GET', invKey)
-  if type(cs) ~= 'string' or not string.match(cs, '^%d+$') then return {'ERR', 'inv_nan'} end
+  if type(cs) ~= 'string' or not (cs == '0' or string.match(cs, '^[1-9]%d*$')) then
+    return {'ERR', 'inv_nan'}
+  end
   local v = tonumber(cs)
   if not v or v > maxInv then return {'ERR', 'inv_range'} end
   return {'OK', v}
@@ -591,6 +601,37 @@ export async function attachPaymentId(id: string, paymentId: string): Promise<At
 export async function getOrder(id: string): Promise<Order | undefined> {
   await reapExpiredHolds();
   return readOrder(id);
+}
+
+// Reads the stored order WITHOUT getOrder's lazy-reap side effect. The
+// webhook handler uses this: authenticating a delivery and binding a
+// payment to its order must not incidentally trigger unrelated hold
+// expiry/cancellation work (which reapExpiredHolds does, and which can
+// itself call the provider). Returns the order as-is, or undefined if the
+// key is absent.
+export async function peekOrder(id: string): Promise<Order | undefined> {
+  return readOrder(id);
+}
+
+// ---------------------------------------------------------------------------
+// Webhook-delivery dedup marker. A bounded-TTL key set ONLY after a webhook
+// delivery's business outcome is durably recorded. isWebhookEventProcessed
+// lets a sequential redelivery of an already-handled event skip a duplicate
+// provider read; it is NOT what prevents duplicate business effects (the
+// atomic transitions are — a concurrent duplicate that races past this
+// check still no-ops at the transition). Keep this a plain marker: not a
+// lock, not a queue.
+// ---------------------------------------------------------------------------
+function webhookEventKey(eventId: string) {
+  return `webhook_event:${eventId}`;
+}
+
+export async function isWebhookEventProcessed(eventId: string): Promise<boolean> {
+  return (await redis.exists(webhookEventKey(eventId))) === 1;
+}
+
+export async function markWebhookEventProcessed(eventId: string): Promise<void> {
+  await redis.set(webhookEventKey(eventId), "1", { ex: WEBHOOK_EVENT_TTL_SECONDS });
 }
 
 // Lightweight "how much interest is this event getting right now"

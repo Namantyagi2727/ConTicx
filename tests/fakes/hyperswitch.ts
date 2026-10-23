@@ -33,6 +33,8 @@ export interface StoredPayment {
   amount: number;
   currency: string;
   metadata: Record<string, unknown> | null;
+  merchant_id?: string;
+  profile_id?: string;
 }
 
 // Hyperswitch returns a refund status that is NOT always "succeeded"
@@ -54,6 +56,13 @@ export class FakeHyperswitch {
     error: { type: "invalid_request", code: "IR_16", message: "You cannot cancel this payment because it has status succeeded" },
   };
   refundStatus: RefundStatus = "succeeded";
+  // Delays every response by this many ms — used to exercise the provider
+  // request timeout deterministically (set a delay above the configured
+  // HYPERSWITCH_TIMEOUT_MS).
+  delayMs = 0;
+  // When set, GET /payments/:id replies 200 with a non-JSON body, so the
+  // retrieve helper's JSON parse fails (a misbehaving-provider case).
+  getReturnsNonJson = false;
 
   // `port` 0 binds an ephemeral port (used by the fake's own unit
   // self-test); the integration setup passes the fixed loopback port
@@ -85,10 +94,39 @@ export class FakeHyperswitch {
     this.seq = 0;
     this.cancelRejectsWith400 = false;
     this.refundStatus = "succeeded";
+    this.delayMs = 0;
+    this.getReturnsNonJson = false;
   }
 
   getPayment(id: string): StoredPayment | undefined {
     return this.payments.get(id);
+  }
+
+  // Seeds a payment directly (bypassing POST /payments) so a test can set
+  // up a specific retrieve result — e.g. a payment whose metadata.orderId
+  // points at an order, or one carrying a particular merchant_id — without
+  // going through the full create flow.
+  seedPayment(p: {
+    payment_id: string;
+    status?: string;
+    amount?: number;
+    currency?: string;
+    metadata?: Record<string, unknown> | null;
+    merchant_id?: string;
+    profile_id?: string;
+  }): StoredPayment {
+    const payment: StoredPayment = {
+      payment_id: p.payment_id,
+      client_secret: `${p.payment_id}_secret_seed`,
+      status: p.status ?? "requires_payment_method",
+      amount: p.amount ?? 0,
+      currency: p.currency ?? "USD",
+      metadata: p.metadata ?? null,
+      merchant_id: p.merchant_id,
+      profile_id: p.profile_id,
+    };
+    this.payments.set(payment.payment_id, payment);
+    return payment;
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -97,6 +135,12 @@ export class FakeHyperswitch {
     const method = req.method ?? "GET";
     const body = await readJson(req);
     this.calls.push({ method, path, body });
+
+    // Optional response delay, so a test can drive the client's request
+    // timeout (the client aborts before this resolves).
+    if (this.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    }
 
     // POST /payments
     if (method === "POST" && path === "/payments") {
@@ -129,6 +173,11 @@ export class FakeHyperswitch {
     // GET /payments/:id
     const getMatch = path.match(/^\/payments\/([^/]+)$/);
     if (method === "GET" && getMatch) {
+      if (this.getReturnsNonJson) {
+        res.writeHead(200, { "content-type": "text/html" });
+        res.end("<html>not json</html>");
+        return;
+      }
       const id = decodeURIComponent(getMatch[1]);
       const payment = this.payments.get(id);
       if (!payment) return json(res, 404, { error: { message: "payment not found" } });
