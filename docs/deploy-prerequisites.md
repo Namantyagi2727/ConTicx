@@ -47,6 +47,24 @@ potentially a deploy trigger. Before the first push, one of these must be
   Redis database and sandbox-only payment keys), so a preview deployment
   touches no production data or real money.
 
+### Automatic Git deployments are disabled in `vercel.json`
+
+`vercel.json` at the repository root sets
+`"git": { "deploymentEnabled": false }`. Vercel's Git configuration docs
+say this turns off automatic deployments for **all branches**, `main`
+included. Commits, pushes, pull requests, and GitHub Actions CI continue
+as normal, and merging a PR does not deploy. Deploying is a **separate,
+explicitly approved action**.
+
+- The setting lives in the repository, so it covers only commits that
+  contain this file. A branch created before it must merge it in first.
+- Vercel does not document this setting as covering deployments made with
+  the Vercel CLI or through Deploy Hooks. Treat those as still possible,
+  and use neither without approval.
+- It is separate from the dashboard's Ignored Build Step setting. If the
+  project's Root Directory ever moves away from the repository root, this
+  file must move with it.
+
 ## First-push checklist
 
 A first push of this branch requires **all** of:
