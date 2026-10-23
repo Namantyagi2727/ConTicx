@@ -4,8 +4,10 @@ import { getEvent } from "@/lib/events";
 import { HOLD_DURATION_MS, MAX_QUANTITY_PER_ORDER, SERVICE_FEE_RATE } from "@/lib/constants";
 import {
   attachPaymentId,
+  clearPaymentAttempt,
   getRemainingInventory,
   InventoryStateError,
+  markPaymentAttempt,
   recordDemandSignal,
   reserveAndCreateOrder,
   updateOrderStatus,
@@ -118,6 +120,13 @@ export async function POST(request: Request) {
   // under-counts; it never blocks or fails the purchase.
   await recordDemandSignal(event.id).catch(() => {});
 
+  // Record that we are about to create a provider payment for this order,
+  // BEFORE the call; cleared once the payment id is attached. Diagnostic
+  // only: if attachment never completes, expiry notes the marker in the
+  // reconciliation reason. Expiry never treats its ABSENCE as proof that no
+  // payment exists — a payment-less expired order is always retained.
+  await markPaymentAttempt(order.id);
+
   const response = await hyperswitchFetch("/payments", {
     method: "POST",
     body: JSON.stringify({
@@ -150,11 +159,19 @@ export async function POST(request: Request) {
   // payment-status poll had already advanced in the sub-second window
   // between the create above and here, resurrecting a resolved hold.
   const attached = await attachPaymentId(order.id, data.payment_id);
-  if (attached !== "ok" && attached !== "noop") {
+  if (attached === "ok" || attached === "noop") {
+    // The payment id is attached, so the order is no longer in the
+    // orphan-risk window — drop the attempt marker. (Best-effort: if this
+    // fails, the marker simply expires via its TTL.)
+    await clearPaymentAttempt(order.id).catch(() => {});
+  } else {
     // conflict/not_found/error: the order was resolved or removed out
     // from under us in that window. The payment exists and carries
     // metadata.orderId, so the webhook / payment-status route will
-    // reconcile by order id; log and return the payment either way.
+    // reconcile by order id; log and return the payment either way. The
+    // attempt marker is deliberately LEFT set here — a payment was created
+    // but not attached, so expiry must treat this order as a possible
+    // orphan rather than release it.
     console.warn(
       `[orders] payment attach '${attached}' for order ${order.id} (payment ${data.payment_id})`
     );

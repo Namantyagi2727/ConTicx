@@ -20,3 +20,41 @@ export const MAX_INVENTORY = 1_000_000_000;
 // skip duplicate provider reads, NOT the mechanism that prevents duplicate
 // business effects — the atomic Phase 1B.1 transitions are.
 export const WEBHOOK_EVENT_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+// Lazy hold expiry (reapExpiredHolds) processes at most this many expired
+// holds per pass, oldest first, and each one makes a bounded number of
+// provider calls (retrieve, at most one cancel, one re-retrieve). This caps
+// the work a single request can trigger: a large backlog or a provider
+// outage is worked off across many passes instead of one request looping
+// over every expired order.
+export const HOLD_EXPIRY_BATCH_SIZE = 20;
+
+// Provider-wait budget for request-triggered expiry. Expiry runs inline in
+// front of an ordinary request (an availability read, order creation), so
+// without this the batch cap alone would allow 20 holds x 3 calls x 10 s of
+// provider waiting. The budget is the TOTAL wall time spent inside provider
+// calls by expiry on one instance within one budget window; each call's
+// timeout is capped at the remaining budget, and no new provider call starts
+// once fewer than HOLD_EXPIRY_MIN_CALL_MS remain. 2 s keeps the worst-case
+// added latency of housekeeping modest while still letting a normal
+// sandbox-latency pass (~100-500 ms per call) make real progress.
+//
+// The window groups the several expiry passes one request can trigger
+// (order creation runs up to three) so they share one budget instead of
+// each getting a fresh one. A request that straddles a window boundary can
+// see at most two windows' budget. Redis round trips and other overhead are
+// NOT counted — this bounds provider waiting, not end-to-end latency.
+// Overridable via HOLD_EXPIRY_PROVIDER_BUDGET_MS (read per pass) for tuning
+// and tests.
+export const HOLD_EXPIRY_PROVIDER_BUDGET_MS = 2_000;
+export const HOLD_EXPIRY_BUDGET_WINDOW_MS = 10_000;
+export const HOLD_EXPIRY_MIN_CALL_MS = 250;
+
+// TTL for the per-order "a provider payment was attempted" marker, set just
+// before the payment is created and cleared once its id is attached. It is
+// DIAGNOSTIC ONLY: when an expired hold has no attached payment id, expiry
+// records whether the marker was present in the reconciliation reason. Its
+// absence is never treated as proof that no payment exists (such an order
+// is always retained). Comfortably longer than the hold window plus any
+// lazy-reap lag.
+export const PAYMENT_ATTEMPT_TTL_SECONDS = 24 * 60 * 60;
