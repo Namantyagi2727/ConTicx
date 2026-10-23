@@ -29,8 +29,15 @@
 // transitionOrder / attachPaymentId below.
 
 import { redis } from "./redis";
-import { hyperswitchFetch } from "./hyperswitch";
-import { DEMAND_WINDOW_SECONDS, MAX_INVENTORY, WEBHOOK_EVENT_TTL_SECONDS } from "./constants";
+import { hyperswitchFetch, retrievePayment, type ProviderPayment } from "./hyperswitch";
+import {
+  DEMAND_WINDOW_SECONDS,
+  HOLD_EXPIRY_BATCH_SIZE,
+  MAX_INVENTORY,
+  PAYMENT_ATTEMPT_TTL_SECONDS,
+  WEBHOOK_EVENT_TTL_SECONDS,
+} from "./constants";
+import { bindPaymentToOrder, decideFromStatus, type Decision } from "./payment-policy";
 import type { Order, OrderStatus } from "./types";
 
 // ZSET of still-pending order ids, scored by holdExpiresAt. Lets reap
@@ -57,6 +64,22 @@ function inventoryInitKey(eventId: string, tierName: string) {
 
 function demandKey(eventId: string) {
   return `demand:${eventId}`;
+}
+
+// Durable "needs human/later reconciliation" record for one order, carrying
+// a bounded non-sensitive reason and a timestamp. A SEPARATE key (not a
+// field on the order) so recording it never does a whole-order stale write
+// and never touches inventory. Persistent on purpose — it is a backlog item
+// the recovery phase owns, not a transient marker.
+function reconcileKey(id: string) {
+  return `reconcile:${id}`;
+}
+
+// Per-order marker that a provider payment was ATTEMPTED (set just before
+// the create call, cleared once its id is attached). Read only when an
+// expired hold has no attached payment id.
+function paymentAttemptKey(id: string) {
+  return `payment_attempt:${id}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -373,20 +396,21 @@ async function readOrder(id: string): Promise<Order | undefined> {
   return order ?? undefined;
 }
 
-// Cancels the Hyperswitch intent for a genuinely-expired pending hold
-// before releasing its inventory — see the comment on the loop body
-// for the race this guards against. Guarded by a single in-flight
-// promise: getRemainingInventory is called once per tier, and
-// Promise.all-ing those calls (as the event page does for GA + VIP
-// together) would otherwise start two concurrent reap passes that
-// both see the same expired order and both race to cancel the same
-// payment_id — whichever cancel response loses that race gets
-// rejected by Hyperswitch and would incorrectly read as "already
-// paid". Joining concurrent callers onto the same pass removes that
-// race entirely. Note this guard is per serverless instance, not
-// global — Redis's atomicity is what keeps two *different* instances
-// reaping at the same moment from double-cancelling, same as it keeps
-// two concurrent reservations from overselling.
+// Lazy hold expiry. For each expired pending hold, resolve its fate from
+// AUTHORITATIVE provider evidence, never from a clock or an HTTP code:
+// retrieve the payment, bind it, and apply the single transition its status
+// justifies (via the shared policy). A payment still in a cancellable state
+// gets ONE bounded cancellation attempt followed by a re-read — a cancel
+// 400 / non-success / timeout never itself produces succeeded or released
+// (the INV-01 fix). Inconclusive outcomes retain the allocation and are
+// flagged for the recovery phase rather than guessed.
+//
+// Single-flight (reapInFlight) is kept as a per-instance OPTIMISATION so
+// one request's concurrent callers (e.g. GA + VIP availability read in
+// parallel) share one pass. Correctness does NOT depend on it: every
+// release is a guarded atomic pending->terminal transition, so two passes
+// (here or on different instances) that both see the same hold apply the
+// inventory effect at most once.
 let reapInFlight: Promise<void> | null = null;
 
 async function reapExpiredHolds(): Promise<void> {
@@ -394,65 +418,17 @@ async function reapExpiredHolds(): Promise<void> {
 
   reapInFlight = (async () => {
     const now = Date.now();
+    // Bounded batch, oldest-expired first. A large backlog or a provider
+    // outage is worked off across many passes; one request never processes
+    // every expired order.
     const expiredIds = await redis.zrange<string[]>(PENDING_HOLDS_KEY, "-inf", now, {
       byScore: true,
+      offset: 0,
+      count: HOLD_EXPIRY_BATCH_SIZE,
     });
 
     for (const orderId of expiredIds) {
-      const order = await readOrder(orderId);
-      if (!order || order.status !== "pending") {
-        // Already resolved (webhook, another instance's reap pass, or
-        // a stale entry) — drop it so we stop re-checking it.
-        await redis.zrem(PENDING_HOLDS_KEY, orderId);
-        continue;
-      }
-
-      if (!order.paymentId) {
-        await updateOrderStatus(order.id, "expired");
-        continue;
-      }
-
-      // The race this guards against: a shopper's payment can succeed
-      // at Hyperswitch in the same moment their 10-minute hold ticks
-      // over (a slow bank auth, a redirect flow, a browser tab left
-      // open). If we freed the inventory purely on the clock, we
-      // could resell a seat that was just paid for. So cancelling the
-      // intent always comes first, and the order's fate depends on
-      // what Hyperswitch says:
-      //   - cancel succeeds -> the intent was still in a cancellable
-      //     state, so it was genuinely unpaid. Safe to expire and
-      //     release the hold.
-      //   - cancel is rejected with 400 (IR_16, "cannot cancel from
-      //     status X") -> the intent moved past a cancellable state,
-      //     which for a payment we created can only mean it succeeded
-      //     or is mid-flight. Treat the order as paid and keep its
-      //     inventory reserved.
-      //   - cancel fails for any other reason (network error, 401,
-      //     5xx) -> inconclusive. Leave the order pending and retry
-      //     on the next reap instead of guessing either way.
-      //
-      // NOTE (tracked defect INV-01): reading a 400 as "paid" is an
-      // over-broad inference a 400 does not justify. Phase 1B.1 does
-      // not change this interpretation — it only makes the resulting
-      // transition atomic. Re-fetching the real payment status after a
-      // non-2xx cancel is deferred to a later subphase.
-      try {
-        const response = await hyperswitchFetch(
-          `/payments/${order.paymentId}/cancel`,
-          {
-            method: "POST",
-            body: JSON.stringify({ cancellation_reason: "hold_expired" }),
-          }
-        );
-
-        if (response.ok) {
-          await updateOrderStatus(order.id, "expired");
-        } else if (response.status === 400) {
-          await updateOrderStatus(order.id, "succeeded");
-        }
-      } catch {
-        // Network/infra error — inconclusive, leave pending.
-      }
+      await reconcileExpiredHold(orderId);
     }
   })();
 
@@ -461,6 +437,84 @@ async function reapExpiredHolds(): Promise<void> {
   } finally {
     reapInFlight = null;
   }
+}
+
+// Resolves one expired hold. Removes it from the active reap index once it
+// reaches a terminal or a flagged-unresolved state, so a stuck hold cannot
+// consume provider calls on every subsequent pass; a transient failure
+// leaves it in the index to retry next pass (bounded by the batch size).
+async function reconcileExpiredHold(orderId: string): Promise<void> {
+  const order = await readOrder(orderId);
+  if (!order || order.status !== "pending") {
+    // Already resolved elsewhere (a webhook, another pass, or a stale
+    // entry) — drop it so we stop re-checking.
+    await redis.zrem(PENDING_HOLDS_KEY, orderId);
+    return;
+  }
+
+  // (A) No attached payment id. A payment may still have been created before
+  // attachment failed, so only release when we have durable evidence that no
+  // provider call was ever initiated (no payment-attempt marker). Otherwise
+  // retain the allocation and flag it: full orphan-payment recovery is
+  // deferred, so such a hold can stay unavailable until that phase.
+  if (!order.paymentId) {
+    if (await hasPaymentAttempt(orderId)) {
+      await flagForReconciliation(orderId, "no_payment_id_but_attempt_made");
+      await redis.zrem(PENDING_HOLDS_KEY, orderId);
+    } else {
+      await transitionOrder(orderId, "pending", "expired", true);
+    }
+    return;
+  }
+
+  // (B) Reconcile against authoritative provider state.
+  const first = await reconcileKnownOrder(order);
+  if (first.result === "paid" || first.result === "released") return; // transition removed the hold
+  if (first.result === "transient") return; // retry next pass (bounded)
+  if (first.result === "retained" || first.result === "conflict") {
+    // Already flagged by applyDecision; stop reprocessing.
+    await redis.zrem(PENDING_HOLDS_KEY, orderId);
+    return;
+  }
+  if (first.result !== "not_final") {
+    // mismatch / unknown_payment / not_ready: an anomaly for an order that
+    // has an attached payment id. Flag and stop reprocessing.
+    await flagForReconciliation(orderId, reconcileResultReason(first));
+    await redis.zrem(PENDING_HOLDS_KEY, orderId);
+    return;
+  }
+
+  // (C) Still non-terminal: attempt ONE bounded cancellation, then re-read
+  // authoritative state. The cancel response never itself decides the
+  // outcome — only the subsequent authoritative read does.
+  try {
+    await hyperswitchFetch(`/payments/${order.paymentId}/cancel`, {
+      method: "POST",
+      body: JSON.stringify({ cancellation_reason: "hold_expired" }),
+    });
+  } catch {
+    return; // cancel inconclusive (timeout / network) — retain, retry next pass
+  }
+
+  const second = await reconcileKnownOrder(order);
+  if (second.result === "paid" || second.result === "released") return;
+  if (second.result === "transient") {
+    // A cancellation was issued but the resulting state cannot be confirmed.
+    // Retain the allocation and record it; leave the hold in the index so a
+    // later (bounded) pass can confirm and release once the provider answers.
+    await flagForReconciliation(orderId, "cancel_issued_retrieve_inconclusive");
+    return;
+  }
+  if (second.result === "retained" || second.result === "conflict") {
+    await redis.zrem(PENDING_HOLDS_KEY, orderId);
+    return;
+  }
+  // Cancel issued but the state is still non-terminal or anomalous: retain
+  // and flag; stop reprocessing (the recovery phase owns it from here).
+  const reason =
+    second.result === "not_final" ? "cancel_then_not_final" : reconcileResultReason(second);
+  await flagForReconciliation(orderId, reason);
+  await redis.zrem(PENDING_HOLDS_KEY, orderId);
 }
 
 export async function getRemainingInventory(
@@ -562,12 +616,13 @@ export async function transitionOrder(
 // back to the tier. succeeded keeps the seat.
 const RELEASING_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>(["failed", "expired"]);
 
-// Authoritative pending -> terminal transition driven by the payment
-// status route, the webhook handler, the reaper, or the order route's
-// own provider-failure path. Atomic and idempotent by construction: a
-// redelivered webhook, a reconcile racing the webhook, or a reap racing
-// either one all resolve to a single applied transition — the others see
-// a non-pending status and no-op, never a second inventory release.
+// Fixed-semantics pending -> terminal transition, used by the order
+// route's own provider-failure path. (Provider-driven outcomes — webhook,
+// payment-status read, expiry — go through the shared reconciliation in
+// applyDecision, which calls transitionOrder directly.) Atomic and
+// idempotent by construction: concurrent or repeated callers resolve to a
+// single applied transition; the others see a non-pending status and
+// no-op, never a second inventory release.
 export async function updateOrderStatus(id: string, status: OrderStatus): Promise<void> {
   await transitionOrder(id, "pending", status, RELEASING_STATUSES.has(status));
 }
@@ -632,6 +687,141 @@ export async function isWebhookEventProcessed(eventId: string): Promise<boolean>
 
 export async function markWebhookEventProcessed(eventId: string): Promise<void> {
   await redis.set(webhookEventKey(eventId), "1", { ex: WEBHOOK_EVENT_TTL_SECONDS });
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation flag + payment-attempt marker.
+// ---------------------------------------------------------------------------
+
+export interface ReconcileFlag {
+  reason: string; // bounded, non-sensitive slug
+  at: number; // epoch ms
+}
+
+// Records that an order needs later reconciliation (a failed-but-retained
+// payment, an inconclusive expiry, a late conflict, a possible orphan). The
+// reason is bounded and non-sensitive; updating it is a single small write
+// that never rewrites the order and never changes inventory.
+export async function flagForReconciliation(orderId: string, reason: string): Promise<void> {
+  await redis.set(reconcileKey(orderId), { reason: reason.slice(0, 64), at: Date.now() });
+}
+
+export async function getReconciliationFlag(orderId: string): Promise<ReconcileFlag | null> {
+  return (await redis.get<ReconcileFlag>(reconcileKey(orderId))) ?? null;
+}
+
+// Set just before a provider payment is created, cleared once its id is
+// attached. See paymentAttemptKey / the expiry no-payment-id branch.
+export async function markPaymentAttempt(orderId: string): Promise<void> {
+  await redis.set(paymentAttemptKey(orderId), "1", { ex: PAYMENT_ATTEMPT_TTL_SECONDS });
+}
+
+export async function clearPaymentAttempt(orderId: string): Promise<void> {
+  await redis.del(paymentAttemptKey(orderId));
+}
+
+async function hasPaymentAttempt(orderId: string): Promise<boolean> {
+  return (await redis.exists(paymentAttemptKey(orderId))) === 1;
+}
+
+// ---------------------------------------------------------------------------
+// Shared reconciliation: map AUTHORITATIVE provider state onto the local
+// order using the same binding (payment-policy) and the same atomic
+// transitions on every path (webhook, payment-status read, expiry). No HTTP
+// response code, event name, or metadata alone ever drives an outcome.
+// ---------------------------------------------------------------------------
+
+export type ReconcileResult =
+  | { result: "paid" }
+  | { result: "released" }
+  | { result: "retained"; reason: string }
+  | { result: "not_final"; reason: string }
+  | { result: "conflict"; current: OrderStatus }
+  | { result: "not_ready"; reason: string }
+  | { result: "mismatch"; reason: string }
+  | { result: "transient"; reason: string }
+  | { result: "unknown_payment" };
+
+export function reconcileResultReason(r: ReconcileResult): string {
+  if (r.result === "unknown_payment") return "provider_unknown_payment";
+  if (r.result === "conflict") return `conflict_over_${r.current}`;
+  if ("reason" in r && r.reason) return r.reason;
+  return r.result;
+}
+
+// Applies the single transition a decision justifies, atomically, and
+// records reconciliation for the outcomes that leave the order unresolved
+// without a transition (a retained failed payment) or that collide with an
+// already-terminal order (a late conflict). Uses readOrder (no reap).
+async function applyDecision(order: Order, decision: Decision): Promise<ReconcileResult> {
+  if (decision.action === "retain") {
+    await flagForReconciliation(order.id, decision.reason);
+    return { result: "retained", reason: decision.reason };
+  }
+  if (decision.action === "pending") {
+    // Non-terminal: no guessed terminal outcome. Caller decides whether to
+    // retry (webhook / status) or attempt cancellation (expiry).
+    return { result: "not_final", reason: decision.reason };
+  }
+
+  const tr = await transitionOrder(order.id, "pending", decision.to, decision.release);
+  if (tr === "applied" || tr === "noop") {
+    return { result: decision.action === "succeed" ? "paid" : "released" };
+  }
+  if (tr === "conflict") {
+    // Late / conflicting evidence: the order is already in a different
+    // terminal state. Do NOT overwrite it; record the conflict.
+    const current = (await readOrder(order.id))?.status ?? order.status;
+    await flagForReconciliation(order.id, `conflict_${decision.to}_over_${current}`);
+    return { result: "conflict", current };
+  }
+  // not_found / error — the order vanished or a data error; retryable.
+  return { result: "transient", reason: `transition_${tr}` };
+}
+
+// Reconcile a KNOWN, already-retrieved provider payment against its order.
+// Used by the webhook and the payment-status read (both already hold `pp`).
+export async function reconcileRetrievedPayment(
+  pp: ProviderPayment,
+  requestedPaymentId: string
+): Promise<ReconcileResult> {
+  const orderId = typeof pp.metadata?.orderId === "string" ? pp.metadata.orderId : "";
+  if (!orderId) return { result: "mismatch", reason: "no_order_association" };
+  const order = await readOrder(orderId); // no reap
+  if (!order) return { result: "mismatch", reason: "unknown_order" };
+  const bound = bindPaymentToOrder(order, pp, requestedPaymentId);
+  if (bound.kind === "retry") return { result: "not_ready", reason: bound.reason };
+  if (bound.kind === "reject") return { result: "mismatch", reason: bound.reason };
+  return applyDecision(order, decideFromStatus(pp.status));
+}
+
+// Retrieve + reconcile by payment id. Used by the webhook (which has only a
+// payment id and does not need the payment object afterwards).
+export async function reconcilePaymentById(paymentId: string): Promise<ReconcileResult> {
+  const retrieved = await retrievePayment(paymentId);
+  if (!retrieved.ok) {
+    return retrieved.category === "not_found"
+      ? { result: "unknown_payment" }
+      : { result: "transient", reason: "provider_unavailable" };
+  }
+  return reconcileRetrievedPayment(retrieved.payment, paymentId);
+}
+
+// Reconcile a KNOWN order (expiry path): retrieve by its attached payment id,
+// bind, and apply. The caller already has the order and its payment id.
+async function reconcileKnownOrder(order: Order): Promise<ReconcileResult> {
+  const paymentId = order.paymentId;
+  if (!paymentId) return { result: "not_ready", reason: "no_payment_id" };
+  const retrieved = await retrievePayment(paymentId);
+  if (!retrieved.ok) {
+    return retrieved.category === "not_found"
+      ? { result: "unknown_payment" }
+      : { result: "transient", reason: "provider_unavailable" };
+  }
+  const bound = bindPaymentToOrder(order, retrieved.payment, paymentId);
+  if (bound.kind === "reject") return { result: "mismatch", reason: bound.reason };
+  if (bound.kind === "retry") return { result: "not_ready", reason: bound.reason };
+  return applyDecision(order, decideFromStatus(retrieved.payment.status));
 }
 
 // Lightweight "how much interest is this event getting right now"

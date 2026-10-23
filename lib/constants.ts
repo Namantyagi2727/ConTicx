@@ -20,3 +20,19 @@ export const MAX_INVENTORY = 1_000_000_000;
 // skip duplicate provider reads, NOT the mechanism that prevents duplicate
 // business effects — the atomic Phase 1B.1 transitions are.
 export const WEBHOOK_EVENT_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+// Lazy hold expiry (reapExpiredHolds) processes at most this many expired
+// holds per pass, oldest first, and each one makes a bounded number of
+// provider calls (retrieve, at most one cancel, one re-retrieve). This caps
+// the work a single request can trigger: a large backlog or a provider
+// outage is worked off across many passes instead of one request looping
+// over every expired order.
+export const HOLD_EXPIRY_BATCH_SIZE = 20;
+
+// TTL for the per-order "a provider payment was attempted" marker, set just
+// before the payment is created and cleared once its id is attached. It is
+// read only when an expired hold has NO attached payment id, to distinguish
+// "creation was attempted, so a payment may exist (possible orphan)" from
+// "no provider call was ever made (safe to release)". Comfortably longer
+// than the hold window plus any lazy-reap lag.
+export const PAYMENT_ATTEMPT_TTL_SECONDS = 24 * 60 * 60;
