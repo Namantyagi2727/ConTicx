@@ -30,7 +30,7 @@
 
 import { redis } from "./redis";
 import { hyperswitchFetch } from "./hyperswitch";
-import { DEMAND_WINDOW_SECONDS, MAX_INVENTORY } from "./constants";
+import { DEMAND_WINDOW_SECONDS, MAX_INVENTORY, WEBHOOK_EVENT_TTL_SECONDS } from "./constants";
 import type { Order, OrderStatus } from "./types";
 
 // ZSET of still-pending order ids, scored by holdExpiresAt. Lets reap
@@ -601,6 +601,37 @@ export async function attachPaymentId(id: string, paymentId: string): Promise<At
 export async function getOrder(id: string): Promise<Order | undefined> {
   await reapExpiredHolds();
   return readOrder(id);
+}
+
+// Reads the stored order WITHOUT getOrder's lazy-reap side effect. The
+// webhook handler uses this: authenticating a delivery and binding a
+// payment to its order must not incidentally trigger unrelated hold
+// expiry/cancellation work (which reapExpiredHolds does, and which can
+// itself call the provider). Returns the order as-is, or undefined if the
+// key is absent.
+export async function peekOrder(id: string): Promise<Order | undefined> {
+  return readOrder(id);
+}
+
+// ---------------------------------------------------------------------------
+// Webhook-delivery dedup marker. A bounded-TTL key set ONLY after a webhook
+// delivery's business outcome is durably recorded. isWebhookEventProcessed
+// lets a sequential redelivery of an already-handled event skip a duplicate
+// provider read; it is NOT what prevents duplicate business effects (the
+// atomic transitions are — a concurrent duplicate that races past this
+// check still no-ops at the transition). Keep this a plain marker: not a
+// lock, not a queue.
+// ---------------------------------------------------------------------------
+function webhookEventKey(eventId: string) {
+  return `webhook_event:${eventId}`;
+}
+
+export async function isWebhookEventProcessed(eventId: string): Promise<boolean> {
+  return (await redis.exists(webhookEventKey(eventId))) === 1;
+}
+
+export async function markWebhookEventProcessed(eventId: string): Promise<void> {
+  await redis.set(webhookEventKey(eventId), "1", { ex: WEBHOOK_EVENT_TTL_SECONDS });
 }
 
 // Lightweight "how much interest is this event getting right now"
