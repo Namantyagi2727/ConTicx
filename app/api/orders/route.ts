@@ -121,10 +121,10 @@ export async function POST(request: Request) {
   await recordDemandSignal(event.id).catch(() => {});
 
   // Record that we are about to create a provider payment for this order,
-  // BEFORE the call. If creation succeeds but attachment never completes,
-  // this durable marker lets lazy expiry tell "a payment may exist but was
-  // never attached" (retain + flag) from "no provider call was ever made"
-  // (safe to release). Cleared once the payment id is attached.
+  // BEFORE the call; cleared once the payment id is attached. Diagnostic
+  // only: if attachment never completes, expiry notes the marker in the
+  // reconciliation reason. Expiry never treats its ABSENCE as proof that no
+  // payment exists — a payment-less expired order is always retained.
   await markPaymentAttempt(order.id);
 
   const response = await hyperswitchFetch("/payments", {

@@ -29,10 +29,18 @@
 // transitionOrder / attachPaymentId below.
 
 import { redis } from "./redis";
-import { hyperswitchFetch, retrievePayment, type ProviderPayment } from "./hyperswitch";
+import {
+  hyperswitchFetch,
+  retrievePayment,
+  type ProviderPayment,
+  type RetrievePaymentResult,
+} from "./hyperswitch";
 import {
   DEMAND_WINDOW_SECONDS,
   HOLD_EXPIRY_BATCH_SIZE,
+  HOLD_EXPIRY_BUDGET_WINDOW_MS,
+  HOLD_EXPIRY_MIN_CALL_MS,
+  HOLD_EXPIRY_PROVIDER_BUDGET_MS,
   MAX_INVENTORY,
   PAYMENT_ATTEMPT_TTL_SECONDS,
   WEBHOOK_EVENT_TTL_SECONDS,
@@ -74,6 +82,12 @@ function demandKey(eventId: string) {
 function reconcileKey(id: string) {
   return `reconcile:${id}`;
 }
+
+// ZSET of every order id that currently has a reconciliation flag, scored by
+// when it was (last) flagged. Written atomically with the flag, so unresolved
+// work stays enumerable (ZRANGE) after it leaves the pending-holds index —
+// a per-order key alone could only be found by scanning the keyspace.
+const RECONCILE_INDEX_KEY = "reconcile_needed";
 
 // Per-order marker that a provider payment was ATTEMPTED (set just before
 // the create call, cleared once its id is attached). Read only when an
@@ -315,6 +329,74 @@ redis.call('SET', orderKey, cjson.encode(order))
 return {'OK'}
 `;
 
+// record a reconciliation flag, atomically with its index entry, optionally
+// moving the order out of the pending-holds index in the same step.
+//   mode 'record'  : SET flag + ZADD index. No order checks (used for flags
+//                    written alongside a decision, e.g. a retained failed
+//                    payment or a late conflict).
+//   mode 'dequeue' : only while the order is still pending — and, when
+//                    requireNoPaymentId is '1', still has NO payment id —
+//                    SET flag + ZADD index + ZREM hold together. If the order
+//                    is gone or no longer pending, just drop the stale hold
+//                    (RESOLVED, no flag). If a payment id has been attached
+//                    since the caller's read, change nothing (HAS_PAYMENT):
+//                    this closes the stale-snapshot window between reading
+//                    the order and acting on it.
+// Because flag and dequeue are one script, a hold can never leave the
+// pending index without its flag being recorded.
+//
+// Returns: {'FLAGGED'} | {'RESOLVED'} | {'HAS_PAYMENT'} | {'ERR', reason}
+const RECORD_RECONCILE_SCRIPT = `
+local orderKey = KEYS[1]
+local holdsKey = KEYS[2]
+local flagKey = KEYS[3]
+local indexKey = KEYS[4]
+local orderId = ARGV[1]
+local flagJson = ARGV[2]
+local at = tonumber(ARGV[3])
+local mode = ARGV[4]
+local requireNoPaymentId = ARGV[5] == '1'
+
+if not orderId or orderId == '' then return {'ERR', 'bad_order_id'} end
+if not flagJson or flagJson == '' then return {'ERR', 'bad_flag'} end
+if not at then return {'ERR', 'bad_at'} end
+if mode ~= 'record' and mode ~= 'dequeue' then return {'ERR', 'bad_mode'} end
+
+local flagType = redis.call('TYPE', flagKey).ok
+if flagType ~= 'string' and flagType ~= 'none' then return {'ERR', 'flag_type'} end
+local indexType = redis.call('TYPE', indexKey).ok
+if indexType ~= 'zset' and indexType ~= 'none' then return {'ERR', 'index_type'} end
+
+if mode == 'dequeue' then
+  local holdsType = redis.call('TYPE', holdsKey).ok
+  if holdsType ~= 'zset' and holdsType ~= 'none' then return {'ERR', 'holds_type'} end
+  local orderType = redis.call('TYPE', orderKey).ok
+  if orderType == 'none' then
+    redis.call('ZREM', holdsKey, orderId)
+    return {'RESOLVED'}
+  end
+  if orderType ~= 'string' then return {'ERR', 'order_type'} end
+  local ok, order = pcall(cjson.decode, redis.call('GET', orderKey))
+  if not ok or type(order) ~= 'table' then return {'ERR', 'bad_order_json'} end
+  if order['status'] ~= 'pending' then
+    redis.call('ZREM', holdsKey, orderId)
+    return {'RESOLVED'}
+  end
+  local pid = order['paymentId']
+  if requireNoPaymentId and pid ~= nil and pid ~= cjson.null and pid ~= '' then
+    return {'HAS_PAYMENT'}
+  end
+end
+
+-- Writes only below this line; every key was type-checked above.
+redis.call('SET', flagKey, flagJson)
+redis.call('ZADD', indexKey, at, orderId)
+if mode == 'dequeue' then
+  redis.call('ZREM', holdsKey, orderId)
+end
+return {'FLAGGED'}
+`;
+
 // read-only availability resolver. Counter present -> return it. Counter
 // absent + init record present -> LOST (initialized before, counter now
 // missing: refuse, no mutation). Neither present -> genuinely new tier,
@@ -413,6 +495,60 @@ async function readOrder(id: string): Promise<Order | undefined> {
 // inventory effect at most once.
 let reapInFlight: Promise<void> | null = null;
 
+// ---------------------------------------------------------------------------
+// Provider-time budget for request-triggered expiry (see the constants for
+// the rationale). The budget window is per instance and is SHARED by every
+// expiry pass that starts within it, so the several passes one request can
+// trigger draw on one budget rather than each getting a fresh one. Only time
+// spent inside provider calls is charged; Redis and other overhead are not,
+// so this is a provider-work bound, not an end-to-end deadline.
+// ---------------------------------------------------------------------------
+
+interface ProviderBudgetWindow {
+  startedAt: number;
+  spentMs: number;
+}
+
+let providerBudgetWindow: ProviderBudgetWindow | null = null;
+
+function expiryProviderBudgetMs(): number {
+  const raw = Number(process.env.HOLD_EXPIRY_PROVIDER_BUDGET_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : HOLD_EXPIRY_PROVIDER_BUDGET_MS;
+}
+
+function currentBudgetWindow(now: number): ProviderBudgetWindow {
+  if (
+    !providerBudgetWindow ||
+    now - providerBudgetWindow.startedAt >= HOLD_EXPIRY_BUDGET_WINDOW_MS
+  ) {
+    providerBudgetWindow = { startedAt: now, spentMs: 0 };
+  }
+  return providerBudgetWindow;
+}
+
+// Starts a fresh budget window. Exposed for tests (and any future operator
+// tooling); the application itself never calls it.
+export function resetExpiryBudgetWindow(): void {
+  providerBudgetWindow = null;
+}
+
+// Runs one provider call under the remaining budget: refuses to START it
+// when fewer than HOLD_EXPIRY_MIN_CALL_MS remain, otherwise caps its timeout
+// at the remaining budget and charges the wall time it actually took.
+async function withProviderBudget<T>(
+  call: (timeoutMs: number) => Promise<T>
+): Promise<{ started: false } | { started: true; value: T }> {
+  const window = currentBudgetWindow(Date.now());
+  const remaining = expiryProviderBudgetMs() - window.spentMs;
+  if (remaining < HOLD_EXPIRY_MIN_CALL_MS) return { started: false };
+  const startedAt = Date.now();
+  try {
+    return { started: true, value: await call(remaining) };
+  } finally {
+    window.spentMs += Date.now() - startedAt;
+  }
+}
+
 async function reapExpiredHolds(): Promise<void> {
   if (reapInFlight) return reapInFlight;
 
@@ -428,7 +564,24 @@ async function reapExpiredHolds(): Promise<void> {
     });
 
     for (const orderId of expiredIds) {
-      await reconcileExpiredHold(orderId);
+      let outcome: HoldOutcome;
+      try {
+        outcome = await reconcileExpiredHold(orderId);
+      } catch (err) {
+        // A failure part-way through one hold (Redis unavailable, or the
+        // reconciliation flag could not be recorded) is NOT treated as
+        // handled: a hold only ever leaves the pending index together with
+        // its recorded flag, so it stays discoverable there and a later pass
+        // retries it. Logged without payment details.
+        console.error(
+          `[expiry] hold ${orderId} left pending after an error:`,
+          err instanceof Error ? err.message : "unknown"
+        );
+        continue;
+      }
+      // Budget exhausted: start no more provider work this pass. Every hold
+      // not yet reached stays in the index, untouched, for a later pass.
+      if (outcome === "budget_exhausted") break;
     }
   })();
 
@@ -439,82 +592,123 @@ async function reapExpiredHolds(): Promise<void> {
   }
 }
 
-// Resolves one expired hold. Removes it from the active reap index once it
-// reaches a terminal or a flagged-unresolved state, so a stuck hold cannot
-// consume provider calls on every subsequent pass; a transient failure
-// leaves it in the index to retry next pass (bounded by the batch size).
-async function reconcileExpiredHold(orderId: string): Promise<void> {
+type HoldOutcome = "continue" | "budget_exhausted";
+
+// Resolves one expired hold, or leaves it safely retained. Every exit is one
+// of: resolved by an atomic transition (which removes the hold); moved to the
+// reconciliation index atomically with its flag (retainAndDequeue); kept in
+// the pending index for a later pass (deferHold, or untouched when the
+// budget ran out). Nothing here releases inventory without authoritative,
+// bound provider evidence.
+async function reconcileExpiredHold(orderId: string): Promise<HoldOutcome> {
   const order = await readOrder(orderId);
   if (!order || order.status !== "pending") {
     // Already resolved elsewhere (a webhook, another pass, or a stale
     // entry) — drop it so we stop re-checking.
     await redis.zrem(PENDING_HOLDS_KEY, orderId);
-    return;
+    return "continue";
   }
 
-  // (A) No attached payment id. A payment may still have been created before
-  // attachment failed, so only release when we have durable evidence that no
-  // provider call was ever initiated (no payment-attempt marker). Otherwise
-  // retain the allocation and flag it: full orphan-payment recovery is
-  // deferred, so such a hold can stay unavailable until that phase.
+  // (A) No attached payment id. Absence of a payment id — or of the
+  // payment-attempt marker — is NOT evidence that no provider payment
+  // exists: creation may have succeeded before attachment failed, legacy
+  // orders never had the marker, and attach-then-clear can land between our
+  // read and our action. So this order is never released here: it is
+  // retained and flagged. The marker only refines the (diagnostic) reason.
+  // The dequeue re-checks inside Redis that the order is still pending with
+  // no payment id, so a payment id attached after our read leaves the hold
+  // in the index (HAS_PAYMENT) for a later pass to reconcile with the
+  // provider. Lazy expiry cannot produce new evidence for a payment-less
+  // order, so on success it moves to the reconciliation index; orphan
+  // recovery is deferred.
   if (!order.paymentId) {
-    if (await hasPaymentAttempt(orderId)) {
-      await flagForReconciliation(orderId, "no_payment_id_but_attempt_made");
-      await redis.zrem(PENDING_HOLDS_KEY, orderId);
-    } else {
-      await transitionOrder(orderId, "pending", "expired", true);
-    }
-    return;
+    const attempted = await hasPaymentAttempt(orderId);
+    await retainAndDequeue(
+      orderId,
+      attempted ? "no_payment_id_attempt_marked" : "no_payment_id_unresolved",
+      true
+    );
+    return "continue";
   }
+  const paymentId = order.paymentId;
 
   // (B) Reconcile against authoritative provider state.
-  const first = await reconcileKnownOrder(order);
-  if (first.result === "paid" || first.result === "released") return; // transition removed the hold
-  if (first.result === "transient") return; // retry next pass (bounded)
+  const firstRead = await withProviderBudget((timeoutMs) =>
+    retrievePayment(paymentId, { timeoutMs })
+  );
+  if (!firstRead.started) return "budget_exhausted";
+  const first = await reconcileKnownOrder(order, firstRead.value);
+  if (first.result === "paid" || first.result === "released") return "continue";
+  if (first.result === "transient") {
+    // Provider unavailable: keep for a later pass, behind earlier holds.
+    await deferHold(orderId);
+    return "continue";
+  }
   if (first.result === "retained" || first.result === "conflict") {
-    // Already flagged by applyDecision; stop reprocessing.
+    // applyDecision already recorded the flag (and index entry).
     await redis.zrem(PENDING_HOLDS_KEY, orderId);
-    return;
+    return "continue";
   }
   if (first.result !== "not_final") {
-    // mismatch / unknown_payment / not_ready: an anomaly for an order that
-    // has an attached payment id. Flag and stop reprocessing.
-    await flagForReconciliation(orderId, reconcileResultReason(first));
-    await redis.zrem(PENDING_HOLDS_KEY, orderId);
-    return;
+    // mismatch / unknown_payment / not_ready for an order that has a payment
+    // id: an anomaly. Retain, flag, and move to the reconciliation index.
+    await retainAndDequeue(orderId, reconcileResultReason(first));
+    return "continue";
   }
 
-  // (C) Still non-terminal: attempt ONE bounded cancellation, then re-read
-  // authoritative state. The cancel response never itself decides the
-  // outcome — only the subsequent authoritative read does.
-  try {
-    await hyperswitchFetch(`/payments/${order.paymentId}/cancel`, {
-      method: "POST",
-      body: JSON.stringify({ cancellation_reason: "hold_expired" }),
-    });
-  } catch {
-    return; // cancel inconclusive (timeout / network) — retain, retry next pass
+  // (C) Still non-terminal: attempt ONE cancellation, then re-read. The
+  // cancel response never decides the outcome; only the authoritative
+  // re-read does.
+  const cancel = await withProviderBudget((timeoutMs) =>
+    hyperswitchFetch(
+      `/payments/${paymentId}/cancel`,
+      { method: "POST", body: JSON.stringify({ cancellation_reason: "hold_expired" }) },
+      { timeoutMs }
+    ).then(
+      () => "responded" as const,
+      () => "unknown" as const
+    )
+  );
+  if (!cancel.started) return "budget_exhausted";
+  if (cancel.value === "unknown") {
+    // Timeout / transport failure: we cannot tell whether the provider
+    // received or processed the cancellation. Retain the allocation, record
+    // it, and keep the hold eligible for a later lazy pass (a later read CAN
+    // produce new evidence). If recording fails this throws before the
+    // hold is touched, so it stays in the index as-is.
+    await flagForReconciliation(orderId, "cancel_outcome_unknown");
+    await deferHold(orderId);
+    return "continue";
   }
 
-  const second = await reconcileKnownOrder(order);
-  if (second.result === "paid" || second.result === "released") return;
+  const secondRead = await withProviderBudget((timeoutMs) =>
+    retrievePayment(paymentId, { timeoutMs })
+  );
+  if (!secondRead.started) {
+    // Cancellation issued, but no budget left to confirm its effect.
+    await flagForReconciliation(orderId, "cancel_issued_retrieve_deferred");
+    await deferHold(orderId);
+    return "budget_exhausted";
+  }
+  const second = await reconcileKnownOrder(order, secondRead.value);
+  if (second.result === "paid" || second.result === "released") return "continue";
   if (second.result === "transient") {
-    // A cancellation was issued but the resulting state cannot be confirmed.
-    // Retain the allocation and record it; leave the hold in the index so a
-    // later (bounded) pass can confirm and release once the provider answers.
+    // Cancellation issued but the resulting state cannot be confirmed.
     await flagForReconciliation(orderId, "cancel_issued_retrieve_inconclusive");
-    return;
+    await deferHold(orderId);
+    return "continue";
   }
   if (second.result === "retained" || second.result === "conflict") {
     await redis.zrem(PENDING_HOLDS_KEY, orderId);
-    return;
+    return "continue";
   }
-  // Cancel issued but the state is still non-terminal or anomalous: retain
-  // and flag; stop reprocessing (the recovery phase owns it from here).
-  const reason =
-    second.result === "not_final" ? "cancel_then_not_final" : reconcileResultReason(second);
-  await flagForReconciliation(orderId, reason);
-  await redis.zrem(PENDING_HOLDS_KEY, orderId);
+  // Still non-terminal (or anomalous) after a cancellation: retain, flag,
+  // and move to the reconciliation index.
+  await retainAndDequeue(
+    orderId,
+    second.result === "not_final" ? "cancel_then_not_final" : reconcileResultReason(second)
+  );
+  return "continue";
 }
 
 export async function getRemainingInventory(
@@ -698,12 +892,57 @@ export interface ReconcileFlag {
   at: number; // epoch ms
 }
 
+type RecordOutcome = "FLAGGED" | "RESOLVED" | "HAS_PAYMENT";
+
+// Writes a reconciliation flag (bounded, non-sensitive reason + timestamp)
+// and its reconcile_needed index entry atomically; in 'dequeue' mode also
+// removes the hold from the pending index in the same step (see
+// RECORD_RECONCILE_SCRIPT). Never rewrites the order and never changes
+// inventory. Throws if the record could not be written, so a caller can
+// never mistake a failed record for a handled order.
+async function recordReconciliation(
+  orderId: string,
+  reason: string,
+  mode: "record" | "dequeue",
+  requireNoPaymentId = false
+): Promise<RecordOutcome> {
+  const at = Date.now();
+  const flag = JSON.stringify({ reason: reason.slice(0, 64), at });
+  const result = await evalScript(
+    RECORD_RECONCILE_SCRIPT,
+    [orderKey(orderId), PENDING_HOLDS_KEY, reconcileKey(orderId), RECONCILE_INDEX_KEY],
+    [orderId, flag, String(at), mode, requireNoPaymentId ? "1" : "0"]
+  );
+  const code = resultCode(result);
+  if (code === "FLAGGED" || code === "RESOLVED" || code === "HAS_PAYMENT") return code;
+  throw new Error(`reconciliation record failed (${String(result[1] ?? code)})`);
+}
+
 // Records that an order needs later reconciliation (a failed-but-retained
-// payment, an inconclusive expiry, a late conflict, a possible orphan). The
-// reason is bounded and non-sensitive; updating it is a single small write
-// that never rewrites the order and never changes inventory.
+// payment, an inconclusive cancellation, a late conflict). Leaves the
+// pending-holds index untouched.
 export async function flagForReconciliation(orderId: string, reason: string): Promise<void> {
-  await redis.set(reconcileKey(orderId), { reason: reason.slice(0, 64), at: Date.now() });
+  await recordReconciliation(orderId, reason, "record");
+}
+
+// Retains the allocation, records the flag, and moves the hold from the
+// pending index to the reconciliation index — atomically, and only while
+// the order is still pending (and, if requested, still has no payment id).
+async function retainAndDequeue(
+  orderId: string,
+  reason: string,
+  requireNoPaymentId = false
+): Promise<RecordOutcome> {
+  return recordReconciliation(orderId, reason, "dequeue", requireNoPaymentId);
+}
+
+// Keeps a hold eligible for a later lazy-expiry pass but moves it behind
+// holds that expired earlier (re-scored to now), so one hold that keeps
+// failing — e.g. a payment read that always times out and would otherwise
+// consume the whole budget — cannot starve the rest of the queue. XX: never
+// re-adds a hold that a concurrent transition has already removed.
+async function deferHold(orderId: string): Promise<void> {
+  await redis.zadd(PENDING_HOLDS_KEY, { xx: true }, { score: Date.now(), member: orderId });
 }
 
 export async function getReconciliationFlag(orderId: string): Promise<ReconcileFlag | null> {
@@ -711,7 +950,10 @@ export async function getReconciliationFlag(orderId: string): Promise<ReconcileF
 }
 
 // Set just before a provider payment is created, cleared once its id is
-// attached. See paymentAttemptKey / the expiry no-payment-id branch.
+// attached. DIAGNOSTIC ONLY: expiry records whether it was present in the
+// flag reason, but its absence is never treated as proof that no payment
+// exists (legacy orders never had it, and attach-then-clear can race with
+// an expiry read).
 export async function markPaymentAttempt(orderId: string): Promise<void> {
   await redis.set(paymentAttemptKey(orderId), "1", { ex: PAYMENT_ATTEMPT_TTL_SECONDS });
 }
@@ -807,12 +1049,15 @@ export async function reconcilePaymentById(paymentId: string): Promise<Reconcile
   return reconcileRetrievedPayment(retrieved.payment, paymentId);
 }
 
-// Reconcile a KNOWN order (expiry path): retrieve by its attached payment id,
-// bind, and apply. The caller already has the order and its payment id.
-async function reconcileKnownOrder(order: Order): Promise<ReconcileResult> {
+// Reconcile a KNOWN order (expiry path) against a retrieval of its attached
+// payment id: bind and apply. The retrieval is done by the caller so expiry
+// can charge it to its provider-time budget.
+async function reconcileKnownOrder(
+  order: Order,
+  retrieved: RetrievePaymentResult
+): Promise<ReconcileResult> {
   const paymentId = order.paymentId;
   if (!paymentId) return { result: "not_ready", reason: "no_payment_id" };
-  const retrieved = await retrievePayment(paymentId);
   if (!retrieved.ok) {
     return retrieved.category === "not_found"
       ? { result: "unknown_payment" }
