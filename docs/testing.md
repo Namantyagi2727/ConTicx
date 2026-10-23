@@ -216,7 +216,8 @@ build still succeeds. CI runs this same build with the same
   writes and every value it computes: order existence, hold-index type,
   the counter's type **and canonical-integer representation** (a value
   `tonumber()` parses but Redis integer ops reject — `"1.5"`, `"1.0"`,
-  `"1e2"` — is rejected, not silently normalized), positive-integer
+  `"1e2"`, or a leading-zero form like `"01"`; only `"0"` itself is a valid
+  zero — is rejected, not silently normalized), positive-integer
   quantities, and capacities/results within an explicit safe bound
   (`MAX_INVENTORY`) so `DECRBY`/`INCRBY` cannot overflow. This validates
   the inputs and stored shapes these scripts touch; it is **not** a claim
@@ -225,6 +226,34 @@ build still succeeds. CI runs this same build with the same
   instance). Tests feed raw numeric-looking invalid values (written as
   raw bytes so the SDK can't normalize them) and corrupt keys, and assert
   the operation is rejected with no partial write.
+- **Webhook authentication, binding, and dedup (Phase 1B.2).** The
+  Hyperswitch webhook route verifies an HMAC-SHA512 signature
+  (`X-Webhook-Signature-512`, over the exact raw body bytes, keyed by the
+  configured `payment_response_hash_key`) **fail-closed, before** any
+  parse, Redis, or provider call: a missing / malformed / wrong-length /
+  invalid-hex / incorrect signature is `401`, a missing server secret is
+  `503`, body tampering or a whitespace change breaks the byte-exact digest
+  (`401`), and an invalid delivery performs **zero** Redis and provider
+  calls. An authenticated delivery is treated as a *notification*: the
+  route retrieves the authoritative payment from the provider and binds it
+  two-way — returned id == requested id, the stored order points back at
+  this payment, matching amount and currency, and merchant id where
+  configured — so metadata alone never authorizes a change. A mismatch is
+  `422` with no mutation; an order whose payment id is not yet attached is a
+  retryable `503` (a legitimate early webhook), distinct from a permanent
+  mismatch. Only the **authoritative provider status** drives a single
+  atomic transition (never the event name): `succeeded` marks succeeded,
+  `cancelled`/`expired` release inventory, `failed` **retains** it (a failed
+  payment may be retried), and any other status gets no terminal outcome
+  (retryable). A late success conflicting with an already-terminal order is
+  reported, not overwritten. Duplicate deliveries are recognized by
+  `event_id` (a bounded-TTL marker written only *after* the durable
+  transition): a sequential duplicate skips the provider read, and
+  concurrent duplicates still apply the inventory effect exactly once via
+  the atomic transition (reprocessing after a lost completion marker does
+  not repeat it). Provider timeout / non-JSON / a Redis failure are
+  retryable (`503`, no marker). Signature vectors in these tests are
+  produced by an **independent** signer, never the route's own verifier.
 
 These prove the **harness** and the **oversell path** behave as
 expected. They do **not** prove the application is secure or correct —
@@ -240,21 +269,25 @@ present**. They are evidence of a bug, not a guarantee:
 
 | Test | Audit finding | Current behavior it pins |
 | --- | --- | --- |
-| `webhook-forgery.characterization` | SEC-01 | An unsigned webhook promotes an order to `succeeded`. |
 | `expiry-cancel-400.characterization` | INV-01 | A hold whose cancel is rejected with 400 is marked `succeeded` and keeps its seat. |
 | `refund-authorization.characterization` | SEC-02 | A refund succeeds for a caller with no ownership proof. |
 
 The **INV-02** double-release characterization was **converted** into a
 regression test in Phase 1B.1
 (`concurrent-refund-release.regression.test.ts`): it now asserts a single
-atomic release. The three rows above remain characterizations — Phase
-1B.1 deliberately did **not** touch webhook authenticity (SEC-01), the
-cancel-400 interpretation (INV-01), or refund authorization (SEC-02), so
-those defects are still present and these tests still pass because of it.
-Do not read a passing characterization test as a passing security
-control. Converting the remaining three is the job of later subphases
-(invalid signature rejected; real payment status re-fetched after a
-non-2xx cancel; unauthorized refund gets a uniform 404).
+atomic release. The **SEC-01** unsigned-webhook characterization was
+**converted** in Phase 1B.2 (`webhook-forgery.regression.test.ts`, with the
+full matrix in `webhook-security.regression.test.ts`): an unsigned or
+invalid-signature delivery is now rejected (`401`) with the order left
+unchanged. The two rows above remain characterizations — this phase
+deliberately did **not** touch the cancel-400 interpretation (INV-01) or
+refund authorization (SEC-02), so those defects are still present and these
+tests still pass because of it. Do not read a passing characterization test
+as a passing security control. Converting the remaining two is the job of
+later subphases (real payment status re-fetched after a non-2xx cancel;
+unauthorized refund gets a uniform 404). Phase 1B.2 did not change the
+cancel-400 reaper path, so it does **not** fix every route that can mark an
+order paid — INV-01 remains open.
 
 ## Emulator and provider-fake limitations
 
@@ -266,10 +299,17 @@ non-2xx cancel; unauthorized refund gets a uniform 404).
   app, but Phase 1B Lua work should be re-checked against real Upstash.
 - **The fake Hyperswitch is minimal and programmed.** It implements only
   the create / retrieve / cancel / refund shapes these tests need, with
-  explicit knobs (a 400 cancel, a non-succeeded refund status). It is
-  not a provider simulator and proves nothing about the real API's
-  signatures, idempotency, status transitions, or timing. Those are the
-  deferred sandbox checks (addendum S1–S10).
+  explicit knobs (a 400 cancel, a non-succeeded refund status, a response
+  delay for the timeout path, a non-JSON retrieve). It is not a provider
+  simulator and proves nothing about the real API's signatures,
+  idempotency, status transitions, or timing. The Phase 1B.2 webhook
+  verification is written to the **documented** Hyperswitch contract —
+  HMAC-SHA512 over the raw body in `X-Webhook-Signature-512`, keyed by
+  `payment_response_hash_key` (webhooks integration guide), and the
+  terminal-status release policy follows `IntentStatus::is_in_terminal_state`
+  (`crates/common_enums/src/enums.rs`) — but the fake does not reproduce
+  real signing, event_id semantics, delivery retries, or status timing.
+  Confirming those against the sandbox stays deferred (addendum S1–S10).
 - **Init-record compatibility (Phase 1B.1).** The lost-counter protection
   relies on the per-tier `inventory_init:<event>:<tier>` record, written
   the first time a tier is seeded after this change. A tier initialized

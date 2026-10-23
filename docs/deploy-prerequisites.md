@@ -33,6 +33,31 @@ exist:
 
 Standard Protection (section 1) provides none of this; it is orthogonal.
 
+### Webhook signing secret (Phase 1B.2)
+
+The Hyperswitch webhook route verifies an HMAC-SHA512 signature over the
+raw request body, keyed by the business profile's
+`payment_response_hash_key`, supplied to the app as
+`HYPERSWITCH_WEBHOOK_SECRET` (server-only; no `NEXT_PUBLIC_` prefix).
+Before a deployment can process webhooks:
+
+- Set `HYPERSWITCH_WEBHOOK_SECRET` in the deployment environment to the
+  profile's `payment_response_hash_key` (keep production and
+  sandbox/preview values separate, like every other credential here). The
+  route **fails closed** — with the secret unset it returns `503` and
+  mutates nothing — so a deployment without it processes no webhooks
+  rather than trusting unsigned ones.
+- Configure the Hyperswitch dashboard to deliver webhooks to the
+  deployment's `/api/webhooks/hyperswitch` URL, and confirm the profile
+  actually has a `payment_response_hash_key` set (a missing key there means
+  no signature header is sent).
+- Optionally set `HYPERSWITCH_MERCHANT_ID` to have the route additionally
+  verify the retrieved payment's merchant id.
+
+This is **local-only** so far: nothing has been pushed or deployed, and no
+real webhook has been received. Real delivery, signing, and `event_id`
+retry behavior against the sandbox remain unverified (addendum S1–S10).
+
 ## 3. Whether a branch push triggers a deployment
 
 On Vercel's Git integration, pushing a branch normally creates a
