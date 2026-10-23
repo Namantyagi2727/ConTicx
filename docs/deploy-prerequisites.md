@@ -57,9 +57,9 @@ Before a deployment can process webhooks:
 - Optionally set `HYPERSWITCH_MERCHANT_ID` to have the route additionally
   verify the retrieved payment's merchant id.
 
-This is **local-only** so far: nothing has been pushed or deployed, and no
-real webhook has been received. Real delivery, signing, and `event_id`
-retry behavior against the sandbox remain unverified (addendum S1–S10).
+The signature check has been exercised only by the test suite, never by a
+real Hyperswitch webhook. Real delivery, signing, and `event_id` retry
+behavior against the sandbox remain unverified (addendum S1–S10).
 
 ## 3. Whether a branch push triggers a deployment
 
