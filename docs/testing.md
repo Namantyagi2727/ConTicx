@@ -236,9 +236,15 @@ build still succeeds. CI runs this same build with the same
   (`401`), and an invalid delivery performs **zero** Redis and provider
   calls. An authenticated delivery is treated as a *notification*: the
   route retrieves the authoritative payment from the provider and binds it
-  two-way — returned id == requested id, the stored order points back at
-  this payment, matching amount and currency, and merchant id where
-  configured — so metadata alone never authorizes a change. A mismatch is
+  two-way — returned id == requested id, the payment's metadata names this
+  order *and* the stored order points back at this payment id, and matching
+  amount and currency — so metadata alone never authorizes a change. When
+  `HYPERSWITCH_MERCHANT_ID` is configured the provider response must also
+  carry exactly that merchant id: a **missing** merchant id fails binding
+  just as a mismatched one does. When it is **not** configured, the merchant
+  check is skipped and only the association, amount, and currency checks
+  above apply; no profile id (or any other provider field) is validated.
+  A mismatch is
   `422` with no mutation; an order whose payment id is not yet attached is a
   retryable `503` (a legitimate early webhook), distinct from a permanent
   mismatch. Only the **authoritative provider status** drives a single
@@ -250,16 +256,102 @@ build still succeeds. CI runs this same build with the same
   `event_id` (a bounded-TTL marker written only *after* the durable
   transition): a sequential duplicate skips the provider read, and
   concurrent duplicates still apply the inventory effect exactly once via
-  the atomic transition (reprocessing after a lost completion marker does
-  not repeat it). Provider timeout / non-JSON / a Redis failure are
-  retryable (`503`, no marker). Signature vectors in these tests are
-  produced by an **independent** signer, never the route's own verifier.
+  the atomic transition. Failures are retryable (`503`, no marker) but
+  differ by *when* they happen — see the handler table below: a failure
+  **before** the order transition leaves the order unchanged, while a
+  failure **after** the transition but before the completion marker can
+  return `503` with the order already changed; the redelivery re-runs the
+  idempotent transition as a no-op and does not repeat the inventory effect
+  (tested). Signature vectors in these tests are produced by an
+  **independent** signer, never the route's own verifier.
+- **Authoritative reconciliation and bounded hold expiry (Phase 1B.3).**
+  The webhook, the payment-status read, and lazy hold expiry now share one
+  policy (`lib/payment-policy.ts` binding + status mapping; `lib/store.ts`
+  reconciliation and atomic transitions) — see the policy table below. The
+  INV-01 rule that a cancellation `400` means "paid" is removed: expiry
+  retrieves and binds the payment, applies the status-justified transition,
+  and gives a still-cancellable payment one cancellation attempt followed by
+  an authoritative re-read; the cancel response itself never produces
+  `succeeded` or a release. Tests cover cancel `400` followed by
+  `succeeded` (paid, no release) or `failed`/`processing` (retained, never
+  paid); confirmed cancellation/expiry releasing once; cancel success then
+  an inconclusive re-read (retained + flagged); non-JSON / 5xx / timeout /
+  binding mismatch (no guessed outcome); an expired order with no attached
+  payment id (retained + flagged when a payment was attempted); repeated and
+  concurrent passes releasing at most once; webhook success racing expiry;
+  a late success against a resolved order (recorded, not overwritten); the
+  payment-status read retaining failed payments and enforcing binding; and
+  the per-pass batch / provider-call bounds with a backlog.
 
 These prove the **harness** and the **oversell path** behave as
 expected. They do **not** prove the application is secure or correct —
 see the next section — and they do **not** establish Hyperswitch
 contract behavior, which stays deferred to real sandbox checks (addendum
 S1–S10).
+
+## Payment reconciliation policy (Phase 1B.2–1B.3)
+
+### Shared provider-state policy
+
+Used identically by the webhook, `GET /api/payments/[id]`, and lazy expiry.
+Only the **authoritative** status from a bound provider retrieval decides an
+outcome — never an event name, an HTTP response code, or metadata alone.
+Terminal classification follows Hyperswitch's
+`IntentStatus::is_in_terminal_state` (`crates/common_enums/src/enums.rs`).
+
+| Authoritative status | Order action | Inventory | Reconciliation flag |
+| --- | --- | --- | --- |
+| `succeeded` | guarded `pending → succeeded` | kept | — |
+| `cancelled` | guarded `pending → failed` | released once | — |
+| `expired` | guarded `pending → expired` | released once | — |
+| `failed` | none (retained; may be retried, no finality rule implemented) | kept | `payment_failed_retryable` |
+| anything else (`processing`, `requires_*`, `review`, `partially_*`, `cancelled_post_capture`, unknown) | none | kept | expiry only, if still non-terminal after its one cancel attempt |
+| any of the above, but order already terminal | none (not overwritten) | unchanged | `conflict_<to>_over_<current>` |
+| binding mismatch | none | unchanged | expiry: the mismatch reason |
+
+Expiry additions: a still-non-terminal payment gets **one** cancellation
+attempt, then a re-read; the cancel response is never used as evidence. A
+cancel timeout leaves the hold for the next pass; a successful cancel whose
+re-read is inconclusive is retained and flagged
+`cancel_issued_retrieve_inconclusive`. An expired order with **no attached
+payment id** is released only when no `payment_attempt:<order>` marker
+exists (no provider call was ever made); otherwise it is retained and
+flagged `no_payment_id_but_attempt_made`.
+
+**Bounds.** One lazy-expiry pass handles at most `HOLD_EXPIRY_BATCH_SIZE`
+(20) expired holds, oldest first, with at most three provider calls each
+(retrieve, cancel, re-retrieve), every call bounded by the provider-helper
+timeout (`HYPERSWITCH_TIMEOUT_MS`, default 10 s). Holds that end flagged
+are removed from the reap index so they cost nothing on later passes;
+transient failures stay in the index and are retried on a later pass. The
+per-instance single-flight is an optimisation only — correctness rests on
+the atomic `pending → terminal` transition, so concurrent passes release at
+most once.
+
+**Reconciliation flags** are a separate durable key per order
+(`reconcile:<order>` → `{ reason, at }`), written without rewriting the
+order and without touching inventory. They are a backlog for a later
+recovery phase; nothing in this phase acts on them automatically.
+
+### Webhook handler outcomes
+
+| Condition | HTTP | Order / inventory | Event marker |
+| --- | --- | --- | --- |
+| Body too large | 413 | unchanged | no |
+| Signing secret not configured | 503 | unchanged | no |
+| Missing / malformed / wrong signature | 401 | unchanged (zero Redis / provider calls) | no |
+| Malformed JSON / bad shape / bad payment-id | 400 | unchanged | no |
+| Unsupported (refund / other) event | 200 | unchanged | no |
+| Already processed (`event_id` marker present) | 200 | unchanged | already set |
+| Provider unknown payment | 422 | unchanged | no |
+| Binding mismatch (incl. merchant missing/mismatched when configured) | 422 | unchanged | no |
+| Order payment id not yet attached | 503 | unchanged | no |
+| Non-terminal provider status | 503 | unchanged | no |
+| `failed` | 200 | unchanged (retained, flagged) | yes |
+| `succeeded` / `cancelled` / `expired` | 200 | one guarded transition | yes |
+| Late status vs already-terminal order | 200 | unchanged (conflict flagged) | yes |
+| **Failure before the order transition** (provider timeout / 5xx / non-JSON, Redis failure on read or on the transition itself) | 503 | **unchanged** | no |
+| **Failure after the transition, before the marker** (marker write fails) | 503 | **already changed** by the transition | no — redelivery re-runs the transition as a no-op; the inventory effect is not repeated |
 
 ## Known-defect characterization tests
 
@@ -269,7 +361,6 @@ present**. They are evidence of a bug, not a guarantee:
 
 | Test | Audit finding | Current behavior it pins |
 | --- | --- | --- |
-| `expiry-cancel-400.characterization` | INV-01 | A hold whose cancel is rejected with 400 is marked `succeeded` and keeps its seat. |
 | `refund-authorization.characterization` | SEC-02 | A refund succeeds for a caller with no ownership proof. |
 
 The **INV-02** double-release characterization was **converted** into a
@@ -279,15 +370,16 @@ atomic release. The **SEC-01** unsigned-webhook characterization was
 **converted** in Phase 1B.2 (`webhook-forgery.regression.test.ts`, with the
 full matrix in `webhook-security.regression.test.ts`): an unsigned or
 invalid-signature delivery is now rejected (`401`) with the order left
-unchanged. The two rows above remain characterizations — this phase
-deliberately did **not** touch the cancel-400 interpretation (INV-01) or
-refund authorization (SEC-02), so those defects are still present and these
-tests still pass because of it. Do not read a passing characterization test
-as a passing security control. Converting the remaining two is the job of
-later subphases (real payment status re-fetched after a non-2xx cancel;
-unauthorized refund gets a uniform 404). Phase 1B.2 did not change the
-cancel-400 reaper path, so it does **not** fix every route that can mark an
-order paid — INV-01 remains open.
+unchanged. The **INV-01** cancel-400 characterization was **converted** in
+Phase 1B.3 (`expiry-reconciliation.regression.test.ts`): a cancellation
+response no longer decides the outcome; expiry re-reads the authoritative
+status, and a cancel `400` with a still-processing payment is retained and
+flagged rather than marked `succeeded`. The one row above remains a
+characterization — refund authorization (SEC-02) is untouched, so that
+defect is still present and the test still passes because of it. Do not
+read a passing characterization test as a passing security control.
+Converting it (an unauthorized refund gets a uniform 404) is the job of a
+later subphase.
 
 ## Emulator and provider-fake limitations
 
@@ -299,8 +391,10 @@ order paid — INV-01 remains open.
   app, but Phase 1B Lua work should be re-checked against real Upstash.
 - **The fake Hyperswitch is minimal and programmed.** It implements only
   the create / retrieve / cancel / refund shapes these tests need, with
-  explicit knobs (a 400 cancel, a non-succeeded refund status, a response
-  delay for the timeout path, a non-JSON retrieve). It is not a provider
+  explicit knobs (a 400 cancel — optionally revealing a new status, a
+  non-succeeded refund status, a response delay for the timeout path, a
+  non-JSON or 5xx retrieve, a retrieve that fails only after a cancel). It
+  is not a provider
   simulator and proves nothing about the real API's signatures,
   idempotency, status transitions, or timing. The Phase 1B.2 webhook
   verification is written to the **documented** Hyperswitch contract —
@@ -322,3 +416,17 @@ order paid — INV-01 remains open.
   indistinguishable from a fresh tier. The init record is an additive new
   key; existing order/inventory/hold storage is unchanged, so no
   migration is required for the rest of the model.
+- **Retained holds are not recovered here (Phase 1B.3).** Conservative
+  expiry deliberately keeps a seat allocated when the evidence is
+  inconclusive: a retryable `failed` payment, a payment still non-terminal
+  after one cancel attempt, a cancel whose re-read is inconclusive, a
+  binding mismatch, or an expired order with no attached payment id where a
+  payment was attempted (a possible orphan). Those orders stay `pending`,
+  are flagged under `reconcile:<order>`, and leave the reap index, so **their
+  seats can remain unavailable until a later recovery phase** acts on the
+  flags. Eventual recovery, orphan-payment discovery, compensation refunds,
+  and scheduled reconciliation are **not** implemented. The provider cancel
+  call carries no idempotency key, and historical orders created before
+  this phase have no `payment_attempt` marker (an expired legacy order with
+  no payment id is therefore treated as "no provider call made" and
+  released) — no historical repair is performed.

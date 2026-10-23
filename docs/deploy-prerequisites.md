@@ -51,8 +51,11 @@ Before a deployment can process webhooks:
   deployment's `/api/webhooks/hyperswitch` URL, and confirm the profile
   actually has a `payment_response_hash_key` set (a missing key there means
   no signature header is sent).
-- Optionally set `HYPERSWITCH_MERCHANT_ID` to have the route additionally
-  verify the retrieved payment's merchant id.
+- Optionally set `HYPERSWITCH_MERCHANT_ID`. When set, the webhook, the
+  payment-status read, and hold expiry all require the retrieved payment to
+  carry exactly that merchant id (missing or different both fail binding).
+  When unset, only the order-association, amount, and currency checks
+  apply; no profile id is validated.
 
 This is **local-only** so far: nothing has been pushed or deployed, and no
 real webhook has been received. Real delivery, signing, and `event_id`
