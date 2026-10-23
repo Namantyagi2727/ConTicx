@@ -75,6 +75,13 @@ export class FakeHyperswitch {
   getFailsAfterCancel = false;
   // When set, every GET /payments/:id returns a 500 (provider outage).
   getReturns500 = false;
+  // Delays only cancel requests (the cancellation is still applied after the
+  // delay, even if the client has already timed out) — models a cancel whose
+  // outcome the caller cannot observe.
+  cancelDelayMs = 0;
+  // Per-payment-id delay for GET /payments/:id — makes one payment's reads
+  // slow without slowing the rest.
+  readonly getDelayMsFor = new Map<string, number>();
   private cancelSeen = false;
 
   // `port` 0 binds an ephemeral port (used by the fake's own unit
@@ -112,6 +119,8 @@ export class FakeHyperswitch {
     this.statusAfterCancel400 = null;
     this.getFailsAfterCancel = false;
     this.getReturns500 = false;
+    this.cancelDelayMs = 0;
+    this.getDelayMsFor.clear();
     this.cancelSeen = false;
   }
 
@@ -180,6 +189,9 @@ export class FakeHyperswitch {
     if (method === "POST" && cancelMatch) {
       this.cancelSeen = true;
       const id = decodeURIComponent(cancelMatch[1]);
+      if (this.cancelDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.cancelDelayMs));
+      }
       if (this.cancelRejectsWith400) {
         // The intent moved past a cancellable state; optionally reveal what
         // it moved to, so a subsequent authoritative read decides the fate.
@@ -206,6 +218,8 @@ export class FakeHyperswitch {
         return json(res, 500, { error: { message: "provider error" } });
       }
       const id = decodeURIComponent(getMatch[1]);
+      const readDelay = this.getDelayMsFor.get(id);
+      if (readDelay) await new Promise((resolve) => setTimeout(resolve, readDelay));
       const payment = this.payments.get(id);
       if (!payment) return json(res, 404, { error: { message: "payment not found" } });
       return json(res, 200, payment);
