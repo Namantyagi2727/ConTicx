@@ -63,6 +63,19 @@ export class FakeHyperswitch {
   // When set, GET /payments/:id replies 200 with a non-JSON body, so the
   // retrieve helper's JSON parse fails (a misbehaving-provider case).
   getReturnsNonJson = false;
+  // When set alongside cancelRejectsWith400, a rejected cancel ALSO flips
+  // the targeted payment's status to this value — models the real race the
+  // INV-01 fix targets: the cancel is rejected with 400 *because* the intent
+  // just moved on (e.g. to "succeeded" or "failed"), which the re-read then
+  // reveals authoritatively.
+  statusAfterCancel400: string | null = null;
+  // When set, GET /payments/:id returns a 500 AFTER any cancel has been
+  // handled — models "cancellation issued but the follow-up retrieval is
+  // inconclusive" without affecting the first (pre-cancel) retrieve.
+  getFailsAfterCancel = false;
+  // When set, every GET /payments/:id returns a 500 (provider outage).
+  getReturns500 = false;
+  private cancelSeen = false;
 
   // `port` 0 binds an ephemeral port (used by the fake's own unit
   // self-test); the integration setup passes the fixed loopback port
@@ -96,6 +109,10 @@ export class FakeHyperswitch {
     this.refundStatus = "succeeded";
     this.delayMs = 0;
     this.getReturnsNonJson = false;
+    this.statusAfterCancel400 = null;
+    this.getFailsAfterCancel = false;
+    this.getReturns500 = false;
+    this.cancelSeen = false;
   }
 
   getPayment(id: string): StoredPayment | undefined {
@@ -161,10 +178,17 @@ export class FakeHyperswitch {
     // POST /payments/:id/cancel
     const cancelMatch = path.match(/^\/payments\/([^/]+)\/cancel$/);
     if (method === "POST" && cancelMatch) {
+      this.cancelSeen = true;
+      const id = decodeURIComponent(cancelMatch[1]);
       if (this.cancelRejectsWith400) {
+        // The intent moved past a cancellable state; optionally reveal what
+        // it moved to, so a subsequent authoritative read decides the fate.
+        if (this.statusAfterCancel400) {
+          const payment = this.payments.get(id);
+          if (payment) payment.status = this.statusAfterCancel400;
+        }
         return json(res, 400, this.cancelRejectionBody);
       }
-      const id = decodeURIComponent(cancelMatch[1]);
       const payment = this.payments.get(id);
       if (payment) payment.status = "cancelled";
       return json(res, 200, { payment_id: id, status: "cancelled" });
@@ -177,6 +201,9 @@ export class FakeHyperswitch {
         res.writeHead(200, { "content-type": "text/html" });
         res.end("<html>not json</html>");
         return;
+      }
+      if (this.getReturns500 || (this.getFailsAfterCancel && this.cancelSeen)) {
+        return json(res, 500, { error: { message: "provider error" } });
       }
       const id = decodeURIComponent(getMatch[1]);
       const payment = this.payments.get(id);

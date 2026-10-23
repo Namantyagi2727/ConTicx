@@ -347,6 +347,18 @@ describe("[regression] payment-to-order binding", () => {
     expect(await statusOf(orderId)).toBe("pending");
   });
 
+  it("rejects a provider response MISSING the merchant id when one is configured (422)", async () => {
+    const { orderId, paymentId } = await createOrder();
+    getFake().getPayment(paymentId)!.status = "succeeded";
+    expect(getFake().getPayment(paymentId)!.merchant_id).toBeUndefined();
+    process.env.HYPERSWITCH_MERCHANT_ID = "merchant_expected";
+
+    const res = await webhook(signed(bodyFor(paymentId)));
+
+    expect(res.status).toBe(422);
+    expect(await statusOf(orderId)).toBe("pending");
+  });
+
   it("returns a retryable 503 for an early webhook before the payment id is attached", async () => {
     // Order exists (seeded through the atomic store) but has no paymentId
     // yet — the create -> attach window. Build that state directly.
