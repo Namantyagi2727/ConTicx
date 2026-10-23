@@ -21,6 +21,10 @@ export const TEST_HYPERSWITCH_PORT = 38171;
 export const TEST_HYPERSWITCH_BASE_URL = `http://127.0.0.1:${TEST_HYPERSWITCH_PORT}`;
 export const TEST_HYPERSWITCH_API_KEY = "snd_test_fake_secret_key";
 export const TEST_HYPERSWITCH_PUBLISHABLE_KEY = "pk_snd_test_fake_publishable_key";
+// Fake webhook signing secret (the business profile's
+// payment_response_hash_key, in real Hyperswitch). Tests HMAC-SHA512 the
+// raw body with this to produce valid X-Webhook-Signature-512 vectors.
+export const TEST_HYPERSWITCH_WEBHOOK_SECRET = "whsec_test_fake_webhook_secret";
 
 // Hosts the network guard treats as local. Anything else is blocked.
 export const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);

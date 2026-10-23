@@ -3,16 +3,20 @@ import { POST as createOrder } from "@/app/api/orders/route";
 import { POST as webhook } from "@/app/api/webhooks/hyperswitch/route";
 import type { Order } from "@/lib/types";
 import { makeTestRedis } from "../helpers/redis";
+import { makeWebhookRequest } from "../helpers/webhook";
 
-// CHARACTERIZATION TEST — asserts the CURRENT, INCORRECT behavior.
-// Audit finding: SEC-01 (unsigned webhooks change order state).
+// REGRESSION — converted from the SEC-01 characterization test.
 //
-// This test PASSES today because the vulnerability is present: an
-// unauthenticated, unsigned webhook body can drive a pending order to
-// "succeeded". It is NOT a security guarantee. In Phase 1B it must be
-// converted into a regression test asserting the CORRECTED behavior:
-// an unsigned/invalid-signature webhook is rejected (401) and the order
-// is left unchanged.
+// Audit finding SEC-01: an unsigned/unverified webhook could drive a
+// pending order to "succeeded". The old characterization test asserted
+// that DEFECT (an unsigned forged webhook was accepted with 200 and
+// applied). Phase 1B.2 closes it: the handler verifies an HMAC-SHA512
+// signature fail-closed, so a forged delivery with no valid signature is
+// rejected (401) and the order is left exactly as it was. The broader
+// signature/binding/dedup matrix lives in webhook-security.regression.
+//
+// (The full forged-but-signed cases are impossible without the secret, so
+// this file focuses on the core SEC-01 guarantee: no signature, no effect.)
 
 function orderRequest() {
   return new Request("http://localhost/api/orders", {
@@ -22,20 +26,17 @@ function orderRequest() {
   });
 }
 
-function forgedWebhook(orderId: string) {
-  // No signature header, attacker-chosen payment id and order id.
-  return new Request("http://localhost/api/webhooks/hyperswitch", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      event_type: "payment_succeeded",
-      content: { object: { payment_id: "forged_by_anyone", metadata: { orderId } } },
-    }),
+function forgedBody(orderId: string): string {
+  // Attacker-chosen payment id and order id, no signing secret available.
+  return JSON.stringify({
+    event_id: "evt_forged",
+    event_type: "payment_succeeded",
+    content: { object: { payment_id: "forged_by_anyone", metadata: { orderId } } },
   });
 }
 
-describe("[characterization] SEC-01 unsigned webhook forges payment success", () => {
-  it("promotes a pending order to succeeded with no signature (DEFECT)", async () => {
+describe("[regression] SEC-01 unsigned webhook cannot forge payment success", () => {
+  it("rejects an unsigned forged webhook with 401 and leaves the order unchanged", async () => {
     const created = await createOrder(orderRequest());
     expect(created.status).toBe(200);
     const { orderId } = await created.json();
@@ -43,10 +44,24 @@ describe("[characterization] SEC-01 unsigned webhook forges payment success", ()
     const r = makeTestRedis();
     expect((await r.get<Order>(`order:${orderId}`))!.status).toBe("pending");
 
-    const res = await webhook(forgedWebhook(orderId));
+    // No X-Webhook-Signature-512 header at all.
+    const res = await webhook(makeWebhookRequest(forgedBody(orderId)));
 
-    // Current behavior: accepted and applied.
-    expect(res.status).toBe(200);
-    expect((await r.get<Order>(`order:${orderId}`))!.status).toBe("succeeded");
+    expect(res.status).toBe(401);
+    // The order must be untouched.
+    expect((await r.get<Order>(`order:${orderId}`))!.status).toBe("pending");
+  });
+
+  it("rejects a forged webhook carrying a bogus signature and leaves the order unchanged", async () => {
+    const created = await createOrder(orderRequest());
+    const { orderId } = await created.json();
+    const r = makeTestRedis();
+
+    // A plausible-looking but wrong 128-hex signature (attacker cannot
+    // produce a valid one without payment_response_hash_key).
+    const res = await webhook(makeWebhookRequest(forgedBody(orderId), "a".repeat(128)));
+
+    expect(res.status).toBe(401);
+    expect((await r.get<Order>(`order:${orderId}`))!.status).toBe("pending");
   });
 });
