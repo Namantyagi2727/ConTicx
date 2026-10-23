@@ -1,0 +1,38 @@
+# Local test services only. Nothing here is used at runtime or in
+# production: a throwaway Redis and the serverless-redis-http adapter
+# that puts an Upstash-compatible REST API in front of it, so the real
+# @upstash/redis client can run unchanged against a local database.
+#
+# Both images are pinned by digest. Ports bind to 127.0.0.1 only. There
+# are no volumes, so stopping the stack discards all data.
+#
+#   Start:  docker compose -f docker-compose.test.yml up -d
+#   Stop:   docker compose -f docker-compose.test.yml down
+#
+# See docs/testing.md.
+
+services:
+  redis:
+    # redis:7.4.11-bookworm
+    image: redis@sha256:44960b3100c48159a66d28c18b0588c193492e25f7551d60e51dd464fc3eca5b
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:38078:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  srh:
+    # hiett/serverless-redis-http:0.0.10 — Upstash REST adapter
+    image: hiett/serverless-redis-http@sha256:65128347949bca511e448fd7238780d624573d74c22b79155a7563db19e9b678
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      SRH_MODE: env
+      SRH_TOKEN: conticx_test_token
+      SRH_CONNECTION_STRING: "redis://redis:6379"
+    ports:
+      - "127.0.0.1:38079:80"

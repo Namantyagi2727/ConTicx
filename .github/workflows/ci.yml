@@ -1,0 +1,75 @@
+name: CI
+
+# Runs on branch pushes and pull requests. Uses `pull_request` (never
+# `pull_request_target`), so workflows from forks run WITHOUT access to
+# repository secrets. The job needs no application secrets at all: tests
+# run against a local Redis adapter and an in-process fake provider, and
+# the build uses placeholder sandbox-shaped values.
+on:
+  push:
+  pull_request:
+
+# Least privilege: the job only reads the repository.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      # actions/setup-node v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Start local test services (Redis + Upstash REST adapter)
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Wait for the Redis REST adapter
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H 'Authorization: Bearer conticx_test_token' \
+              -H 'Content-Type: application/json' \
+              -X POST http://127.0.0.1:38079/ -d '["PING"]' || true)
+            if [ "$code" = "200" ]; then echo "adapter ready"; exit 0; fi
+            sleep 1
+          done
+          echo "Redis REST adapter did not become ready" >&2
+          docker compose -f docker-compose.test.yml logs >&2 || true
+          exit 1
+
+      - name: Test (unit + integration)
+        run: npm test
+
+      - name: Stop local test services
+        if: always()
+        run: docker compose -f docker-compose.test.yml down
+
+      # Build with placeholder values on unreachable `.invalid` hosts.
+      # The CI checkout has no .env.local, and these hosts never resolve,
+      # so build-time code cannot reach real Redis or the payment provider
+      # — and every service-touching route is dynamic and is not executed
+      # during the build anyway. (The only external request `next build`
+      # makes is to Google Fonts: a UI build input, no credentials.)
+      - name: Build (isolated configuration)
+        env:
+          UPSTASH_REDIS_REST_URL: https://redis.invalid
+          UPSTASH_REDIS_REST_TOKEN: placeholder_build_token
+          HYPERSWITCH_BASE_URL: https://hyperswitch.invalid
+          HYPERSWITCH_API_KEY: snd_placeholder_build
+          NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY: pk_snd_placeholder_build
+        run: npm run build
