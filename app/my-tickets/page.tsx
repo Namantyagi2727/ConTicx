@@ -1,97 +1,122 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
 import Link from "next/link";
-import type { Order } from "@/lib/types";
+import { getEvent } from "@/lib/events";
+import { formatCents } from "@/lib/format";
+import { ensureGuestSession, SAME_BROWSER_NOTE } from "@/lib/guest-client";
+import type { OrderView } from "@/lib/types";
+
+// Lists the orders owned by THIS browser's guest session (GET /api/orders).
+// It replaces the old "type an order id" lookup: an order id is no longer a
+// credential. Opening the page also renews the session's lifetime.
+
+type State =
+  | { kind: "loading" }
+  | { kind: "ready"; orders: OrderView[] }
+  | { kind: "no_session" }
+  | { kind: "error" };
+
+const STATUS_LABEL: Record<OrderView["status"], string> = {
+  succeeded: "VALID FOR ENTRY",
+  refunded: "REFUNDED",
+  pending: "CONFIRMING PAYMENT",
+  failed: "PAYMENT DIDN'T GO THROUGH",
+  expired: "HOLD EXPIRED",
+};
 
 export default function MyTicketsPage() {
-  const router = useRouter();
-  const [orderId, setOrderId] = useState("");
-  const [isLooking, setIsLooking] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [state, setState] = useState<State>({ kind: "loading" });
 
-  const handleSubmit = async (e: FormEvent) => {
-    e.preventDefault();
-    const trimmed = orderId.trim();
-    if (!trimmed) return;
-
-    setIsLooking(true);
-    setError(null);
-
-    const res = await fetch(`/api/orders/${encodeURIComponent(trimmed)}`);
-
-    if (res.status === 404) {
-      setIsLooking(false);
-      setError(
-        "We couldn't find an order with that ID — double check it and try again."
-      );
-      return;
-    }
-
-    if (!res.ok) {
-      setIsLooking(false);
-      setError("Something went wrong looking that up — try again in a moment.");
-      return;
-    }
-
-    const order: Order = await res.json();
-
-    if (!order.paymentId) {
-      setIsLooking(false);
-      setError("That order never made it to payment, so there's no ticket for it.");
-      return;
-    }
-
-    // Confirmation page already knows how to render a ticket from a
-    // payment id — reuse it entirely instead of duplicating the ticket
-    // display here.
-    router.push(`/confirmation?payment_id=${order.paymentId}`);
-  };
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const ok = await ensureGuestSession();
+      if (cancelled) return;
+      if (!ok) return setState({ kind: "no_session" });
+      try {
+        const res = await fetch("/api/orders", { cache: "no-store" });
+        if (cancelled) return;
+        if (res.status === 401) return setState({ kind: "no_session" });
+        if (!res.ok) return setState({ kind: "error" });
+        const data: { orders: OrderView[] } = await res.json();
+        if (!cancelled) setState({ kind: "ready", orders: data.orders });
+      } catch {
+        if (!cancelled) setState({ kind: "error" });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return (
     <main className="flex flex-1 items-center justify-center px-6 py-16">
       <div className="w-full max-w-sm">
-        <p className="font-mono text-xs tracking-[0.2em] text-flame">
-          LOST YOUR TAB?
-        </p>
-        <h1 className="mt-2 font-display text-3xl font-black tracking-tight">
-          FIND YOUR TICKET
-        </h1>
-        <p className="mt-2 font-body text-sm text-text-muted">
-          Enter the order ID printed on your ticket and we&apos;ll pull it
-          back up.
-        </p>
+        <p className="font-mono text-xs tracking-[0.2em] text-flame">IN THIS BROWSER</p>
+        <h1 className="mt-2 font-display text-3xl font-black tracking-tight">MY TICKETS</h1>
+        <p className="mt-2 font-body text-sm text-text-muted">{SAME_BROWSER_NOTE}</p>
 
-        <form onSubmit={handleSubmit} className="mt-6">
-          <label
-            htmlFor="orderId"
-            className="font-mono text-[11px] tracking-wide text-text-faint"
-          >
-            ORDER ID
-          </label>
-          <input
-            id="orderId"
-            type="text"
-            value={orderId}
-            onChange={(e) => setOrderId(e.target.value)}
-            placeholder="e.g. 7c92733d-0f50-445d-98b0-0da22464ce1a"
-            className="mt-2 w-full border border-ink-line bg-ink-raised px-3 py-2 font-mono text-sm text-text placeholder:text-text-faint focus:border-flame focus:outline-none"
-          />
+        <div className="mt-6">
+          {state.kind === "loading" && (
+            <p className="flex items-center gap-2 font-body text-sm text-text-muted">
+              <span className="spinner" aria-hidden /> Loading your tickets…
+            </p>
+          )}
 
-          <button
-            type="submit"
-            disabled={isLooking || !orderId.trim()}
-            className="mt-4 flex w-full items-center justify-center gap-2 bg-flame py-3 text-center font-display text-lg font-bold tracking-wide text-ink transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50"
-          >
-            {isLooking && <span className="spinner" aria-hidden />}
-            {isLooking ? "LOOKING…" : "FIND TICKET"}
-          </button>
-        </form>
+          {state.kind === "no_session" && (
+            <p className="font-body text-sm text-text-muted">
+              We couldn&apos;t start a ticket session in this browser. Check
+              that cookies are allowed for this site, then reload.
+            </p>
+          )}
 
-        {error && (
-          <p className="mt-3 font-mono text-xs text-flame">{error}</p>
-        )}
+          {state.kind === "error" && (
+            <p className="font-mono text-xs text-flame">
+              Something went wrong loading your tickets — try again in a moment.
+            </p>
+          )}
+
+          {state.kind === "ready" && state.orders.length === 0 && (
+            <p className="font-body text-sm text-text-muted">
+              No tickets in this browser yet. Tickets bought in another
+              browser or on another device won&apos;t appear here.
+            </p>
+          )}
+
+          {state.kind === "ready" && state.orders.length > 0 && (
+            <ul className="space-y-3">
+              {state.orders.map((order) => {
+                const event = getEvent(order.eventId);
+                const live = order.status === "succeeded" || order.status === "pending";
+                return (
+                  <li key={order.id}>
+                    <Link
+                      href={`/confirmation/${order.id}`}
+                      className={`block border border-ink-line bg-ink-raised p-4 transition-colors hover:border-flame ${
+                        live ? "" : "opacity-60"
+                      }`}
+                    >
+                      <p className="font-display text-lg font-extrabold tracking-tight">
+                        {event?.name ?? "Event"}
+                      </p>
+                      <p className="mt-1 font-mono text-xs text-text-muted">
+                        {order.quantity} × {order.tierName} · {formatCents(order.amountCents)}
+                      </p>
+                      <p
+                        className={`mt-2 font-mono text-[11px] font-bold tracking-wide ${
+                          order.status === "succeeded" ? "text-acid" : "text-text-faint"
+                        }`}
+                      >
+                        {STATUS_LABEL[order.status]}
+                      </p>
+                    </Link>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
 
         <Link
           href="/"

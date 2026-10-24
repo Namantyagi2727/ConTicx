@@ -12,6 +12,7 @@ import {
 } from "@juspay-tech/react-hyper-js";
 import { getEvent } from "@/lib/events";
 import { formatCents } from "@/lib/format";
+import { ensureGuestSession } from "@/lib/guest-client";
 
 // Load Hyper once, outside the component, so it isn't recreated on every render.
 // Guarded to the browser only — loadHyper touches `document`, which
@@ -40,7 +41,6 @@ const HYPER_APPEARANCE = {
 
 interface OrderCreateResponse {
   clientSecret: string;
-  paymentId: string;
   orderId: string;
   holdExpiresAt: number;
   feeCents: number;
@@ -61,16 +61,29 @@ function CheckoutContent() {
   const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
 
   // Create the inventory hold + Hyperswitch payment as soon as we land here.
+  // The guest session is established FIRST, so the booking request already
+  // carries the cookie that will own the order (see /api/guest-session).
   useEffect(() => {
     if (!event || !tier || !quantity) return;
 
-    fetch("/api/orders", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ eventId: event.id, tierName: tier.name, quantity }),
-    })
-      .then(async (res) => {
+    ensureGuestSession()
+      .then(async (ok) => {
+        if (!ok) {
+          throw new Error(
+            "We couldn't start a secure session in this browser — check that cookies are allowed"
+          );
+        }
+        const res = await fetch("/api/orders", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ eventId: event.id, tierName: tier.name, quantity }),
+        });
         const data = await res.json();
+        if (res.status === 401) {
+          throw new Error(
+            "Your browser session wasn't available — check that cookies are allowed, then try again"
+          );
+        }
         if (!res.ok) throw new Error(data.error ?? "Could not reserve tickets");
         setOrder(data);
       })
@@ -207,6 +220,7 @@ function CheckoutContent() {
         >
           <PaymentForm
             total={formatCents(order.amountCents)}
+            orderId={order.orderId}
             eventId={event.id}
             eventName={event.name}
           />
@@ -246,10 +260,12 @@ function StatusCard({
 
 function PaymentForm({
   total,
+  orderId,
   eventId,
   eventName,
 }: {
   total: string;
+  orderId: string;
   eventId: string;
   eventName: string;
 }) {
@@ -267,13 +283,19 @@ function PaymentForm({
   // it, a wallet button has nowhere valid to send the shopper back to.
   // Memoized so the widget doesn't see a new options object (and
   // potentially reset) on every unrelated re-render (isSubmitting, etc).
+  //
+  // Every return lands on the order's own confirmation page, keyed by our
+  // order id in the PATH (never a provider id, and never a query parameter
+  // that the provider's own appended return parameters could disturb).
+  // Access there is checked against this browser's guest session.
+  const returnUrl = `${window.location.origin}/confirmation/${encodeURIComponent(orderId)}`;
   const unifiedCheckoutOptions = useMemo(
     () => ({
       wallets: {
-        walletReturnUrl: `${window.location.origin}/confirmation`,
+        walletReturnUrl: returnUrl,
       },
     }),
-    []
+    [returnUrl]
   );
 
   const handleSubmit = async (e: FormEvent) => {
@@ -285,10 +307,10 @@ function PaymentForm({
 
     // redirect: "if_required" keeps the shopper on this page unless the
     // connector needs a redirect (e.g. a 3DS challenge).
-    const { error, payment_id } = await hyper.confirmPayment({
+    const { error } = await hyper.confirmPayment({
       elements: widgets,
       confirmParams: {
-        return_url: `${window.location.origin}/confirmation`,
+        return_url: returnUrl,
       },
       redirect: "if_required",
     });
@@ -300,7 +322,7 @@ function PaymentForm({
       return;
     }
 
-    router.push(`/confirmation?payment_id=${payment_id}`);
+    router.push(`/confirmation/${encodeURIComponent(orderId)}`);
   };
 
   return (

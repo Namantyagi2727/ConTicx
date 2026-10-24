@@ -172,7 +172,7 @@ export default function Home() {
               href="/my-tickets"
               className="font-mono text-xs text-text underline underline-offset-4"
             >
-              Already have a ticket? Find it →
+              Your tickets in this browser →
             </Link>
           </div>
         </div>
