@@ -1,26 +1,58 @@
 import { randomUUID } from "crypto";
-import { NextResponse } from "next/server";
 import { getEvent } from "@/lib/events";
-import { HOLD_DURATION_MS, MAX_QUANTITY_PER_ORDER, SERVICE_FEE_RATE } from "@/lib/constants";
+import {
+  GUEST_ORDER_LIST_LIMIT,
+  HOLD_DURATION_MS,
+  MAX_QUANTITY_PER_ORDER,
+  SERVICE_FEE_RATE,
+} from "@/lib/constants";
 import {
   attachPaymentId,
   clearPaymentAttempt,
   getRemainingInventory,
   InventoryStateError,
+  listGuestOrders,
   markPaymentAttempt,
   recordDemandSignal,
   reserveAndCreateOrder,
   updateOrderStatus,
 } from "@/lib/store";
 import { hyperswitchFetch } from "@/lib/hyperswitch";
+import { checkRequestOrigin } from "@/lib/app-origin";
+import { authenticateGuest, ownsOrder } from "@/lib/guest-session";
+import { jsonNoStore, originRejected, sessionRequired, toOrderView } from "@/lib/order-access";
 import type { Order } from "@/lib/types";
+
+export const dynamic = "force-dynamic";
+
+// Lists the current guest's own orders, newest first (My Tickets). Reads only
+// this guest's order index — no hold expiry, no provider call — and re-checks
+// ownership on every order before returning its allow-listed fields.
+export async function GET(request: Request) {
+  const guest = await authenticateGuest(request);
+  if (!guest) return sessionRequired();
+  const orders = await listGuestOrders(guest.ownerHash, GUEST_ORDER_LIST_LIMIT);
+  return jsonNoStore({
+    orders: orders.filter((o) => ownsOrder(o, guest.ownerHash)).map(toOrderView),
+  });
+}
 
 // Creates an order: atomically reserves inventory with a 10-minute hold
 // AND persists the order, then creates a matching Hyperswitch payment.
 // The charged amount is always computed here — tier price × quantity,
 // plus a flat SERVICE_FEE_RATE service fee on that subtotal — the client
 // only ever sends eventId, tierName, and quantity, never an amount.
+//
+// Phase 1B.4: the request must come from the trusted origin and must
+// already carry a valid guest session (POST /api/guest-session). The order
+// is bound to that guest inside the atomic reservation. This route never
+// issues a session cookie itself, so a lost response cannot lose ownership.
 export async function POST(request: Request) {
+  const origin = checkRequestOrigin(request);
+  if (!origin.ok) return originRejected(origin);
+  const guest = await authenticateGuest(request);
+  if (!guest) return sessionRequired();
+
   const body = await request.json().catch(() => null);
   const eventId = body?.eventId;
   const tierName = body?.tierName;
@@ -28,19 +60,16 @@ export async function POST(request: Request) {
 
   const event = getEvent(eventId);
   if (!event) {
-    return NextResponse.json({ error: "Unknown event" }, { status: 400 });
+    return jsonNoStore({ error: "Unknown event" }, 400);
   }
 
   const tier = event.tiers.find((t) => t.name === tierName);
   if (!tier) {
-    return NextResponse.json({ error: "Unknown ticket tier" }, { status: 400 });
+    return jsonNoStore({ error: "Unknown ticket tier" }, 400);
   }
 
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_QUANTITY_PER_ORDER) {
-    return NextResponse.json(
-      { error: `Quantity must be between 1 and ${MAX_QUANTITY_PER_ORDER}` },
-      { status: 400 }
-    );
+    return jsonNoStore({ error: `Quantity must be between 1 and ${MAX_QUANTITY_PER_ORDER}` }, 400);
   }
 
   // Friendly pre-check for a nice error message in the common case — the
@@ -53,15 +82,12 @@ export async function POST(request: Request) {
     remaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
   } catch (err) {
     if (err instanceof InventoryStateError) {
-      return NextResponse.json({ error: "Inventory temporarily unavailable" }, { status: 503 });
+      return jsonNoStore({ error: "Inventory temporarily unavailable" }, 503);
     }
     throw err;
   }
   if (quantity > remaining) {
-    return NextResponse.json(
-      { error: `Only ${remaining} ${tier.name} ticket(s) left` },
-      { status: 400 }
-    );
+    return jsonNoStore({ error: `Only ${remaining} ${tier.name} ticket(s) left` }, 400);
   }
 
   const subtotalCents = tier.priceCents * quantity;
@@ -80,6 +106,7 @@ export async function POST(request: Request) {
     status: "pending",
     holdExpiresAt: Date.now() + HOLD_DURATION_MS,
     createdAt: Date.now(),
+    ownerHash: guest.ownerHash,
   };
 
   // Atomic reserve + persist: either the seat is reserved AND the order
@@ -101,17 +128,14 @@ export async function POST(request: Request) {
     } catch (err) {
       if (!(err instanceof InventoryStateError)) throw err;
     }
-    return NextResponse.json(
-      { error: `Only ${nowRemaining} ${tier.name} ticket(s) left` },
-      { status: 400 }
-    );
+    return jsonNoStore({ error: `Only ${nowRemaining} ${tier.name} ticket(s) left` }, 400);
   }
   if (reservation === "lost") {
-    return NextResponse.json({ error: "Inventory temporarily unavailable" }, { status: 503 });
+    return jsonNoStore({ error: "Inventory temporarily unavailable" }, 503);
   }
   if (reservation !== "created") {
     // exists / conflict / error
-    return NextResponse.json({ error: "Could not create order" }, { status: 500 });
+    return jsonNoStore({ error: "Could not create order" }, 500);
   }
 
   // Fire-and-forget-ish: counts toward the event page's "N reserved
@@ -149,8 +173,11 @@ export async function POST(request: Request) {
     // Atomic pending -> failed transition releases the reservation and
     // removes the hold (see lib/store.ts). Safe no-op if something else
     // already resolved the order in the meantime.
+    // The provider's error body is logged in outline only and never
+    // returned to the browser.
     await updateOrderStatus(order.id, "failed");
-    return NextResponse.json({ error: data }, { status: response.status });
+    console.warn(`[orders] payment create failed for order ${order.id}: HTTP ${response.status}`);
+    return jsonNoStore({ error: "Could not set up payment" }, 502);
   }
 
   // Attach ONLY the payment id to the current stored order — never a
@@ -177,9 +204,10 @@ export async function POST(request: Request) {
     );
   }
 
-  return NextResponse.json({
+  // The widget needs the payment's client secret; the provider payment id is
+  // deliberately not returned — the browser navigates by the order id.
+  return jsonNoStore({
     clientSecret: data.client_secret,
-    paymentId: data.payment_id,
     orderId: order.id,
     holdExpiresAt: order.holdExpiresAt,
     feeCents: order.feeCents,

@@ -3,6 +3,7 @@ import { POST as createOrder } from "@/app/api/orders/route";
 import { POST as webhook } from "@/app/api/webhooks/hyperswitch/route";
 import type { Order } from "@/lib/types";
 import { makeTestRedis } from "../helpers/redis";
+import { newGuest, orderRequest } from "../helpers/guest";
 import { makeWebhookRequest } from "../helpers/webhook";
 
 // REGRESSION — converted from the SEC-01 characterization test.
@@ -18,13 +19,6 @@ import { makeWebhookRequest } from "../helpers/webhook";
 // (The full forged-but-signed cases are impossible without the secret, so
 // this file focuses on the core SEC-01 guarantee: no signature, no effect.)
 
-function orderRequest() {
-  return new Request("http://localhost/api/orders", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ eventId: "midnight-parade", tierName: "VIP", quantity: 1 }),
-  });
-}
 
 function forgedBody(orderId: string): string {
   // Attacker-chosen payment id and order id, no signing secret available.
@@ -37,7 +31,7 @@ function forgedBody(orderId: string): string {
 
 describe("[regression] SEC-01 unsigned webhook cannot forge payment success", () => {
   it("rejects an unsigned forged webhook with 401 and leaves the order unchanged", async () => {
-    const created = await createOrder(orderRequest());
+    const created = await createOrder(orderRequest(await newGuest()));
     expect(created.status).toBe(200);
     const { orderId } = await created.json();
 
@@ -53,7 +47,7 @@ describe("[regression] SEC-01 unsigned webhook cannot forge payment success", ()
   });
 
   it("rejects a forged webhook carrying a bogus signature and leaves the order unchanged", async () => {
-    const created = await createOrder(orderRequest());
+    const created = await createOrder(orderRequest(await newGuest()));
     const { orderId } = await created.json();
     const r = makeTestRedis();
 

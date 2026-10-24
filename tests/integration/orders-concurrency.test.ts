@@ -4,6 +4,7 @@ import { getEvent } from "@/lib/events";
 import type { Order } from "@/lib/types";
 import { getFake } from "../setup/integration";
 import { makeTestRedis } from "../helpers/redis";
+import { newGuest, orderRequest as guestOrderRequest } from "../helpers/guest";
 
 // T1A-06 (scenario 1: concurrent orders exceeding capacity) and
 // scenario 2 (successful orders have matching persisted records,
@@ -14,12 +15,10 @@ import { makeTestRedis } from "../helpers/redis";
 const EVENT_ID = "midnight-parade";
 const TIER = "VIP"; // 10 total — see lib/events.ts
 
-function orderRequest(quantity: number): Request {
-  return new Request("http://localhost/api/orders", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ eventId: EVENT_ID, tierName: TIER, quantity }),
-  });
+// One guest places every order (Phase 1B.4: a booking needs an established
+// guest session), which also exercises one identity owning many bookings.
+function orderRequest(cookie: string, quantity: number): Request {
+  return guestOrderRequest(cookie, { eventId: EVENT_ID, tierName: TIER, quantity });
 }
 
 describe("POST /api/orders under concurrency", () => {
@@ -28,8 +27,9 @@ describe("POST /api/orders under concurrency", () => {
     const capacity = tier.totalInventory;
     const requestCount = capacity + 5; // 15 requests for 10 seats
 
+    const guest = await newGuest();
     const responses = await Promise.all(
-      Array.from({ length: requestCount }, () => createOrder(orderRequest(1)))
+      Array.from({ length: requestCount }, () => createOrder(orderRequest(guest, 1)))
     );
 
     const statuses = responses.map((r) => r.status);
@@ -68,7 +68,10 @@ describe("POST /api/orders under concurrency", () => {
       expect(order).not.toBeNull();
       expect(order!.status).toBe("pending");
       expect(order!.paymentId).toBeTruthy();
-      expect(order!.paymentId).toBe(body.paymentId);
+      // The provider payment id stays server-side; the browser gets the
+      // order id (and the widget's client secret) only.
+      expect(body.paymentId).toBeUndefined();
+      expect(order!.ownerHash).toMatch(/^[0-9a-f]{64}$/);
       const holdScore = await r.zscore("pending_holds", body.orderId);
       expect(holdScore).not.toBeNull();
     }

@@ -44,4 +44,24 @@ export interface Order {
   paymentId?: string;
   holdExpiresAt: number; // epoch ms
   createdAt: number; // epoch ms
+  // SHA-256 (lowercase hex) of the guest credential that created the order,
+  // bound atomically at reservation (Phase 1B.4). Absent on legacy orders,
+  // which are therefore not accessible to any guest. Never sent to a client.
+  ownerHash?: string;
+}
+
+// The only order fields a guest-facing response carries. Deliberately
+// excludes ownerHash and the provider paymentId.
+export interface OrderView {
+  id: string;
+  eventId: string;
+  tierName: TierName;
+  quantity: number;
+  unitPriceCents: number;
+  feeCents: number;
+  amountCents: number;
+  currency: string;
+  status: OrderStatus;
+  holdExpiresAt: number;
+  createdAt: number;
 }

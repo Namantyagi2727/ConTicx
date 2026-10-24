@@ -14,6 +14,7 @@ import {
 } from "@/lib/store";
 import type { Order } from "@/lib/types";
 import { getFake } from "../setup/integration";
+import { createOwnedOrder, newGuest, orderRequest } from "../helpers/guest";
 import { beforeRedisCommandOnce, failRedisCommand, rejectRequests, waitFor } from "../helpers/faults";
 import { makeOrder } from "../helpers/orders";
 import { makeTestRedis } from "../helpers/redis";
@@ -47,16 +48,8 @@ afterEach(() => {
 });
 
 async function createOrder(): Promise<{ orderId: string; paymentId: string }> {
-  const res = await createOrderRoute(
-    new Request("http://localhost/api/orders", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ eventId: EVENT_ID, tierName: TIER, quantity: 1 }),
-    })
-  );
-  if (res.status !== 200) throw new Error(`order setup failed: ${res.status}`);
-  const data = await res.json();
-  return { orderId: data.orderId, paymentId: data.paymentId };
+  const { orderId, paymentId } = await createOwnedOrder();
+  return { orderId, paymentId };
 }
 
 // Push an order's hold into the past and re-score its index entry so the
@@ -601,18 +594,13 @@ describe("[regression] expiry provider-time budget", () => {
     const ids = await expiredSucceededOrders(4);
     getFake().delayMs = 400;
     process.env.HOLD_EXPIRY_PROVIDER_BUDGET_MS = "1000";
+    const guest = await newGuest(); // no provider calls
     const reads0 = paymentReads();
 
     // Order creation runs an expiry pass in the availability pre-check AND
     // another inside reserveAndCreateOrder. Without a shared budget each
     // pass would spend a full budget (4 reads); shared, they make 2 in total.
-    const res = await createOrderRoute(
-      new Request("http://localhost/api/orders", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ eventId: EVENT_ID, tierName: TIER, quantity: 1 }),
-      })
-    );
+    const res = await createOrderRoute(orderRequest(guest));
     expect(res.status).toBe(200);
     expect(paymentReads() - reads0).toBe(2);
 

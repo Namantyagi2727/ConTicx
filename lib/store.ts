@@ -89,6 +89,14 @@ function reconcileKey(id: string) {
 // a per-order key alone could only be found by scanning the keyspace.
 const RECONCILE_INDEX_KEY = "reconcile_needed";
 
+// Per-guest index of the orders that guest created (Phase 1B.4), scored by
+// createdAt. Written only inside RESERVE_AND_CREATE_SCRIPT, in the same step
+// as the order and its owner, so the My Tickets listing reads a guest's own
+// orders without scanning the keyspace.
+function guestOrdersKey(ownerHash: string) {
+  return `guest_orders:${ownerHash}`;
+}
+
 // Per-order marker that a provider payment was ATTEMPTED (set just before
 // the create call, cleared once its id is attached). Read only when an
 // expired hold has no attached payment id.
@@ -108,6 +116,12 @@ function paymentAttemptKey(id: string) {
 // Insufficient inventory leaves no inventory mutation, no order, and no
 // hold entry.
 //
+// Phase 1B.4: the order MUST carry its guest owner (ownerHash, 64 lowercase
+// hex), which is written in the same step as the order itself and indexed
+// in the owner's order list (KEYS[5], guest_orders:<ownerHash>). Ownership
+// is never attached afterwards, and a replay under a different owner — or
+// against a legacy order that has no owner — is a CONFLICT with no write.
+//
 // Returns: {'OK', remaining} | {'SOLD_OUT', remaining} | {'EXISTS', status}
 //        | {'CONFLICT', status} | {'LOST'} | {'ERR', reason}
 const RESERVE_AND_CREATE_SCRIPT = `
@@ -115,6 +129,7 @@ local invKey = KEYS[1]
 local orderKey = KEYS[2]
 local holdsKey = KEYS[3]
 local initKey = KEYS[4]
+local ownerIndexKey = KEYS[5]
 local orderJson = ARGV[1]
 local total = tonumber(ARGV[2])
 local maxInv = tonumber(ARGV[3])
@@ -137,7 +152,16 @@ local currency = incoming['currency']
 local unitPrice = tonumber(incoming['unitPriceCents'])
 local fee = tonumber(incoming['feeCents'])
 local amount = tonumber(incoming['amountCents'])
+local owner = incoming['ownerHash']
+local createdAt = tonumber(incoming['createdAt'])
 if not orderId or orderId == '' then return {'ERR', 'bad_order_id'} end
+-- Owner must be a SHA-256 hex digest, and the index key must be that
+-- owner's: a caller cannot index an order under someone else's list.
+if type(owner) ~= 'string' or #owner ~= 64 or not string.match(owner, '^[0-9a-f]+$') then
+  return {'ERR', 'bad_owner'}
+end
+if ownerIndexKey ~= 'guest_orders:' .. owner then return {'ERR', 'bad_owner_index'} end
+if not createdAt then return {'ERR', 'bad_created_at'} end
 -- Quantity must be a POSITIVE INTEGER within the safe bound: a value Lua
 -- could parse numerically (e.g. 1.5) is not enough — DECRBY needs a whole
 -- number and the result must stay in range.
@@ -153,6 +177,8 @@ local invType = redis.call('TYPE', invKey).ok
 if invType ~= 'string' and invType ~= 'none' then return {'ERR', 'inv_type'} end
 local holdsType = redis.call('TYPE', holdsKey).ok
 if holdsType ~= 'zset' and holdsType ~= 'none' then return {'ERR', 'holds_type'} end
+local ownerIndexType = redis.call('TYPE', ownerIndexKey).ok
+if ownerIndexType ~= 'zset' and ownerIndexType ~= 'none' then return {'ERR', 'owner_index_type'} end
 
 -- Replay / order-id collision guard. Never overwrite an existing order,
 -- reset its status, recreate its hold, or decrement again. A matching
@@ -171,7 +197,12 @@ if existingRaw then
   -- the stored order (EXISTS returns without overwriting), so a matching
   -- retry preserves the original hold window, progressed status, and any
   -- payment association.
+  --
+  -- The owner is part of the comparison: the same booking replayed by a
+  -- DIFFERENT guest is a CONFLICT, so an existing order (including a legacy
+  -- one with no owner) can never be claimed through a replay.
   local sameBooking =
+    existing['ownerHash'] == owner and
     existing['eventId'] == eventId and
     existing['tierName'] == tierName and
     existing['currency'] == currency and
@@ -226,6 +257,7 @@ end
 local after = redis.call('DECRBY', invKey, qty)
 redis.call('SET', orderKey, orderJson)
 redis.call('ZADD', holdsKey, holdExpiresAt, orderId)
+redis.call('ZADD', ownerIndexKey, createdAt, orderId)
 return {'OK', after}
 `;
 
@@ -753,6 +785,9 @@ export async function getRemainingInventory(
 // tier whose counter was lost returns "lost" — all without mutation.
 // This is internal-operation replay safety, NOT client checkout
 // idempotency (a fresh HTTP checkout still mints a new order id).
+//
+// The order must carry its guest owner (order.ownerHash). Without one the
+// script refuses ("error"); a replay by a different owner is "conflict".
 export async function reserveAndCreateOrder(
   order: Order,
   totalInventory: number
@@ -765,6 +800,7 @@ export async function reserveAndCreateOrder(
       orderKey(order.id),
       PENDING_HOLDS_KEY,
       inventoryInitKey(order.eventId, order.tierName),
+      guestOrdersKey(order.ownerHash ?? ""),
     ],
     [JSON.stringify(order), String(totalInventory), String(MAX_INVENTORY)]
   );
@@ -860,6 +896,17 @@ export async function getOrder(id: string): Promise<Order | undefined> {
 // key is absent.
 export async function peekOrder(id: string): Promise<Order | undefined> {
   return readOrder(id);
+}
+
+// The newest orders created by one guest, at most `limit`, as stored. Reads
+// only that guest's index and those order keys: no reap, no provider call.
+// Callers still check ownership on every returned order (defence in depth),
+// and an index entry whose order has gone is skipped.
+export async function listGuestOrders(ownerHash: string, limit: number): Promise<Order[]> {
+  const ids = await redis.zrange<string[]>(guestOrdersKey(ownerHash), 0, limit - 1, { rev: true });
+  if (ids.length === 0) return [];
+  const orders = await redis.mget<(Order | null)[]>(...ids.map(orderKey));
+  return orders.filter((o): o is Order => o !== null && typeof o === "object");
 }
 
 // ---------------------------------------------------------------------------

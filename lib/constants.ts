@@ -58,3 +58,18 @@ export const HOLD_EXPIRY_MIN_CALL_MS = 250;
 // is always retained). Comfortably longer than the hold window plus any
 // lazy-reap lag.
 export const PAYMENT_ATTEMPT_TTL_SECONDS = 24 * 60 * 60;
+
+// Guest ownership (Phase 1B.4). A guest session is a server-issued random
+// credential in an HttpOnly cookie; the server keeps only its SHA-256 hash,
+// as a session record that expires after this long and as the owner of
+// each order created with it. The lifetime is SLIDING: it restarts whenever
+// the browser re-establishes the session (before every booking, and when My
+// Tickets is opened), and the cookie's Max-Age is renewed to match. After
+// it lapses — or if the browser's data is cleared — this browser can no
+// longer reach those orders; there is no cross-device or email recovery yet.
+export const GUEST_SESSION_TTL_SECONDS = 90 * 24 * 60 * 60;
+
+// Upper bound on how many of a guest's orders the My Tickets listing
+// returns (newest first). Far above normal use; it only bounds the work one
+// listing request can trigger.
+export const GUEST_ORDER_LIST_LIMIT = 50;
