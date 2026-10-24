@@ -5,6 +5,7 @@ import { POST as webhook } from "@/app/api/webhooks/hyperswitch/route";
 import { updateOrderStatus } from "@/lib/store";
 import type { Order } from "@/lib/types";
 import { getFake } from "../setup/integration";
+import { failRedisCommand } from "../helpers/faults";
 import { makeTestRedis } from "../helpers/redis";
 import { makeWebhookRequest, signWebhookBody } from "../helpers/webhook";
 import {
@@ -74,36 +75,6 @@ async function counter(): Promise<number> {
 
 function getPaymentReads(): number {
   return getFake().calls.filter((c) => c.method === "GET" && c.path.startsWith("/payments/")).length;
-}
-
-// Makes every Redis-adapter request whose serialized command body matches
-// `match` (uppercased) fail, until disposed. Each command is its own
-// Upstash REST request (the basis tests/helpers/race.ts relies on), so this
-// fails one specific command — e.g. the marker SET or the transition EVAL —
-// without depending on module/singleton identity. It RESOLVES a non-ok JSON
-// error rather than rejecting the fetch: the Upstash client retries a
-// rejected fetch (5 attempts with backoff) but throws immediately on a
-// non-ok response, so this fails deterministically and fast. The store
-// surfaces it as a thrown command, exactly like a real Redis failure.
-// Returns a disposer.
-function failRedisCommand(match: (upperBody: string) => boolean): () => void {
-  const previous = globalThis.fetch;
-  const wrapped: typeof fetch = (input, init) => {
-    const body = typeof init?.body === "string" ? init.body : "";
-    if (body && match(body.toUpperCase())) {
-      return Promise.resolve(
-        new Response('{"error":"injected redis failure"}', {
-          status: 500,
-          headers: { "content-type": "application/json" },
-        })
-      );
-    }
-    return previous(input as Parameters<typeof fetch>[0], init);
-  };
-  globalThis.fetch = wrapped;
-  return () => {
-    globalThis.fetch = previous;
-  };
 }
 
 // Counts outbound requests to the local Redis adapter and the fake provider
@@ -339,6 +310,18 @@ describe("[regression] payment-to-order binding", () => {
     const { orderId, paymentId } = await createOrder();
     getFake().getPayment(paymentId)!.status = "succeeded";
     getFake().getPayment(paymentId)!.merchant_id = "merchant_wrong";
+    process.env.HYPERSWITCH_MERCHANT_ID = "merchant_expected";
+
+    const res = await webhook(signed(bodyFor(paymentId)));
+
+    expect(res.status).toBe(422);
+    expect(await statusOf(orderId)).toBe("pending");
+  });
+
+  it("rejects a provider response MISSING the merchant id when one is configured (422)", async () => {
+    const { orderId, paymentId } = await createOrder();
+    getFake().getPayment(paymentId)!.status = "succeeded";
+    expect(getFake().getPayment(paymentId)!.merchant_id).toBeUndefined();
     process.env.HYPERSWITCH_MERCHANT_ID = "merchant_expected";
 
     const res = await webhook(signed(bodyFor(paymentId)));

@@ -18,15 +18,31 @@ function requestTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TIMEOUT_MS;
 }
 
-export async function hyperswitchFetch(path: string, init?: RequestInit): Promise<Response> {
+// Optional per-call cap. A caller working under its own time budget (lazy
+// hold expiry) passes its remaining budget; the effective timeout is the
+// smaller of that and the configured helper timeout.
+export interface ProviderRequestOptions {
+  timeoutMs?: number;
+}
+
+export async function hyperswitchFetch(
+  path: string,
+  init?: RequestInit,
+  options?: ProviderRequestOptions
+): Promise<Response> {
   if (!BASE_URL || !API_KEY) {
     throw new Error(
       "Missing HYPERSWITCH_BASE_URL or HYPERSWITCH_API_KEY — check .env.local"
     );
   }
 
+  const cap = options?.timeoutMs;
+  const timeoutMs =
+    cap !== undefined && Number.isFinite(cap) && cap > 0
+      ? Math.min(requestTimeoutMs(), cap)
+      : requestTimeoutMs();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), requestTimeoutMs());
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(`${BASE_URL}${path}`, {
       ...init,
@@ -77,10 +93,17 @@ export type RetrievePaymentResult =
 //   2xx with a non-JSON or malformed body   -> transient (retry)
 // The caller is expected to have validated the id's shape first; the
 // encodeURIComponent here is a second line of defence for the URL path.
-export async function retrievePayment(paymentId: string): Promise<RetrievePaymentResult> {
+export async function retrievePayment(
+  paymentId: string,
+  options?: ProviderRequestOptions
+): Promise<RetrievePaymentResult> {
   let response: Response;
   try {
-    response = await hyperswitchFetch(`/payments/${encodeURIComponent(paymentId)}`);
+    response = await hyperswitchFetch(
+      `/payments/${encodeURIComponent(paymentId)}`,
+      undefined,
+      options
+    );
   } catch {
     return { ok: false, category: "transient" };
   }
