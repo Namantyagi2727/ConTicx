@@ -121,20 +121,20 @@ changed — not what actually happened at Hyperswitch. Order status
 transitions (`"succeeded"` / `"failed"`) are driven by two server-side
 sources instead:
 
-1. `POST /api/webhooks/hyperswitch` — receives Hyperswitch's webhook events
-   and updates order status from the event payload directly.
-2. `GET /api/payments/[id]` — called by the confirmation page, hits
-   Hyperswitch directly and reconciles order status as a side effect. This
-   is a safety net alongside the webhook in case delivery is delayed or
-   missed (there's no signature verification wired up in this sandbox
-   prototype — see the comment in the webhook route for what production
-   would add: an HMAC-SHA512 check against the `x-webhook-signature-512`
-   header using the merchant's `payment_response_hash_key`).
+1. `POST /api/webhooks/hyperswitch` — authenticates each delivery
+   (HMAC-SHA512 over the raw body, `X-Webhook-Signature-512`, keyed by the
+   profile's `payment_response_hash_key`; fail-closed), then re-reads the
+   payment from Hyperswitch and applies only the transition its
+   authoritative status justifies. See `docs/testing.md`.
+2. `GET /api/orders/[id]/status` — called by the confirmation page for the
+   guest's own order. Ownership is checked first; then, for a still-pending
+   order, the server reads the payment id **stored on that order**,
+   retrieves it from Hyperswitch, and reconciles with the same policy as
+   the webhook. A safety net in case webhook delivery is delayed or missed.
 
-The confirmation page also polls `GET /api/orders/[id]` briefly (up to 5
-times, 2s apart) if status is still `"pending"` when it first loads, giving
-the webhook a short window to land before falling back to a "still
-processing" message.
+The confirmation page polls that endpoint (up to 10 times, 2s apart) while
+the order is still `"pending"`, then falls back to a "still confirming"
+message that points to My Tickets.
 
 ### Redirect-based payment methods (PayPal)
 
@@ -147,86 +147,51 @@ at all** and never see `confirmParams.return_url`. Hyperswitch's docs
 call this out as a separate, mandatory option — `options.wallets.walletReturnUrl`
 on `<UnifiedCheckout>` itself — and the checkout page was missing it
 entirely (`<UnifiedCheckout id="unified-checkout" />`, no options) until
-this was reviewed for the PayPal routing change. Both return URLs now
-point at `/confirmation`.
+this was reviewed for the PayPal routing change. Both return URLs point at
+`/confirmation/[orderId]` — our own order id, in the path.
 
-The confirmation page's redirect handling itself didn't need to change:
-Hyperswitch appends `payment_intent_client_secret` to the return URL for
-*any* redirect it initiates — 3DS challenges and wallet flows alike — and
-`extractPaymentId` already fell back to parsing that (it was only the
-comment above it that wrongly implied this was 3DS-specific). Everything
-downstream of extracting a payment id is agnostic to how the shopper got
-there: no client-side state from the checkout page carries over (the
-browser fully navigates away to PayPal and back), so the confirmation
-page re-derives everything from Redis and payment metadata rather than
-anything left over in memory — which was already true before this
-change, since a hard reload needed to work regardless.
+Hyperswitch appends its own parameters (such as
+`payment_intent_client_secret`) to the return URL for any redirect it
+initiates. The confirmation page ignores them: it identifies the order by
+the path segment and asks the server for that order's status, so a
+provider id is never what grants access to a ticket. (Real wallet and 3DS
+redirects have not been re-verified against the sandbox since this
+change.)
 
 If a PayPal hold happens to run past its 10-minute window while the
 shopper is off on PayPal's site, the existing cancel-first reap logic
 above handles it exactly like a slow card confirmation would: no
 PayPal-specific case was needed.
 
-### Refunds
+### Refunds (disabled)
 
-`POST /api/orders/[id]/refund` — full refunds only, no partial amounts
-and no refund-window policy (e.g. "only up to 24h before the event");
-those would be checks added in front of this route using data it already
-has, not changes to how the refund call itself works. Flow:
+Online refunds are **turned off** (Phase 1B.4). `POST
+/api/orders/[id]/refund` now answers `503` with a fixed message and does
+nothing else: no order read, no provider call, no state change. The old
+handler refunded any order whose id the caller knew (audit finding
+SEC-02), and it had no safe handling of duplicate or asynchronous
+provider refunds. The ticket page says online refunds aren't available
+yet. A later refund phase will add guest authorization and
+duplicate-safe provider handling before refunds come back.
+`markOrderRefunded` and the `"refunded"` ticket state remain in place for
+that phase.
 
-1. Reject if the order isn't `"succeeded"` — except `"refunded"` already,
-   which returns success immediately without calling Hyperswitch again.
-   This is the primary idempotency guard: a duplicate or retried request
-   is a safe no-op.
-2. Call Hyperswitch `POST /refunds` with `payment_id` and the order's
-   full `amountCents` explicitly (never omitted/implicit).
-3. Only a `status: "succeeded"` response is treated as done.
-   `"pending"`/`"review"` are surfaced as an error instead of tracked
-   further — resolving those asynchronously would need a refund webhook
-   handler, which is out of scope here.
-4. On success, `markOrderRefunded` flips the order and releases its
-   inventory with the same atomic `INCRBY` used elsewhere.
+### No metadata fallback
 
-Verified live against the real sandbox (not just the happy path): a
-genuinely-confirmed test-card payment refunded successfully and released
-its seat; the identical request repeated afterward returned the same
-success without a second Hyperswitch call or a second inventory release;
-and refunding a payment before it had actually succeeded at Hyperswitch
-was correctly rejected — Hyperswitch validates refunds against its own
-true payment state, which caught a real gap in one of the test setups
-along the way (a synthetic webhook had marked an order `"succeeded"` in
-Redis without the underlying payment ever actually being confirmed).
+Every Hyperswitch payment still carries `orderId`, `eventId`, `tierName`,
+`quantity`, and `unitPrice` as metadata, and binding checks use it. But a
+ticket is never *displayed* from payment metadata any more: if the
+browser cannot access the stored order, the page says the order isn't
+available rather than reconstructing a ticket from provider data.
 
-The confirmation page shows a "Cancel ticket & refund" button on any
-`"succeeded"` ticket; a `"refunded"` order renders the same ticket in a
-visibly inactive state (greyed out, QR code desaturated, "no longer valid
-for entry") rather than disappearing.
+### Organizer view (disabled)
 
-### Metadata fallback
-
-Every Hyperswitch payment is created with `orderId`, `eventId`, `tierName`,
-`quantity`, and `unitPrice` attached as metadata. The confirmation page
-tries the Redis order store first (authoritative — reflects webhook-driven
-updates), and only falls back to reconstructing the ticket display from the
-payment's own metadata if the order isn't found there. With shared Redis
-storage this fallback should be rare in practice (unlike the old in-memory
-version, where it was the normal path whenever a different instance handled
-the request) — it's kept as a last resort for something like the Redis
-database itself being unreachable. The metadata travels with the payment
-regardless, so the ticket still renders correctly either way.
-
-### Organizer view
-
-`/admin` — not linked from anywhere on the customer-facing site, no auth
-on it either (matches the rest of this prototype: no accounts anywhere).
-Reads live reserved/remaining counts and ticket/fee revenue per event and
-tier straight from the same store the checkout flow uses, so there's no
-separate report that can drift out of sync with reality. It's explicit
-that "reserved" includes tickets still mid-checkout, not just confirmed
-sales — a hold that hasn't expired yet counts here, so the number can run
-a little ahead of what's actually been paid for. This is the page that
-caught the counter-drift bug described above: it's a genuinely useful
-piece of internal tooling, not just a demo screen.
+`/admin` answers 404 for everyone (Phase 1B.4). It had no authentication
+— the unlinked URL was its only protection — while showing sales and
+revenue figures and running hold expiry (and therefore provider calls) on
+every view. Hiding the link was not protection, so the page itself was
+disabled. A protected organizer view needs an admin login, which is out
+of scope for now.
 
 ### Live demand signal
 
@@ -243,15 +208,62 @@ counts reservation *attempts* rather than confirmed sales (the same
 badge is usually making). Good enough for a demand badge; not something
 to build billing or analytics on top of.
 
-### Find your ticket
+### Guest ownership and My Tickets
 
-`/my-tickets` — since there's no login anywhere in this app, this is a
-plain "enter your order ID" form for someone who closed their
-confirmation tab and wants it back. It doesn't duplicate any ticket
-rendering: on a successful lookup it just reads the order's `paymentId`
-and hands off to the existing confirmation page
-(`router.push('/confirmation?payment_id=...')`), the same page a fresh
-payment lands on.
+There are no accounts. Instead each browser gets a **guest session**
+(Phase 1B.4), and every order belongs to the session that created it:
+
+- **Credential.** `POST /api/guest-session` issues 32 random bytes
+  (256 bits) in an `HttpOnly`, `SameSite=Lax`, `Path=/` cookie with no
+  `Domain`. On an https `APP_ORIGIN` it is also `Secure`, under the
+  `__Host-` name prefix. The server stores only its SHA-256 hash, as a
+  session record and as each order's `ownerHash`. The credential never
+  appears in a URL, a response body, client-readable storage, or a log.
+- **Lifetime.** 90 days, sliding. It restarts each time the browser
+  starts a booking or opens My Tickets. A valid session is reused for
+  every booking, never rotated per order.
+- **Before booking.** Checkout establishes the session *first*, so the
+  booking request already carries the cookie that will own the order.
+  `POST /api/orders` refuses a request without a valid session (`401`) and
+  never sets a cookie itself, so a lost booking response can't also lose
+  ownership.
+- **Atomic binding.** The owner is written in the same Redis script that
+  reserves inventory and stores the order, and the order is indexed under
+  its owner in that step. A replay by a different guest, or against a
+  legacy order with no owner, is a conflict with no write.
+- **Access.**
+  - `GET /api/orders/[id]`, `GET /api/orders/[id]/status`, and
+    `GET /api/orders` (the list) authenticate the guest before reading
+    anything.
+  - None of them runs hold expiry.
+  - They return one generic `404` for a missing order and for someone
+    else's order alike.
+  - They expose only allow-listed fields (never `ownerHash` or the
+    provider payment id), with `Cache-Control: no-store`.
+- **Legacy orders.** Orders created before this phase have no owner, so no
+  guest can open them — not by order id, and not by payment id. There is
+  no migration or backfill.
+- **Same browser only.** `/my-tickets` lists this browser's orders; an
+  order id is no longer a lookup credential. Clearing browser data, or
+  letting the session lapse, removes access. Cross-device and email
+  recovery are not implemented.
+- **Known limitation.** Two tabs on a brand-new visit can both ask for a
+  session before either has a cookie. The browser keeps whichever cookie
+  arrives last, so an order booked with the other one would be unreachable
+  from this browser. Each page shares a single session request, and a
+  browser that already has a valid session is never re-issued one, so
+  this needs two first-ever tabs racing.
+
+Browser mutations (`POST /api/guest-session`, `POST /api/orders`) are
+accepted only when the `Origin` header exactly matches `APP_ORIGIN`. A
+missing, `null`, malformed, or foreign origin gets `403`, and an unset
+`APP_ORIGIN` fails closed with `503`. The trusted origin is never derived
+from `Host` or `X-Forwarded-Host`. There is no CORS. The signed provider
+webhook is exempt from this check.
+
+The old public `GET /api/payments/[id]` lookup and the prototype `POST
+/api/payments/create` endpoint now answer `410` without contacting
+Hyperswitch or touching state.
 
 ## Local setup
 
@@ -270,6 +282,8 @@ keys on the dashboard):
 | `HYPERSWITCH_BASE_URL` | `https://sandbox.hyperswitch.io` |
 | `UPSTASH_REDIS_REST_URL` | From an Upstash Redis database's "REST API" tab (console.upstash.com) |
 | `UPSTASH_REDIS_REST_TOKEN` | Same tab as above |
+| `HYPERSWITCH_WEBHOOK_SECRET` | The business profile's `payment_response_hash_key`; without it every webhook is refused (`503`) |
+| `APP_ORIGIN` | The app's own origin, exactly — `http://localhost:3000` locally, `https://<your-domain>` when deployed. Browser mutations from any other origin are refused, and with it unset they fail closed |
 
 ```bash
 npm run dev
@@ -288,22 +302,19 @@ dashboard's business profile settings.
 2. On checkout, check the order summary breaks out the ticket subtotal,
    a 10% service fee, and the total separately — then pay with test card
    `4242 4242 4242 4242`, any future expiry date, any CVC.
-3. You should land on the confirmation page with a ticket: event details,
-   tier, quantity, order ID, and a QR code encoding the order ID.
+3. You should land on `/confirmation/<order id>` with a ticket: event
+   details, tier, quantity, order ID, and a QR code encoding the order ID.
 4. To see the expired-hold state, let a checkout session's 10-minute
    countdown run out without paying — the payment widget is replaced with
    a "reservation expired" message linking back to the event.
-5. On the confirmation page, click **Cancel ticket & refund** to test the
-   refund flow — the ticket should switch to a greyed-out "refunded"
-   state.
-6. Copy the order ID off a ticket, go to `/my-tickets`, and look it up —
-   it should land you back on that same confirmation page.
-7. Check `/admin` — the tier you just bought from should show a higher
-   "reserved" count and non-zero revenue.
+5. Open `/my-tickets` in the same browser — the order should be listed
+   and link back to its confirmation page. In a different browser (or a
+   private window) the same confirmation link shows "This order isn't
+   available".
+6. Online refunds and `/admin` are disabled in this phase (see above).
 
-Verify both the payment and the refund in the Hyperswitch sandbox
-dashboard to confirm they actually cleared, not just that the UI looked
-right.
+Verify the payment in the Hyperswitch sandbox dashboard to confirm it
+actually cleared, not just that the UI looked right.
 
 ## Spike test
 

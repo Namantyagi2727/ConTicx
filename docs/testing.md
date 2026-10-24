@@ -53,7 +53,10 @@ The tests never read `.env.local` and can never reach a real service:
   loopback endpoints and fake, sandbox-shaped credentials before any
   application module is imported, and sets `envDir: false` so Vite loads
   no `.env*` files. These are the only values `lib/redis.ts` and
-  `lib/hyperswitch.ts` ever see in tests.
+  `lib/hyperswitch.ts` ever see in tests. It also sets
+  `APP_ORIGIN=http://localhost`, the trusted origin that route tests send
+  as their `Origin` header (plain http, so the guest cookie is not
+  `Secure` there; the https cookie is covered by a unit test).
 - **Target guard** (`tests/setup/target-guard.ts`). Before the
   integration suite touches anything, it refuses to continue unless the
   Redis and provider URLs are loopback and the Redis token is the
@@ -178,8 +181,8 @@ build still succeeds. CI runs this same build with the same
   will need.
 - `POST /api/orders` under 15 concurrent requests for a 10-seat tier
   never oversells: exactly 10 succeed, the raw counter lands at 0, and
-  each success has a persisted pending order with a payment id and a
-  hold entry. (Assertions read raw Redis values, never clamped UI
+  each success has a persisted pending order with a payment id, a guest
+  owner, and a hold entry. All 15 come from one guest session. (Assertions read raw Redis values, never clamped UI
   numbers.)
 - The network guard refuses to follow a 3xx redirect off a vetted
   loopback URL — verified with a local fixture server that records
@@ -307,7 +310,7 @@ S1–S10).
 
 ### Shared provider-state policy
 
-Used identically by the webhook, `GET /api/payments/[id]`, and lazy expiry.
+Used identically by the webhook, the order status refresh (`GET /api/orders/[id]/status`, formerly `GET /api/payments/[id]`), and lazy expiry.
 Only the **authoritative** status from a bound provider retrieval decides an
 outcome — never an event name, an HTTP response code, or metadata alone.
 Terminal classification follows Hyperswitch's
@@ -421,33 +424,84 @@ the order's current status.
 | **Failure before the order transition** (provider timeout / 5xx / non-JSON, Redis failure on read or on the transition itself) | 503 | **unchanged** | no |
 | **Failure after the transition, before the marker** (marker write fails) | 503 | **already changed** by the transition | no — redelivery re-runs the transition as a no-op; the inventory effect is not repeated |
 
+## Guest ownership and order access (Phase 1B.4)
+
+Every route that reads or changes an individual order, ticket, payment,
+or refund, and what now protects it:
+
+| Route | Protection |
+| --- | --- |
+| `POST /api/guest-session` | Trusted `Origin` required. Reuses a valid presented session (lifetime renewed); issues a new credential only when none is presented. The credential travels only in `Set-Cookie`. |
+| `POST /api/orders` | Trusted `Origin` and an established guest session required, before any inventory read, expiry, or provider call. Owner bound inside the atomic reservation. Never sets a cookie. No provider error body or provider payment id in the response. |
+| `GET /api/orders` | Guest session required. Lists only this guest's orders (owner index + per-order ownership re-check), allow-listed fields, `no-store`. |
+| `GET /api/orders/[id]` | Guest session, valid UUID, ownership — checked before the order is returned. Side-effect-free read (no expiry, no provider). Same `404` for missing and not-owned. `no-store`. |
+| `GET /api/orders/[id]/status` | As above, and only then: for a pending order, the provider read uses the payment id **stored on the owned order** and reconciles through the shared policy. |
+| `POST /api/orders/[id]/refund` | Disabled — fixed `503`, no reads, no provider call, no writes. |
+| `GET /api/payments/[id]`, `POST /api/payments/create` | Disabled — fixed `410`, no provider call, no state. |
+| `/admin` | Disabled — `notFound()`, reads nothing. |
+| `POST /api/webhooks/hyperswitch` | Unchanged: signature-authenticated server-to-server; no guest cookie and no browser-origin check. |
+
+`guest-authorization.regression.test.ts` asserts, against raw Redis state
+(a full key-and-value snapshot) and the fake's recorded calls:
+
+- Guest A can read, poll, and list A's order; guest B gets the same `404`
+  as a missing order, and B's status poll reaches neither the provider nor
+  reconciliation, even with an expired hold queued.
+- Missing, malformed, and unknown (well-formed but never issued)
+  credentials get `401` from every read route with no provider call, no
+  expiry pass, no reconciliation, and no write; a booking without a
+  session is refused before any work and never sets a cookie.
+- Legacy orders without an owner are unreachable by any guest.
+- A different-owner replay, and a replay against a legacy order, are
+  conflicts that leave order, inventory, holds, and indexes untouched; an
+  order without a well-formed owner is refused.
+- Repeated and concurrent session calls keep one identity across several
+  bookings; listings never include another guest's orders or any owner
+  hash or provider id.
+- Cookie attributes (`HttpOnly`, `SameSite=Lax`, `Path=/`, `Max-Age`, no
+  `Domain`; `Secure` + `__Host-` on https in the unit test), no credential
+  in the body or in Redis, and `Cache-Control: no-store`.
+- Missing, `null`, malformed, foreign, and Host/forwarded-spoofed origins
+  are refused with no session, order, or provider call; an unset
+  `APP_ORIGIN` fails closed.
+- The disabled refund, payment, and admin routes have no side effects; an
+  authenticated webhook still updates a guest's order with no cookie.
+
+`order-status-reconcile.regression.test.ts` ports the Phase 1B.3
+payment-status scenarios to the order-scoped status route. Mutation
+checks: dropping the owner from the replay comparison, accepting any
+owner, running expiry before the ownership check, accepting any origin,
+rotating a valid session, or skipping the session-record lookup each fail
+at least one of these tests.
+
+**Limitations.**
+
+- **Same browser only.** No cross-device or email recovery; clearing
+  browser data, or 90 days without starting a booking or opening My
+  Tickets, ends access.
+- **First-visit race across tabs.** Two first-ever tabs can be issued
+  different credentials before either cookie is stored; the browser keeps
+  the last, and an order placed with the other is unreachable from that
+  browser. Within one page the session request is shared.
+- **No admin or refund access** until the phases that add an admin login
+  and authorized, duplicate-safe refunds.
+- **Hosted behavior unverified.** Real Hyperswitch redirect return URLs
+  with the order id in the path, and cookie behavior behind the
+  production proxy, have not been checked against the sandbox or a
+  deployment.
+- **No rate limiting** on session creation or status polling.
+
 ## Known-defect characterization tests
 
-The files named `*.characterization.test.ts` assert the application's
-**current, incorrect** behavior. They pass **because the defect is
-present**. They are evidence of a bug, not a guarantee:
-
-| Test | Audit finding | Current behavior it pins |
-| --- | --- | --- |
-| `refund-authorization.characterization` | SEC-02 | A refund succeeds for a caller with no ownership proof. |
-
-The **INV-02** double-release characterization was **converted** into a
-regression test in Phase 1B.1
-(`concurrent-refund-release.regression.test.ts`): it now asserts a single
-atomic release. The **SEC-01** unsigned-webhook characterization was
-**converted** in Phase 1B.2 (`webhook-forgery.regression.test.ts`, with the
-full matrix in `webhook-security.regression.test.ts`): an unsigned or
-invalid-signature delivery is now rejected (`401`) with the order left
-unchanged. The **INV-01** cancel-400 characterization was **converted** in
-Phase 1B.3 (`expiry-reconciliation.regression.test.ts`): a cancellation
-response no longer decides the outcome; expiry re-reads the authoritative
-status, and a cancel `400` with a still-processing payment is retained and
-flagged rather than marked `succeeded`. The one row above remains a
-characterization — refund authorization (SEC-02) is untouched, so that
-defect is still present and the test still passes because of it. Do not
-read a passing characterization test as a passing security control.
-Converting it (an unauthorized refund gets a uniform 404) is the job of a
-later subphase.
+No characterization tests remain. The last one, `refund-authorization`
+(SEC-02, "a refund succeeds for a caller with no ownership proof"), was
+**replaced** in Phase 1B.4 by a regression test proving the refund
+endpoint is disabled with zero provider or store side effects; refunds
+stay disabled until a later phase adds guest authorization and
+duplicate-safe provider handling. Earlier conversions: **INV-02**
+(Phase 1B.1, `concurrent-refund-release.regression.test.ts`), **SEC-01**
+(Phase 1B.2, `webhook-forgery` / `webhook-security`), and **INV-01**
+(Phase 1B.3, `expiry-reconciliation`).
 
 ## Emulator and provider-fake limitations
 
