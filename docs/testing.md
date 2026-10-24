@@ -185,6 +185,52 @@ build still succeeds. CI runs this same build with the same
   loopback URL — verified with a local fixture server that records
   whether the redirect target was requested; no remote host is
   contacted.
+- **Atomic store operations (Phase 1B.1).** Reserve-and-create, status
+  transitions + inventory release, and payment-id attachment each run as
+  a single Redis Lua script. Regression tests assert, on raw Redis
+  state: concurrent reservations never exceed capacity and reserves =
+  orders = holds = inventory; an insufficient reserve writes nothing;
+  two concurrent refunds (and a retried one) release a seat exactly once
+  (INV-02 fixed); two conflicting transitions apply exactly one inventory
+  effect; a payment-id attach racing a transition never resurrects
+  pending state; duplicate attaches no-op and conflicting ones are
+  refused.
+- **Reservation replay / order-id collision (Phase 1B.1).** Resubmitting
+  the same order id — sequentially, concurrently, or as a lost-response
+  retry — decrements inventory at most once and returns an `exists`
+  result without overwriting the order, resetting its status, or
+  recreating a resolved hold; a different booking under the same id is
+  rejected (`conflict`) with no mutation. The compared immutable booking
+  fields are `eventId`, `tierName`, `currency`, `quantity`,
+  `unitPriceCents`, `feeCents`, and `amountCents`, so a differing currency
+  or pricing breakdown conflicts even when the total matches. `createdAt`
+  and `holdExpiresAt` are deliberately **not** compared — they belong to
+  the original attempt and are retained from the stored order, so a
+  matching retry preserves the original hold window, progressed status,
+  and any payment association. (Internal-operation replay safety, not
+  client checkout idempotency, which is deferred.)
+- **Initialization vs lost counter (Phase 1B.1).** A persistent per-tier
+  `inventory_init:<event>:<tier>` record distinguishes a genuinely new
+  tier (seed to full) from a tier whose counter was lost (an absent
+  counter alone cannot). With the counter deleted but the init record
+  present, the availability read, a new reservation, and a release
+  transition all refuse (a clear error / `lost`) rather than reset to
+  full or fabricate a counter.
+- **Pre-write validation (Phase 1B.1).** A Lua script does **not** roll
+  back writes that ran before a later error, so these guarantees rest on
+  each script validating — *before* the first mutation — every key it
+  writes and every value it computes: order existence, hold-index type,
+  the counter's type **and canonical-integer representation** (a value
+  `tonumber()` parses but Redis integer ops reject — `"1.5"`, `"1.0"`,
+  `"1e2"` — is rejected, not silently normalized), positive-integer
+  quantities, and capacities/results within an explicit safe bound
+  (`MAX_INVENTORY`) so `DECRBY`/`INCRBY` cannot overflow. This validates
+  the inputs and stored shapes these scripts touch; it is **not** a claim
+  that a Redis script can never fail mid-sequence under any operational
+  condition (e.g. an out-of-memory rejection, eviction, or a killed
+  instance). Tests feed raw numeric-looking invalid values (written as
+  raw bytes so the SDK can't normalize them) and corrupt keys, and assert
+  the operation is rejected with no partial write.
 
 These prove the **harness** and the **oversell path** behave as
 expected. They do **not** prove the application is secure or correct —
@@ -202,14 +248,19 @@ present**. They are evidence of a bug, not a guarantee:
 | --- | --- | --- |
 | `webhook-forgery.characterization` | SEC-01 | An unsigned webhook promotes an order to `succeeded`. |
 | `expiry-cancel-400.characterization` | INV-01 | A hold whose cancel is rejected with 400 is marked `succeeded` and keeps its seat. |
-| `double-release.characterization` | INV-02 | Two concurrent refunds both release the same seat (forced interleaving). |
 | `refund-authorization.characterization` | SEC-02 | A refund succeeds for a caller with no ownership proof. |
 
-**Phase 1B must convert each of these into a regression test that
-asserts the corrected behavior** (invalid signature rejected; real
-payment status re-fetched after a non-2xx cancel; a single atomic
-release; unauthorized refund gets a uniform 404). Until then, do not
-read a passing characterization test as a passing security control.
+The **INV-02** double-release characterization was **converted** into a
+regression test in Phase 1B.1
+(`concurrent-refund-release.regression.test.ts`): it now asserts a single
+atomic release. The three rows above remain characterizations — Phase
+1B.1 deliberately did **not** touch webhook authenticity (SEC-01), the
+cancel-400 interpretation (INV-01), or refund authorization (SEC-02), so
+those defects are still present and these tests still pass because of it.
+Do not read a passing characterization test as a passing security
+control. Converting the remaining three is the job of later subphases
+(invalid signature rejected; real payment status re-fetched after a
+non-2xx cancel; unauthorized refund gets a uniform 404).
 
 ## Emulator and provider-fake limitations
 
@@ -225,3 +276,15 @@ read a passing characterization test as a passing security control.
   not a provider simulator and proves nothing about the real API's
   signatures, idempotency, status transitions, or timing. Those are the
   deferred sandbox checks (addendum S1–S10).
+- **Init-record compatibility (Phase 1B.1).** The lost-counter protection
+  relies on the per-tier `inventory_init:<event>:<tier>` record, written
+  the first time a tier is seeded after this change. A tier initialized
+  *before* this change has a counter but no init record; if that
+  counter is later lost, the tier is indistinguishable from a new one and
+  would be reseeded to full. By design there is **no** auto-backfill or
+  repair of the init record (that would be a migration, out of scope), so
+  the guarantee applies only to tiers initialized after this change.
+  Losing both the counter and the init record (e.g. a full flush) is also
+  indistinguishable from a fresh tier. The init record is an additive new
+  key; existing order/inventory/hold storage is unchanged, so no
+  migration is required for the rest of the model.

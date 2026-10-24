@@ -1,5 +1,5 @@
 // Fires N concurrent order requests at one event/tier to demonstrate —
-// not just assert — that reserveInventory's atomic Redis DECRBY
+// not just assert — that reserveAndCreateOrder's atomic Redis script
 // (lib/store.ts) prevents overselling under real concurrency. This is
 // the same test that was originally run by hand in a terminal during
 // the move to Redis (15 curl requests backgrounded against 10 VIP
@@ -147,7 +147,7 @@ async function main() {
     console.log("\nOK — inventory accounting is exact, no oversell.");
   } else {
     console.log(
-      `\nMISMATCH — expected ${expectedAfter}, got ${after}. Investigate reserveInventory in lib/store.ts.`
+      `\nMISMATCH — expected ${expectedAfter}, got ${after}. Investigate reserveAndCreateOrder in lib/store.ts.`
     );
     process.exit(1);
   }
