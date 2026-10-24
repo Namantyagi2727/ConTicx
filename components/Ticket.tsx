@@ -28,7 +28,7 @@ export function Ticket({ order }: { order: OrderView }) {
   }, [order.id]);
 
   return (
-    <div className="mx-auto max-w-sm">
+    <div className="mx-auto min-w-0 max-w-sm">
       <div
         className={`ticket-print-in grain relative overflow-hidden border border-black/10 bg-paper text-paper-ink shadow-[0_20px_50px_-15px_rgba(0,0,0,0.6)] ${
           refunded ? "grayscale" : ""
