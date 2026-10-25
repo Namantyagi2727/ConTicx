@@ -435,7 +435,7 @@ or refund, and what now protects it:
 | `POST /api/orders` | Trusted `Origin` and an established guest session required, before any inventory read, expiry, or provider call. Owner bound inside the atomic reservation. Never sets a cookie. No provider error body or provider payment id in the response. |
 | `GET /api/orders` | Guest session required. Lists only this guest's orders (owner index + per-order ownership re-check), allow-listed fields, `no-store`. |
 | `GET /api/orders/[id]` | Guest session, valid UUID, ownership — checked before the order is returned. Side-effect-free read (no expiry, no provider). Same `404` for missing and not-owned. `no-store`. |
-| `GET /api/orders/[id]/status` | As above, and only then: for a pending order, the provider read uses the payment id **stored on the owned order** and reconciles through the shared policy. |
+| `GET /api/orders/[id]/status` | As above, and only then: for an owned order with an attached payment, the provider read uses the payment id **stored on that order** (validated with `isValidPaymentId` first; a malformed id skips the refresh) and reconciles through the shared policy — as the retired payment-status route did for every lookup. A terminal order keeps its state and inventory; a conflicting outcome is flagged. |
 | `POST /api/orders/[id]/refund` | Disabled — fixed `503`, no reads, no provider call, no writes. |
 | `GET /api/payments/[id]`, `POST /api/payments/create` | Disabled — fixed `410`, no provider call, no state. |
 | `/admin` | Disabled — `notFound()`, reads nothing. |
@@ -453,7 +453,10 @@ or refund, and what now protects it:
   session is refused before any work and never sets a cookie.
 - Legacy orders without an owner are unreachable by any guest.
 - A different-owner replay, and a replay against a legacy order, are
-  conflicts that leave order, inventory, holds, and indexes untouched; an
+  conflicts that leave order, inventory, holds, and indexes untouched; a
+  wrong-type owner index (string or hash) makes an otherwise valid
+  reservation fail before any write — no counter seed, decrement, order,
+  hold, or index change, on a new tier or an initialized one; an
   order without a well-formed owner is refused.
 - Repeated and concurrent session calls keep one identity across several
   bookings; listings never include another guest's orders or any owner
@@ -468,11 +471,67 @@ or refund, and what now protects it:
   authenticated webhook still updates a guest's order with no cookie.
 
 `order-status-reconcile.regression.test.ts` ports the Phase 1B.3
-payment-status scenarios to the order-scoped status route. Mutation
-checks: dropping the owner from the replay comparison, accepting any
-owner, running expiry before the ownership check, accepting any origin,
-rotating a valid session, or skipping the session-record lookup each fail
-at least one of these tests.
+payment-status scenarios to the order-scoped status route, including an
+owned **terminal** order that receives a conflicting authoritative status:
+the provider is read with the order's own payment id, state and inventory
+stay put, and the conflict is recorded in `reconcile_needed`. A malformed
+stored payment id never reaches a provider path. Mutation checks: dropping
+the owner from the replay comparison, accepting any owner, running expiry
+before the ownership check, accepting any origin, rotating a valid
+session, skipping the session-record lookup, removing the owner-index
+type guard, restricting the status refresh to pending orders again, or
+dropping the stored payment-id check each fail at least one of these
+tests.
+
+### Checkout browser harness
+
+`tests/browser/checkout-harness/run.sh [APP_ORIGIN]` runs the real app
+with the two payment-widget packages swapped for local stubs at their
+import boundary (`turbopack.resolveAlias` in a harness-only Next config,
+copied over `next.config.ts` only inside a temporary `git archive` export
+of HEAD — never `.env.local`, never the production config). It uses the
+local test Redis and the fake provider, with a loopback control port
+(`38172`) to move a fake payment's status. The stubs record what checkout
+passes across the boundary on `window.__HYPER_STUB__`, and
+`localStorage.hyperStubMode` selects `success` (in-page), `decline`, or
+`redirect` (navigates to the return URL with provider-style query
+parameters appended).
+
+Checked manually in the browser pane against this harness (Phase 1B.4):
+
+- A fresh browser (no session; `GET /api/orders` → `401`) opened the real
+  checkout page from the event page's Get-tickets button. It issued one
+  `POST /api/guest-session` and then the booking; the booking succeeded,
+  which the server allows only with the cookie that session response set.
+- The widget boundary received the publishable-key family (`pk_snd_`) and
+  `env: SANDBOX`, the fake payment's exact client secret, a wallet return
+  URL of `/confirmation/<local order id>`, and `confirmPayment` with that
+  same return URL, `redirect: "if_required"`, and the widgets object.
+- In-page success navigated to the confirmation page, which polled
+  pending, then showed the ticket after the fake payment moved to
+  `succeeded`; the order appeared in My Tickets. The redirect mode landed
+  on the same path with `payment_intent_client_secret` and `status`
+  appended and resolved the same way. A decline kept the shopper on
+  checkout with the error and a retry.
+- A failed session bootstrap (browsing an origin other than `APP_ORIGIN`,
+  so `POST /api/guest-session` returned `403`) sent no booking request,
+  created no order, session, or provider call, and showed "Couldn't
+  reserve those tickets" with a link back to the event.
+- No browser request left the harness origin; nothing was requested from
+  a Hyperswitch domain.
+
+What it does not prove: anything about the real widget or hosted iframe,
+Hyperswitch's actual `confirmPayment` results, its real redirect and
+wallet return behavior, or cookie behavior on a deployed https origin.
+Those remain unverified.
+
+Observed while running it: in `next dev`, React Strict Mode runs
+checkout's booking effect twice, so each checkout visit created **two**
+owned orders (one session request, shared; two `POST /api/orders`), and
+the extra pending order appears in My Tickets until its hold expires.
+This predates Phase 1B.4 (the booking effect is unchanged); production
+builds do not double-run effects, but that has not been confirmed in a
+browser here.
 
 **Limitations.**
 
@@ -485,10 +544,11 @@ at least one of these tests.
   browser. Within one page the session request is shared.
 - **No admin or refund access** until the phases that add an admin login
   and authorized, duplicate-safe refunds.
-- **Hosted behavior unverified.** Real Hyperswitch redirect return URLs
-  with the order id in the path, and cookie behavior behind the
-  production proxy, have not been checked against the sandbox or a
-  deployment.
+- **Hosted behavior unverified.** The checkout harness proves the page's
+  side of the widget contract with a stub; the real widget, real
+  Hyperswitch redirect/wallet returns to `/confirmation/<order id>`, and
+  cookie behavior behind the production proxy have not been checked
+  against the sandbox or a deployment.
 - **No rate limiting** on session creation or status polling.
 
 ## Known-defect characterization tests

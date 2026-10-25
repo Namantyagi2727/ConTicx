@@ -127,10 +127,14 @@ sources instead:
    payment from Hyperswitch and applies only the transition its
    authoritative status justifies. See `docs/testing.md`.
 2. `GET /api/orders/[id]/status` — called by the confirmation page for the
-   guest's own order. Ownership is checked first; then, for a still-pending
-   order, the server reads the payment id **stored on that order**,
-   retrieves it from Hyperswitch, and reconciles with the same policy as
-   the webhook. A safety net in case webhook delivery is delayed or missed.
+   guest's own order. Ownership is checked first; then the server reads
+   the payment id **stored on that order** (shape-checked before it is
+   used in a provider path), retrieves it from Hyperswitch, and reconciles
+   with the same policy as the webhook — exactly as the old payment-status
+   route did, now only for the owner. A pending order may resolve; an
+   already-terminal order keeps its state and inventory, and a conflicting
+   provider outcome is recorded for reconciliation. A safety net in case
+   webhook delivery is delayed or missed.
 
 The confirmation page polls that endpoint (up to 10 times, 2s apart) while
 the order is still `"pending"`, then falls back to a "still confirming"
@@ -315,6 +319,10 @@ dashboard's business profile settings.
 
 Verify the payment in the Hyperswitch sandbox dashboard to confirm it
 actually cleared, not just that the UI looked right.
+
+To exercise the checkout page locally **without** Hyperswitch (payment
+widget stubbed, fake provider, local test Redis), use the checkout browser
+harness described in `docs/testing.md`.
 
 ## Spike test
 
