@@ -557,8 +557,9 @@ on.
   order and no pending hold remained.
 
 This prevents the client from duplicating a booking inside one checkout
-attempt. It is **not** server-side idempotency for payment creation — see
-the limitation below.
+attempt. Server-side idempotency (reloads, concurrent requests, lost
+responses, payment creation) arrived separately in Phase 1B.5 — see
+"Booking attempts and payment creation" below.
 
 **Limitations.**
 
@@ -577,19 +578,144 @@ the limitation below.
   cookie behavior behind the production proxy have not been checked
   against the sandbox or a deployment.
 - **No rate limiting** on session creation or status polling.
-- **No server-side idempotency for order and payment creation.** Each
-  `POST /api/orders` mints a new order id, reserves seats, and creates a
-  provider payment (with no provider idempotency key). A page reload or a
-  second tab on checkout, two concurrent requests, or a client retry after
-  an ambiguous network failure (request sent, response lost) can each
-  create another order, provider payment, and inventory hold. Whether an
-  unpaid extra hold is ever released depends on the shared reconciliation
-  policy and the evidence it gets: expiry releases it only on authoritative
-  proof (e.g. a confirmed cancellation), while a failed payment, an
-  inconclusive cancel or provider read, or a missing payment id is retained
-  and flagged in `reconcile_needed`. Those unresolved holds can stay held
-  until the recovery phase exists. The Strict Mode fix above covers only
-  React re-running one mounted page's effect.
+- **Booking idempotency** is per booking attempt since Phase 1B.5 — see
+  the next section for what it does and does not cover.
+
+## Booking attempts and payment creation (Phase 1B.5)
+
+### Booking-attempt contract
+
+- **Identity.** A booking attempt is a UUID v4 minted in the browser for
+  each deliberate *Get tickets* action (and, once, by checkout for a URL
+  that lacks one). It travels in the checkout URL (`&attempt=`), so a
+  reload, a retry, or React Strict Mode's effect re-run reuses it, while a
+  new *Get tickets* click — even for identical tickets — mints a new one.
+  It is not a secret and not a credential: the server scopes it to the
+  guest, so presenting it grants nothing to anyone else.
+- **Binding.** The reserve script binds
+  `booking_attempt:<ownerHash>:<attemptId>` to the new order and its
+  canonical request (event, tier, quantity) in the same atomic step as the
+  inventory decrement, order, hold, and owner index. Then, for the same
+  guest and attempt:
+  - same request → the ORIGINAL order is returned (original pricing,
+    `createdAt`, hold expiry, and payment identity), no write;
+  - changed event, tier, or quantity → `409 attempt_conflict`, no write
+    (the UI offers a new booking instead);
+  - another guest with the same id → a different key, so an independent
+    booking of their own; they never see or claim the original.
+- **Closed attempts.** If the bound order is paid, failed, or its hold has
+  lapsed, the attempt answers `409 attempt_closed` with the order's status
+  and never turns into a new booking (a paid one goes to its ticket).
+- **Retention.** Attempt records have no TTL; they live as long as the
+  order does, so an unresolved operation can never lapse into a fresh
+  booking.
+
+### Provider contract (as established, with sources)
+
+Read on 2026-10-25; the hosted sandbox's deployed version is not known.
+
+| Claim | Status | Source |
+| --- | --- | --- |
+| `POST /payments` accepts a merchant-provided `payment_id` (30 characters in the v1 schema) that "ensures idempotency for the payment creation request". | **Documented** | [Payments – Create](https://api-reference.hyperswitch.io/v1/payments/payments--create) |
+| No `Idempotency-Key` header is documented for create. | **Documented (absence)** | same |
+| `GET /payments/{payment_id}` returns the payment including `client_secret`. | **Documented** | [Payments – Retrieve](https://api-reference.hyperswitch.io/v1/payments/payments--retrieve) |
+| A create whose `payment_id` already exists fails with HTTP 400, code `HE_01` ("The payment with the specified payment_id already exists in our records") and does **not** return the existing payment; request parameters are not compared. | **Implementation only** (upstream `main`) | [`api_error_response.rs`](https://github.com/juspay/hyperswitch/blob/main/crates/hyperswitch_domain_models/src/errors/api_error_response.rs), [`payment_create.rs`](https://github.com/juspay/hyperswitch/blob/main/crates/router/src/core/payments/operations/payment_create.rs) |
+| Concurrent creates under one id collapse to one payment: the duplicate maps from the storage layer's `DuplicateValue` (unique constraint) error; other storage errors become 500. | **Implementation only** | [`errors/utils.rs`](https://github.com/juspay/hyperswitch/blob/main/crates/router/src/core/errors/utils.rs) |
+| How long a `payment_id` stays reserved. | **Not established** — assumed permanent (payment intents persist). | — |
+
+Before this phase the wrapper sent no `payment_id` at all (the provider
+generated one). `lib/hyperswitch.ts` `createPayment` now sends ours and
+classifies the response: `created` (2xx naming our id), `duplicate`
+(400 + `HE_01`), `rejected` (any other 4xx except 408/425/429, treated as
+"no payment was created" — an assumption based on the create flow
+validating before it inserts), and `uncertain` (transport error, timeout,
+5xx, 408/425/429, or an unrecognised success).
+
+The fake provider models exactly the rows above, including the
+implementation-only duplicate behaviour. That makes the tests consistent
+with the source, **not** a demonstration of hosted-provider parity.
+
+### Payment creation and ambiguous failures
+
+The provider `payment_id` (`pay_` + 26 random `[a-z0-9]`) is chosen and
+stored on the order by the reservation itself — before any provider call
+— and every creation for that order uses it. `lib/booking.ts`:
+
+1. Paid/failed/lapsed order → closed. Attached payment → re-read it for a
+   client secret (no creation).
+2. Claim a short lease (`BOOKING_PAYMENT_LEASE_MS`, 15 s); if another
+   request holds it, answer `202 processing` with no provider call.
+3. Re-read the order under the lease, then **retrieve by our id first**.
+   Found → bind (id, order id, amount, currency) and attach (field-scoped)
+   → ready.
+4. Not found → **create under the same id**. Duplicate → retrieve and
+   adopt. Definitive rejection → fail the order and release its seats,
+   *only if no payment is attached* (transition guard), else resume.
+   Uncertain → keep the reservation, flag `reconcile_needed`, answer
+   `202 processing`.
+
+| Failure boundary | Outcome |
+| --- | --- |
+| Reserved, process stops before the provider call | Retry: retrieve → 404 → create under the stored id → ready. Without a retry, expiry retains and flags it like any payment-less hold. |
+| Create sent, response lost / timed out | `202`, reservation kept, flagged; retry retrieves the payment the provider did create and adopts it — no second create. |
+| Provider created it, local association failed | `202`; retry retrieves and attaches it. If the lease could not be released (Redis failing), retries answer `processing` until it lapses. |
+| Association succeeded, browser response lost | Retry returns the same order; the client secret is re-read from the provider. |
+| Concurrent retry during creation | `202 processing`, no provider call (lease). |
+| Stale worker resumes after another progressed | Its create is a duplicate or the same payment; its attach is a no-op; its definitive-rejection path cannot fail an order with an attached payment. |
+| Provider definitively rejects | `502 payment_setup_failed`; order failed, seats released; the attempt stays closed. |
+
+The lease is an optimisation against redundant calls; a retry after it
+lapses is justified by the fixed provider id (documented idempotency, plus
+the implementation's duplicate rejection), not by the lease.
+
+### Tests
+
+`booking-idempotency.regression.test.ts` (19 cases) asserts stored orders,
+attempt records, inventory, holds, owner indexes, payment associations,
+and the fake's recorded calls for: concurrent identical submissions; replay
+after a lost response (same hold, pricing, payment; no new create); changed
+inputs; guest isolation; deliberately separate identical bookings; a crash
+before creation; provider success then response loss (timeout); 500 after
+create; a create that never arrived; provider success then failed
+association; definitive rejection then a closed replay; a retry during an
+in-flight creation; a stale worker after lease lapse; a stale rejection
+against an attached payment; replay of a paid and of a lapsed attempt;
+wrong-type attempt records; malformed attempt/payment identities; and a
+missing or invalid attempt id. Mutations that skip the attempt replay,
+drop the attempt-key type guard, skip retrieve-before-create, release on
+an uncertain outcome, ignore the stale-rejection guard, ignore the lease,
+mint a new provider id per attempt, or create for closed orders each fail
+it. The Strict Mode suite also checks that a URL without an attempt gets
+exactly one minted attempt and no booking before it.
+
+Checkout harness (manual, Phase 1B.5, from a flushed test Redis): reload
+resumed the same attempt, order, and payment with the hold clock
+continuing; a 500-after-create answered `202` and checkout's automatic
+retry adopted the created payment (one create); with retrieves failing,
+checkout stopped at "Still setting up your payment" with no create, and
+*Try again* (same attempt) then created under the stored id; revisiting a
+paid attempt's checkout opened its ticket; reusing an attempt with a
+different quantity showed the conflict state and changed nothing.
+
+### What remains
+
+- **Not tested against real services.** Neither the duplicate-`payment_id`
+  behaviour nor retrieval semantics has been exercised against the
+  Hyperswitch sandbox; the hosted version may differ from upstream `main`.
+- **Recovery is deferred.** Uncertain outcomes are flagged in
+  `reconcile_needed` and held; nothing yet resolves them in the
+  background, flags are not cleared when a later retry succeeds, and
+  expiry still retains a payment-less hold without asking the provider
+  about its stored `paymentRequestId`.
+- **Per attempt, not per purchase intent.** Two separate *Get tickets*
+  clicks are two bookings by design. A checkout URL copied into another
+  tab shares its attempt (the same order).
+- **Orders reserved before this phase** have no stored payment identity;
+  the route never creates one for them (it answers `processing` and flags
+  them).
+- **Client secret lifetime.** The documented client-secret query
+  parameter expires after 15 minutes; holds are 10 minutes, so a resumed
+  checkout re-reads it from the provider each time.
 
 ## Known-defect characterization tests
 
