@@ -138,7 +138,8 @@ export class RequestLog {
         else if (response.ok && typeof body?.reason === "string") outcome = body.reason;
         else outcome = response.ok ? "ok" : (STATUS_OUTCOMES[response.status] ?? `http_${response.status}`);
       }
-      const level: LogLevel = response.status >= 500 ? "warn" : "info";
+      // A browse-only refusal is the demo working as intended, not a fault.
+      const level: LogLevel = response.status >= 500 && outcome !== "browse_only" ? "warn" : "info";
       logEvent(level, "request", {
         ...this.fields,
         ...this.base(),

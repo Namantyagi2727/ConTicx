@@ -240,6 +240,25 @@ describe("[regression] checkout books once per checkout attempt under Strict Mod
     await page.unmount();
   });
 
+  it("in the browse-only demo, explains it and never loads the payment SDK or books", async () => {
+    process.env.CONTICX_MODE = "browse-only";
+    try {
+      const page = await mountCheckout(checkoutQuery("VIP", 1));
+      await waitUntil(
+        () => page.container.textContent?.includes("Booking is off in this demo") ?? false,
+        "the browse-only state"
+      );
+      expect(count("POST /api/guest-session")).toBe(1);
+      expect(count("POST /api/orders")).toBe(0);
+      expect(window.__HYPER_STUB__?.loadHyper).toBeUndefined(); // SDK never loaded
+      expect(providerCreates()).toBe(0);
+      expect(await r.keys("*")).toEqual([]);
+      await page.unmount();
+    } finally {
+      process.env.CONTICX_MODE = "full";
+    }
+  });
+
   it("does not book twice or error when unmounted while the booking is in flight", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     const page = await mountCheckout(checkoutQuery("VIP", 1));

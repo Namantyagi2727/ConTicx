@@ -14,16 +14,19 @@ import { getEvent } from "@/lib/events";
 import { formatCents } from "@/lib/format";
 import { BROWSE_ONLY_NOTE, ensureGuestSession, newBookingAttemptId } from "@/lib/guest-client";
 
-// Load Hyper once, outside the component, so it isn't recreated on every render.
-// Guarded to the browser only — loadHyper touches `document`, which
-// doesn't exist during Next's server-side prerender of this client page.
-const hyperPromise =
-  typeof window !== "undefined"
-    ? loadHyper(
-        process.env.NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY as string,
-        { env: "SANDBOX" }
-      )
-    : null;
+// Load Hyper lazily and once: only when a booking is ready to pay. A page
+// that never gets that far — the browse-only demo, a refused or failed
+// booking — therefore never loads the SDK or contacts Hyperswitch, and a
+// missing publishable key cannot crash the page at module load. Browser
+// only: loadHyper touches `document`.
+const PUBLISHABLE_KEY = process.env.NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY;
+let hyperPromise: ReturnType<typeof loadHyper> | null = null;
+function getHyper(): ReturnType<typeof loadHyper> | null {
+  if (!hyperPromise && typeof window !== "undefined" && PUBLISHABLE_KEY) {
+    hyperPromise = loadHyper(PUBLISHABLE_KEY, { env: "SANDBOX" });
+  }
+  return hyperPromise;
+}
 
 // Matches the widget's built-in dark theme to the app's own palette,
 // so the hosted card iframe doesn't drop in as a bright rectangle on
@@ -360,6 +363,7 @@ function CheckoutContent() {
   const urgent = secondsLeft !== null && secondsLeft <= 60;
   const clock = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   const subtotalCents = order.amountCents - order.feeCents;
+  const hyper = getHyper();
 
   return (
     <div>
@@ -413,17 +417,25 @@ function CheckoutContent() {
       </div>
 
       <div className="mt-6 border border-ink-line bg-ink-raised p-5">
-        <HyperElements
-          options={{ clientSecret: order.clientSecret, appearance: HYPER_APPEARANCE }}
-          hyper={hyperPromise}
-        >
-          <PaymentForm
-            total={formatCents(order.amountCents)}
-            orderId={order.orderId}
-            eventId={event.id}
-            eventName={event.name}
-          />
-        </HyperElements>
+        {hyper ? (
+          <HyperElements
+            options={{ clientSecret: order.clientSecret, appearance: HYPER_APPEARANCE }}
+            hyper={hyper}
+          >
+            <PaymentForm
+              total={formatCents(order.amountCents)}
+              orderId={order.orderId}
+              eventId={event.id}
+              eventName={event.name}
+            />
+          </HyperElements>
+        ) : (
+          <p className="font-body text-sm text-text-muted">
+            The payment widget isn&apos;t configured on this deployment
+            (missing publishable key), so this booking can&apos;t be paid
+            here. Your seats stay held until the hold runs out.
+          </p>
+        )}
       </div>
 
       {/* Reloading this page resumes this same booking; a separate booking

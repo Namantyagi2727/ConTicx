@@ -15,6 +15,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
 import { Redis } from "@upstash/redis";
 import { events } from "../lib/events";
 
@@ -119,12 +120,29 @@ async function main() {
   );
   console.log(`Available before: ${before} (tier total: ${tier.totalInventory})\n`);
 
+  // Booking needs what a browser sends (Phase 1B.4–1B.5): an established
+  // guest session cookie, the app's own Origin header, and a booking attempt
+  // id. Each request below is a separate attempt, i.e. a separate buyer
+  // decision, so they compete for inventory exactly as distinct bookings do.
+  // The server must run with CONTICX_MODE=full and APP_ORIGIN set to this
+  // base URL's origin.
+  const origin = new URL(baseUrl).origin;
+  const session = await fetch(`${baseUrl}/api/guest-session`, { method: "POST", headers: { Origin: origin } });
+  const cookie = session.headers.get("set-cookie")?.split(";")[0];
+  if (!session.ok || !cookie) {
+    console.error(
+      `Could not start a guest session (HTTP ${session.status}). Is the app running with ` +
+        `CONTICX_MODE=full and APP_ORIGIN=${origin}?`
+    );
+    process.exit(1);
+  }
+
   const statuses = await Promise.all(
     Array.from({ length: requestCount }, () =>
       fetch(`${baseUrl}/api/orders`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ eventId, tierName, quantity }),
+        headers: { "Content-Type": "application/json", Origin: origin, Cookie: cookie },
+        body: JSON.stringify({ eventId, tierName, quantity, attemptId: randomUUID() }),
       })
         .then((res) => res.status)
         .catch(() => 0) // 0 = request itself failed (e.g. dev server not running)
