@@ -4,6 +4,8 @@
 //   POST /set-status?payment_id=..&status=..   move a payment's status
 //   GET  /calls                                every request the fake received
 //   GET  /payments                             id, status, client_secret of each
+//   POST /knobs?createFailsAfterInsert=1&getReturns500=1&createResponseDelayMs=N
+//                                              set failure knobs (omitted = off)
 // Nothing here contacts a real service.
 
 import { createServer } from "node:http";
@@ -26,6 +28,16 @@ async function main() {
       if (!payment) return void res.writeHead(404).end("no such payment");
       payment.status = url.searchParams.get("status") ?? payment.status;
       return json({ payment_id: payment.payment_id, status: payment.status });
+    }
+    if (req.method === "POST" && url.pathname === "/knobs") {
+      fake.createFailsAfterInsert = url.searchParams.get("createFailsAfterInsert") === "1";
+      fake.getReturns500 = url.searchParams.get("getReturns500") === "1";
+      fake.createResponseDelayMs = Number(url.searchParams.get("createResponseDelayMs") ?? 0) || 0;
+      return json({
+        createFailsAfterInsert: fake.createFailsAfterInsert,
+        getReturns500: fake.getReturns500,
+        createResponseDelayMs: fake.createResponseDelayMs,
+      });
     }
     if (url.pathname === "/calls") return json(fake.calls.map((c) => `${c.method} ${c.path}`));
     if (url.pathname === "/payments") {
