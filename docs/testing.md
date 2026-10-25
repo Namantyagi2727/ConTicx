@@ -815,6 +815,32 @@ webhook routes refused with `browse_only`; checkout, My Tickets, and
 confirmation showed the browse-only explanation; no request reached a
 Hyperswitch domain.
 
+## Venue-time display (v0.1.1)
+
+Event dates, weekdays, doors times, and show times are formatted in the
+venue's IANA time zone, stored on each catalog event as `venueTimeZone`
+(all three venues: `America/New_York`). The helpers in `lib/format.ts` take
+the zone as a required argument, so no call site can fall back to the
+process or browser default. The event instants are unchanged, no UTC offset
+is hard-coded, and the zone's rules supply daylight saving per instant.
+v0.1.0 used the default zone, so the UTC Vercel host showed Indie Echoes
+(Sun Sep 20, 8:00 PM in Brooklyn) as "MON SEP 21", show 12:00 AM.
+
+`tests/unit/venue-time.test.ts` switches the process default zone (UTC and
+others) and checks:
+- the venue date, doors, and show time of every catalog event, including the
+  show whose instant is already the next day in UTC;
+- daylight-saving handling: the same UTC time in winter and summer, and doors
+  computed across the spring-forward and fall-back transitions;
+- that each catalog zone is a valid IANA zone whose offset at the event's
+  instant matches the offset written in its timestamp;
+- that the calendar file's `DTSTART` is still the exact UTC instant;
+- the rendered home page, event pages, and ticket under a UTC default zone.
+
+Seven of the nine tests fail against the v0.1.0 formatters. The other two
+(catalog zone consistency, calendar instant) are invariants that hold on
+both. The checkout summary shows no date or time, so it is unaffected.
+
 ## Known-defect characterization tests
 
 No characterization tests remain. The last one, `refund-authorization`

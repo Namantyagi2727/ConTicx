@@ -17,6 +17,7 @@ export interface EventRecord {
   doorsMinutesBeforeShow: number;
   venue: string;
   venueAddress: string;
+  venueTimeZone: string; // IANA zone (e.g. "America/New_York") event dates and times are shown in
   ageRestriction: string;
   genres: string[];
   supportActs: string[];

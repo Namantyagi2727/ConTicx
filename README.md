@@ -22,7 +22,7 @@ runs with booking switched off: the home and event pages work, and every
 booking, order, ticket, and webhook route refuses with `503 browse_only`
 *on the server* before touching Redis or Hyperswitch. Browsing cannot
 reserve seats, run hold expiry, or call the payment provider. It serves the
-`v0.1.0` release — see [Release and hosting status](#release-and-hosting-status).
+latest release — see [Release and hosting status](#release-and-hosting-status).
 
 **2. Full booking flow — locally, with a simulated payment provider.** The
 checkout harness runs the real app against a local Redis and an in-process
@@ -259,27 +259,30 @@ No external monitoring service or logging dependency is used.
   recovery; clearing browser data removes access. Two brand-new tabs racing
   on a first visit can end up with different guest sessions.
 - **No rate limiting** on any route.
-- **Fictional catalog.** Three hard-coded shows dated autumn 2026.
-- **Event times on server-rendered pages use the server's time zone.** The
-  home and event pages format times without an explicit zone, so on the
-  hosted demo (UTC) they read four hours later than the venue's local time,
-  and Indie Echoes (Sat Sep 20, 8 PM) is listed as Mon Sep 21. Tickets
-  render in the viewer's time zone, and the calendar file uses the exact
-  instant. Not fixed in v0.1.0.
+- **Fictional catalog.** Three hard-coded shows dated autumn 2026, all at
+  Brooklyn venues. Event dates, doors times, and show times are displayed in
+  each venue's own IANA time zone (`America/New_York`) on every page and
+  ticket, whatever the server's or the viewer's zone — a show is listed at
+  the venue's wall-clock time, without a zone label. The calendar file
+  carries the exact start instant in UTC, so calendar apps show it in the
+  viewer's zone. (v0.1.0 used the server's zone, which put times on the UTC
+  host four hours late; fixed in v0.1.1.)
 - **Not production-ready.** No load testing, no production deployment
   review, no real payments.
 
 ## Release and hosting status
 
-**v0.1.0** is tagged and published as a
-[GitHub release](https://github.com/Namantyagi2727/ConTicx/releases/tag/v0.1.0)
-(notes: [`docs/release-notes/v0.1.0.md`](docs/release-notes/v0.1.0.md)).
+Releases are tagged and published on
+[GitHub](https://github.com/Namantyagi2727/ConTicx/releases):
+**v0.1.0** (portfolio release,
+[notes](docs/release-notes/v0.1.0.md)) and **v0.1.1** (venue-time display
+fix, [notes](docs/release-notes/v0.1.1.md)).
 
 The public demo at <https://conticx.vercel.app> is a browse-only Production
-build of that tag (`df573e2`), deployed manually with the Vercel CLI on
-2026-10-25 — see
-[`docs/deploy-prerequisites.md`](docs/deploy-prerequisites.md) for its
-provenance. Automatic Vercel Git deployments stay disabled in
+build of the latest release tag, deployed manually with the Vercel CLI from
+a clean export of that tag. Each release's GitHub page records its
+deployment; [`docs/deploy-prerequisites.md`](docs/deploy-prerequisites.md)
+describes how the build is made and its provenance. Automatic Vercel Git deployments stay disabled in
 [`vercel.json`](vercel.json), so merging to `main` does not change the hosted
 demo. Standard Deployment Protection keeps every other deployment URL,
 including older builds, behind Vercel login.

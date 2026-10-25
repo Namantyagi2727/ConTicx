@@ -147,19 +147,22 @@ list confirms that nothing was deployed.
   for the public portfolio demo.
 - The home page reads the mode at request time, so its description always
   matches what the server enforces.
-- **Production now serves a browse-only build of `v0.1.0`** at
-  <https://conticx.vercel.app>: Vercel deployment
-  `dpl_314eyrUMHanKt6rCXFe6SAjmfDNr`, deployed manually on 2026-10-25 with
-  Production `CONTICX_MODE=browse-only`.
-- **Provenance.** It is a Vercel CLI deployment (source `cli`), so it carries
-  **no Git metadata**. It was built from a `git archive` export of tag
-  `v0.1.0` (commit `df573e222d1f6a268c96f0c8b609884aa2d5dd9f`) into a new,
-  empty directory. Test-only files (`tests/`, `vitest.config.ts`,
-  `docker-compose.test.yml`) and every `.env*` file were left out of the
-  upload; every remaining file was checked byte-for-byte against the tag.
-  The deployment's metadata records `sourceTag`, `sourceCommit`, and
+- **Production serves a browse-only build of the latest release tag** at
+  <https://conticx.vercel.app>, with Production `CONTICX_MODE=browse-only`.
+  Each such deployment is made manually and recorded in that version's
+  GitHub release (deployment id, tag, commit).
+- **How it is built (provenance).** These are Vercel CLI deployments
+  (source `cli`), so they carry **no Git metadata**. Each is built from a
+  `git archive` export of the release tag into a new, empty directory.
+  Test-only files (`tests/`, `vitest.config.ts`,
+  `docker-compose.test.yml`) and every `.env*` file — including the
+  `.env.local` that `vercel link` writes — are left out of the upload, and
+  every uploaded file is checked byte-for-byte against the tag. The
+  deployment's metadata records `sourceTag`, `sourceCommit`, and
   `exportManifestSha256` (the SHA-256 of the exported files' checksum
   list).
+- The first such deployment, for `v0.1.0` (commit `df573e2`), was
+  `dpl_314eyrUMHanKt6rCXFe6SAjmfDNr` on 2026-10-25.
 - The previous Production build (`5a04503`, the Phase 1A merge) predates
   every later phase. It no longer serves the public domain, and Standard
   Protection puts its deployment URL behind Vercel login. It was not
