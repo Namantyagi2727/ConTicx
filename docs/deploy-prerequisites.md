@@ -64,6 +64,29 @@ The signature check has been exercised only by the test suite, never by a
 real Hyperswitch webhook. Real delivery, signing, and `event_id` retry
 behavior against the sandbox remain unverified (addendum S1–S10).
 
+### Trusted origin and guest cookie (Phase 1B.4)
+
+- Set `APP_ORIGIN` in every deployment environment to that deployment's
+  **exact** public origin (`https://<host>`, no path or trailing slash).
+  Guest-session creation and order creation accept only requests whose
+  `Origin` header equals it. If it is unset or not a bare origin, both
+  fail closed with `503`, so checkout does not work until it is set. It is
+  never inferred from `Host` / `X-Forwarded-Host`.
+- A preview deployment has its own URL; its `APP_ORIGIN` must be that
+  URL, or checkout on it is refused.
+- With an https `APP_ORIGIN` the guest cookie is `Secure` and named
+  `__Host-conticx_guest` (host-only, `Path=/`). Over plain http (local
+  development, `APP_ORIGIN=http://localhost:3000`) it is `conticx_guest`
+  without `Secure`. Changing `APP_ORIGIN` between http and https therefore
+  changes the cookie name, and browsers' existing sessions stop matching.
+- Guest sessions and order ownership live in the same Redis database as
+  the orders. Flushing or replacing that database ends every guest's
+  access, just as it loses the orders.
+- Orders created before Phase 1B.4 have no owner and cannot be opened by
+  anyone through the app. There is no migration.
+- Refunds, the `/admin` organizer view, and the public payment-id lookup
+  are disabled in this phase.
+
 ## 3. Whether a branch push triggers a deployment
 
 On Vercel's Git integration, pushing a branch normally creates a
@@ -111,6 +134,8 @@ manually — requires **all** of:
    isolated Preview environment (its own Redis DB + sandbox payment keys).
 3. Deployment access protection (Standard Protection) confirmed — this
    gates URL access and is *in addition to*, not a substitute for, (2).
+4. `APP_ORIGIN` set to the deployment's exact https origin, and
+   `HYPERSWITCH_WEBHOOK_SECRET` set (see above).
 
 This maps to addendum prerequisite **P1** (settle the Vercel
 preview-isolation and runtime questions before any branch push) and

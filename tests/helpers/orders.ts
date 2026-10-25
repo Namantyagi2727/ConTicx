@@ -3,7 +3,7 @@
 // can override. It does NOT touch Redis — tests persist it through the real
 // store operation (reserveAndCreateOrder) or seed raw values themselves.
 
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import type { Order } from "@/lib/types";
 
 export function makeOrder(overrides: Partial<Order> = {}): Order {
@@ -20,6 +20,8 @@ export function makeOrder(overrides: Partial<Order> = {}): Order {
     status: "pending",
     holdExpiresAt: now + 10 * 60 * 1000,
     createdAt: now,
+    // Phase 1B.4: every new order carries a guest owner (a sha256 hex).
+    ownerHash: randomBytes(32).toString("hex"),
     ...overrides,
   };
 }

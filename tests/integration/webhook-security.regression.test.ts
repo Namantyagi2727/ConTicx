@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { POST as createOrderRoute } from "@/app/api/orders/route";
 import { POST as webhook } from "@/app/api/webhooks/hyperswitch/route";
 import { updateOrderStatus } from "@/lib/store";
 import type { Order } from "@/lib/types";
 import { getFake } from "../setup/integration";
 import { failRedisCommand } from "../helpers/faults";
 import { makeTestRedis } from "../helpers/redis";
+import { createOwnedOrder } from "../helpers/guest";
 import { makeWebhookRequest, signWebhookBody } from "../helpers/webhook";
 import {
   TEST_HYPERSWITCH_BASE_URL,
@@ -35,17 +35,11 @@ afterEach(() => {
   delete process.env.HYPERSWITCH_TIMEOUT_MS;
 });
 
+// Orders are created by a guest through the real order route (Phase 1B.4);
+// webhook processing itself never involves a guest cookie.
 async function createOrder(quantity = 1): Promise<{ orderId: string; paymentId: string }> {
-  const res = await createOrderRoute(
-    new Request("http://localhost/api/orders", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ eventId: EVENT_ID, tierName: TIER, quantity }),
-    })
-  );
-  if (res.status !== 200) throw new Error(`order setup failed: ${res.status}`);
-  const data = await res.json();
-  return { orderId: data.orderId, paymentId: data.paymentId };
+  const { orderId, paymentId } = await createOwnedOrder(undefined, quantity);
+  return { orderId, paymentId };
 }
 
 function bodyFor(
@@ -347,6 +341,7 @@ describe("[regression] payment-to-order binding", () => {
       status: "pending",
       holdExpiresAt: Date.now() + 10 * 60 * 1000,
       createdAt: Date.now(),
+      ownerHash: "a".repeat(64), // Phase 1B.4: every new order has an owner
     };
     expect(await reserveAndCreateOrder(order, 10)).toBe("created");
     getFake().seedPayment({

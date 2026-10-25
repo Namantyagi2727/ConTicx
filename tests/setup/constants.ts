@@ -28,3 +28,9 @@ export const TEST_HYPERSWITCH_WEBHOOK_SECRET = "whsec_test_fake_webhook_secret";
 
 // Hosts the network guard treats as local. Anything else is blocked.
 export const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+// Trusted application origin for the test run (APP_ORIGIN). Route tests
+// build requests against http://localhost, and browser-mutation routes
+// accept only this exact Origin header. Plain http, so the guest cookie is
+// not Secure here; the https variant is covered by a unit test.
+export const TEST_APP_ORIGIN = "http://localhost";

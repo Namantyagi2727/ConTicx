@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 import {
+  TEST_APP_ORIGIN,
   TEST_HYPERSWITCH_API_KEY,
   TEST_HYPERSWITCH_BASE_URL,
   TEST_HYPERSWITCH_PUBLISHABLE_KEY,
@@ -24,6 +25,7 @@ const testEnv = {
   HYPERSWITCH_API_KEY: TEST_HYPERSWITCH_API_KEY,
   NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY: TEST_HYPERSWITCH_PUBLISHABLE_KEY,
   HYPERSWITCH_WEBHOOK_SECRET: TEST_HYPERSWITCH_WEBHOOK_SECRET,
+  APP_ORIGIN: TEST_APP_ORIGIN,
 };
 
 export default defineConfig({
@@ -58,7 +60,7 @@ export default defineConfig({
         test: {
           name: "integration",
           environment: "node",
-          include: ["tests/integration/**/*.test.ts"],
+          include: ["tests/integration/**/*.test.{ts,tsx}"],
           setupFiles: ["tests/setup/integration.ts"],
           env: testEnv,
         },

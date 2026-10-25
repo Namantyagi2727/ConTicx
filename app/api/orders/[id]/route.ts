@@ -1,21 +1,20 @@
-import { NextResponse } from "next/server";
-import { getOrder } from "@/lib/store";
+import { jsonNoStore, loadOwnedOrder, orderNotFound, sessionRequired, toOrderView } from "@/lib/order-access";
 
-// Reads an order straight from the in-memory store. The confirmation
-// page uses this as its authoritative source — it reflects
-// webhook-driven status updates, not just whatever the browser saw
-// right after redirect — and polls it briefly while a payment is
-// still "pending".
+// Reads one of the current guest's orders. Ownership is checked before
+// anything is returned, using a side-effect-free read: no hold expiry, no
+// reconciliation, no provider call. A missing order and someone else's order
+// get the same 404; only allow-listed fields are returned, never cached.
+// For a status that should be refreshed from the provider, use
+// GET /api/orders/[id]/status.
+export const dynamic = "force-dynamic";
+
 export async function GET(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  const order = await getOrder(id);
-
-  if (!order) {
-    return NextResponse.json({ error: "Order not found" }, { status: 404 });
-  }
-
-  return NextResponse.json(order);
+  const lookup = await loadOwnedOrder(request, id);
+  if (lookup.kind === "no_session") return sessionRequired();
+  if (lookup.kind === "not_found") return orderNotFound();
+  return jsonNoStore(toOrderView(lookup.order));
 }
