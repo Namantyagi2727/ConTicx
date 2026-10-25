@@ -79,7 +79,9 @@ export const GUEST_ORDER_LIST_LIMIT = 50;
 // booking attempt answer "processing" instead of issuing redundant provider
 // calls. Longer than the provider request timeout (10 s) so a live worker
 // normally finishes before another may claim. The lease is only an
-// optimisation: a request that claims after it lapses retries with the SAME
-// provider payment_id, which is what makes that retry safe — not the lease.
+// optimisation against redundant calls: its lapse does NOT show that an
+// earlier request stopped. A request that claims after it lapses reuses the
+// SAME provider payment_id, relying on the provider's documented creation
+// idempotency for merchant-provided ids; no creation outcome releases seats.
 // Overridable via BOOKING_PAYMENT_LEASE_MS (read per call) for tests.
 export const BOOKING_PAYMENT_LEASE_MS = 15_000;

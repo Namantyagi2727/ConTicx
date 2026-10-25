@@ -97,7 +97,10 @@ existing payment) comes from the upstream implementation and has not been
 exercised against the sandbox. Before relying on it in a deployment,
 confirm in the sandbox that a repeated create with the same `payment_id`
 returns `HE_01` and that `GET /payments/{payment_id}` returns the
-`client_secret`. See `docs/testing.md`.
+`client_secret`; how long a `payment_id` stays reserved is also
+unverified. Payment creation never releases seats — refused or uncertain
+creations stay held and flagged until recovery exists — so expect such
+holds to accumulate in `reconcile_needed`. See `docs/testing.md`.
 
 ## 3. Whether a branch push triggers a deployment
 

@@ -3,11 +3,12 @@
 // Every order is reserved with a provider payment identity already chosen
 // and stored (order.paymentRequestId), so creating its payment — the first
 // time, after a crash, after a lost response, or from a concurrent retry —
-// always targets the SAME provider payment_id. That, and not any lock, is
-// what makes a retry safe: per the provider contract (lib/hyperswitch.ts
-// createPayment) a second create under an existing id cannot make another
-// payment; it is rejected as a duplicate, and the existing payment is then
-// retrieved by id.
+// always targets the SAME provider payment_id. Reusing the id relies on the
+// provider's documented creation idempotency for merchant-provided ids; the
+// concrete duplicate response (HE_01, existing payment not returned, so it is
+// retrieved by id) is implementation-observed and unverified against the
+// hosted sandbox. The lease below only avoids redundant calls — its lapse
+// does not show that an earlier request stopped.
 //
 // ensureOrderPayment never invents a new identity, never releases
 // inventory, and never attaches a provider payment that does not bind to the

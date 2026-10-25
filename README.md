@@ -265,9 +265,11 @@ There are no accounts. Instead each browser gets a **guest session**
   and payment). Reusing it with different tickets is refused, and a paid,
   failed, or lapsed attempt is never re-booked. The order's provider
   `payment_id` is chosen and stored before any provider call, so every
-  creation retry targets the same payment; uncertain provider outcomes
-  keep the seats and are flagged for a recovery phase that does not exist
-  yet. Details, provider sources, and limits: `docs/testing.md`.
+  creation retry reuses the same id (relying on the provider's documented
+  creation idempotency for merchant-provided ids). Payment creation never
+  releases seats: uncertain or refused outcomes keep them and are flagged
+  for a recovery phase that does not exist yet. Details, provider sources,
+  and limits: `docs/testing.md`.
 
 Browser mutations (`POST /api/guest-session`, `POST /api/orders`) are
 accepted only when the `Origin` header exactly matches `APP_ORIGIN`. A

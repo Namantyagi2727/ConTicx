@@ -612,24 +612,32 @@ responses, payment creation) arrived separately in Phase 1B.5 — see
 
 ### Provider contract (as established, with sources)
 
-Read on 2026-10-25; the hosted sandbox's deployed version is not known.
+Read on 2026-10-25. Implementation-only rows cite upstream commit
+[`4e6a36b`](https://github.com/juspay/hyperswitch/commit/4e6a36b4a62d83491b75686273e8a6c7d0cbe4d2)
+(`main` as of 2026-10-24); the hosted sandbox's deployed version is not
+known and may differ.
 
 | Claim | Status | Source |
 | --- | --- | --- |
 | `POST /payments` accepts a merchant-provided `payment_id` (30 characters in the v1 schema) that "ensures idempotency for the payment creation request". | **Documented** | [Payments – Create](https://api-reference.hyperswitch.io/v1/payments/payments--create) |
 | No `Idempotency-Key` header is documented for create. | **Documented (absence)** | same |
 | `GET /payments/{payment_id}` returns the payment including `client_secret`. | **Documented** | [Payments – Retrieve](https://api-reference.hyperswitch.io/v1/payments/payments--retrieve) |
-| A create whose `payment_id` already exists fails with HTTP 400, code `HE_01` ("The payment with the specified payment_id already exists in our records") and does **not** return the existing payment; request parameters are not compared. | **Implementation only** (upstream `main`) | [`api_error_response.rs`](https://github.com/juspay/hyperswitch/blob/main/crates/hyperswitch_domain_models/src/errors/api_error_response.rs), [`payment_create.rs`](https://github.com/juspay/hyperswitch/blob/main/crates/router/src/core/payments/operations/payment_create.rs) |
-| Concurrent creates under one id collapse to one payment: the duplicate maps from the storage layer's `DuplicateValue` (unique constraint) error; other storage errors become 500. | **Implementation only** | [`errors/utils.rs`](https://github.com/juspay/hyperswitch/blob/main/crates/router/src/core/errors/utils.rs) |
+| Error code `HE_01` is type `duplicate_request`, HTTP 400 or 422; `IR_*` are invalid-request errors (e.g. `IR_01`, 401). | **Documented** | [Error codes](https://api-reference.hyperswitch.io/essentials/error_codes) |
+| An error response means no object was created. | **Not documented** — the error-code reference lists codes, statuses, and types only. | same |
+| A create whose `payment_id` already exists gets `HE_01` ("The payment with the specified payment_id already exists in our records") and does **not** return the existing payment; request parameters are not compared. | **Implementation only** | [`api_error_response.rs` L80, L437–439](https://github.com/juspay/hyperswitch/blob/4e6a36b4a62d83491b75686273e8a6c7d0cbe4d2/crates/hyperswitch_domain_models/src/errors/api_error_response.rs#L80), [`payment_create.rs`](https://github.com/juspay/hyperswitch/blob/4e6a36b4a62d83491b75686273e8a6c7d0cbe4d2/crates/router/src/core/payments/operations/payment_create.rs) |
+| Concurrent creates under one id collapse to one payment: the duplicate maps from the storage layer's `DuplicateValue` (unique constraint) error; other storage errors become 500. | **Implementation only** | [`errors/utils.rs` L77](https://github.com/juspay/hyperswitch/blob/4e6a36b4a62d83491b75686273e8a6c7d0cbe4d2/crates/router/src/core/errors/utils.rs#L77) |
 | How long a `payment_id` stays reserved. | **Not established** — assumed permanent (payment intents persist). | — |
 
 Before this phase the wrapper sent no `payment_id` at all (the provider
 generated one). `lib/hyperswitch.ts` `createPayment` now sends ours and
 classifies the response: `created` (2xx naming our id), `duplicate`
-(400 + `HE_01`), `rejected` (any other 4xx except 408/425/429, treated as
-"no payment was created" — an assumption based on the create flow
-validating before it inserts), and `uncertain` (transport error, timeout,
-5xx, 408/425/429, or an unrecognised success).
+(400/422 + `HE_01`), `refused` (any other 4xx except 408/425/429), and
+`uncertain` (transport error, timeout, 5xx, 408/425/429, or an
+unrecognised response). **None of these is treated as evidence that no
+payment exists.** A refusal describes only the request that received it:
+an earlier or concurrent create under the same id may already have made
+the payment, or may still be in flight, and neither an HTTP status nor a
+GET-not-found rules that out.
 
 The fake provider models exactly the rows above, including the
 implementation-only duplicate behaviour. That makes the tests consistent
@@ -649,10 +657,17 @@ stored on the order by the reservation itself — before any provider call
    Found → bind (id, order id, amount, currency) and attach (field-scoped)
    → ready.
 4. Not found → **create under the same id**. Duplicate → retrieve and
-   adopt. Definitive rejection → fail the order and release its seats,
-   *only if no payment is attached* (transition guard), else resume.
-   Uncertain → keep the reservation, flag `reconcile_needed`, answer
+   adopt. Refused → keep the reservation, flag `reconcile_needed`
+   (`payment_create_rejected_<status>[_<code>]`), answer
+   `502 payment_setup_failed` with `held: true`; the attempt stays open and
+   a retry reuses the id. Uncertain → keep the reservation, flag, answer
    `202 processing`.
+
+Payment creation **never releases inventory**. Seats are released only by
+the existing authoritative reconciliation paths: a provider status bound
+to the order's attached payment (webhook, owner status refresh) or expiry
+(which retrieves, cancels at most once, and re-reads). A payment-less held
+order stays held and flagged until the recovery phase.
 
 | Failure boundary | Outcome |
 | --- | --- |
@@ -661,31 +676,53 @@ stored on the order by the reservation itself — before any provider call
 | Provider created it, local association failed | `202`; retry retrieves and attaches it. If the lease could not be released (Redis failing), retries answer `processing` until it lapses. |
 | Association succeeded, browser response lost | Retry returns the same order; the client secret is re-read from the provider. |
 | Concurrent retry during creation | `202 processing`, no provider call (lease). |
-| Stale worker resumes after another progressed | Its create is a duplicate or the same payment; its attach is a no-op; its definitive-rejection path cannot fail an order with an attached payment. |
-| Provider definitively rejects | `502 payment_setup_failed`; order failed, seats released; the attempt stays closed. |
+| Stale worker resumes after another progressed | Its create is a duplicate or the same payment; its attach is a no-op; a refusal it receives changes nothing (no release), even if the other worker has not yet written the association. |
+| Retry refused while an earlier create may still land | Kept and flagged; when the earlier create lands, a request adopts it. No release. |
+| Provider refuses (non-duplicate 4xx) | `502 payment_setup_failed`, `held: true`; reservation kept and flagged; a retry of the same attempt reuses the id. |
 
-The lease is an optimisation against redundant calls; a retry after it
-lapses is justified by the fixed provider id (documented idempotency, plus
-the implementation's duplicate rejection), not by the lease.
+What reusing the id does and does not establish:
+
+- Reusing the stored `payment_id` relies on the provider's **documented
+  creation-idempotency contract** for merchant-provided ids; the concrete
+  duplicate response (`HE_01`, no existing payment returned) is
+  implementation-observed.
+- A **lease lapsing does not establish the outcome** of an earlier request
+  — it may still be executing. The lease only avoids redundant calls.
+- **Inventory release has separate evidence requirements** (above); no
+  creation response satisfies them.
+- **Hosted duplicate behaviour and `payment_id` retention remain
+  unverified.**
 
 ### Tests
 
-`booking-idempotency.regression.test.ts` (19 cases) asserts stored orders,
+`booking-idempotency.regression.test.ts` (22 cases) asserts stored orders,
 attempt records, inventory, holds, owner indexes, payment associations,
 and the fake's recorded calls for: concurrent identical submissions; replay
 after a lost response (same hold, pricing, payment; no new create); changed
 inputs; guest isolation; deliberately separate identical bookings; a crash
 before creation; provider success then response loss (timeout); 500 after
 create; a create that never arrived; provider success then failed
-association; definitive rejection then a closed replay; a retry during an
-in-flight creation; a stale worker after lease lapse; a stale rejection
-against an attached payment; replay of a paid and of a lapsed attempt;
+association; a refusal that keeps the reservation and a retry that then
+succeeds under the same id; a retry during an in-flight creation; a stale
+worker after lease lapse; replay of a paid and of a lapsed attempt;
 wrong-type attempt records; malformed attempt/payment identities; and a
-missing or invalid attempt id. Mutations that skip the attempt replay,
-drop the attempt-key type guard, skip retrieve-before-create, release on
-an uncertain outcome, ignore the stale-rejection guard, ignore the lease,
-mint a new provider id per attempt, or create for closed orders each fail
-it. The Strict Mode suite also checks that a URL without an attempt gets
+missing or invalid attempt id. Three deterministic cases (fake create
+gates, a Redis command barrier, deferred promises — no sleeps) cover the
+pre-association window: (1) worker A's create is stored at the provider
+and its response held, A's lease is removed, worker B finds the payment
+and is held just before writing the association, then A receives a
+non-duplicate refusal — the order stays pending, seats stay held, and B
+then binds the payment with no new reservation or payment; (2) A's create
+is in flight but not yet stored, B's retry sees GET-not-found and is
+refused — nothing is released, and A's create then lands and is bound;
+(3) a stale lease holder's release leaves the current holder's lease
+intact. Before the policy fix, (1) and (2) failed (order `failed`, seats
+released); restoring the old "release unless a payment is attached"
+guard, or releasing on any refusal, fails them again, and an
+unconditional lease delete fails (3). Mutations that skip the attempt
+replay, drop the attempt-key type guard, skip retrieve-before-create,
+release on an uncertain outcome, ignore the lease, mint a new provider id
+per attempt, or create for closed orders each fail the suite as well. The Strict Mode suite also checks that a URL without an attempt gets
 exactly one minted attempt and no booking before it.
 
 Checkout harness (manual, Phase 1B.5, from a flushed test Redis): reload
