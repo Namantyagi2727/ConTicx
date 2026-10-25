@@ -24,3 +24,11 @@ export function ensureGuestSession(): Promise<boolean> {
 // is explained consistently.
 export const SAME_BROWSER_NOTE =
   "Tickets are saved in this browser only. Clearing your browser data removes access, and they can't be opened on another device yet.";
+
+// A fresh booking-attempt id (Phase 1B.5). One per deliberate "get tickets"
+// action; it travels in the checkout URL so a reload or retry of that
+// checkout reuses it. Not a secret and not a credential: the server scopes it
+// to this browser's guest session, so it grants nothing to anyone else.
+export function newBookingAttemptId(): string {
+  return crypto.randomUUID();
+}

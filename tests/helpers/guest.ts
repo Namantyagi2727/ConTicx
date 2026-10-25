@@ -5,6 +5,7 @@
 
 import { POST as guestSessionRoute } from "@/app/api/guest-session/route";
 import { POST as createOrderRoute } from "@/app/api/orders/route";
+import { randomUUID } from "node:crypto";
 import type { Order } from "@/lib/types";
 import { TEST_APP_ORIGIN } from "../setup/constants";
 import { makeTestRedis } from "./redis";
@@ -44,12 +45,15 @@ export async function newGuest(existingCookie?: string): Promise<string> {
   return cookieFromSetCookie(res.headers.get("set-cookie"));
 }
 
+// A booking request. Each call gets a fresh booking attempt unless `body`
+// supplies one, so separate calls are independent bookings (Phase 1B.5).
 export function orderRequest(
   cookie: string | null,
-  body: unknown = { eventId: "midnight-parade", tierName: "VIP", quantity: 1 },
+  body: Record<string, unknown> = { eventId: "midnight-parade", tierName: "VIP", quantity: 1 },
   origin?: string | null
 ): Request {
-  return guestRequest("/api/orders", { method: "POST", cookie, body, origin });
+  const withAttempt = "attemptId" in body ? body : { ...body, attemptId: randomUUID() };
+  return guestRequest("/api/orders", { method: "POST", cookie, body: withAttempt, origin });
 }
 
 // Creates an order through the real route as `cookie`'s guest (a fresh

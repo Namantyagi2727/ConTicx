@@ -43,3 +43,27 @@ export async function rawEquals(r: Redis, key: string, expected: string): Promis
   );
   return res === 1;
 }
+
+// Every key with its type and full raw content, sorted, as one string — so a
+// test can assert "the store is byte-for-byte unchanged". Hashes are dumped
+// field by field; other non-string/zset types are marked "?".
+export async function snapshotRedis(r: Redis): Promise<string> {
+  const dump = await r.eval(
+    `local out = {}
+     local keys = redis.call('KEYS', '*')
+     table.sort(keys)
+     for _, k in ipairs(keys) do
+       local t = redis.call('TYPE', k).ok
+       local v
+       if t == 'string' then v = redis.call('GET', k)
+       elseif t == 'zset' then v = table.concat(redis.call('ZRANGE', k, 0, -1, 'WITHSCORES'), ',')
+       elseif t == 'hash' then v = table.concat(redis.call('HGETALL', k), ',')
+       else v = '?' end
+       table.insert(out, k .. '|' .. t .. '|' .. v)
+     end
+     return out`,
+    [],
+    []
+  );
+  return (dump as string[]).join("\n");
+}

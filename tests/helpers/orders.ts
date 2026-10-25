@@ -4,6 +4,7 @@
 // store operation (reserveAndCreateOrder) or seed raw values themselves.
 
 import { randomBytes, randomUUID } from "node:crypto";
+import { newPaymentRequestId } from "@/lib/hyperswitch";
 import type { Order } from "@/lib/types";
 
 export function makeOrder(overrides: Partial<Order> = {}): Order {
@@ -22,6 +23,9 @@ export function makeOrder(overrides: Partial<Order> = {}): Order {
     createdAt: now,
     // Phase 1B.4: every new order carries a guest owner (a sha256 hex).
     ownerHash: randomBytes(32).toString("hex"),
+    // Phase 1B.5: and its booking attempt and provider payment identity.
+    attemptId: randomUUID(),
+    paymentRequestId: newPaymentRequestId(),
     ...overrides,
   };
 }

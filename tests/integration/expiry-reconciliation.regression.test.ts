@@ -602,12 +602,20 @@ describe("[regression] expiry provider-time budget", () => {
     // pass would spend a full budget (4 reads); shared, they make 2 in total.
     const res = await createOrderRoute(orderRequest(guest));
     expect(res.status).toBe(200);
-    expect(paymentReads() - reads0).toBe(2);
+    // Phase 1B.5: the booking itself also retrieves its OWN new payment id
+    // once before creating it; that read is not expiry work, so only reads of
+    // other payments count here.
+    const booked = (await r.get<Order>(`order:${(await res.json()).orderId}`))!;
+    const ownReads = getFake().calls.filter(
+      (c) => c.method === "GET" && c.path === `/payments/${booked.paymentRequestId}`
+    ).length;
+    expect(ownReads).toBe(1);
+    expect(paymentReads() - reads0 - ownReads).toBe(2);
 
     // A later window (a later request) picks up the remaining holds.
     resetExpiryBudgetWindow();
     await runExpiryPass();
-    expect(paymentReads() - reads0).toBe(4);
+    expect(paymentReads() - reads0 - ownReads).toBe(4);
     for (const id of ids) expect(await statusOf(id)).toBe("succeeded");
   });
 
