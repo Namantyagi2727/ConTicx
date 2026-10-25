@@ -257,16 +257,19 @@ There are no accounts. Instead each browser gets a **guest session**
   from this browser. Each page shares a single session request, and a
   browser that already has a valid session is never re-issued one, so
   this needs two first-ever tabs racing.
-- **One booking per checkout visit, not per purchase intent.** Checkout
-  reuses its in-flight booking across React Strict Mode's effect re-run,
-  so a single visit makes one order. Order and payment creation are not
-  idempotent on the server, though: reloading checkout, opening it in a
-  second tab, or retrying after a lost response can create another order,
-  provider payment, and inventory hold. Releasing that hold is not
-  automatic: expiry releases it only with authoritative evidence (such as
-  a confirmed cancellation) under the shared reconciliation policy, and
-  uncertain outcomes are retained and flagged for a recovery phase that
-  does not exist yet, so they can stay held.
+- **One booking per booking attempt (Phase 1B.5).** Each *Get tickets*
+  click mints a booking-attempt id that checkout keeps in its URL. The
+  server binds it, per guest and atomically with the reservation, to one
+  order: reloading checkout, retrying after a lost response, or
+  submitting concurrently returns that same order (same hold, pricing,
+  and payment). Reusing it with different tickets is refused, and a paid,
+  failed, or lapsed attempt is never re-booked. The order's provider
+  `payment_id` is chosen and stored before any provider call, so every
+  creation retry reuses the same id (relying on the provider's documented
+  creation idempotency for merchant-provided ids). Payment creation never
+  releases seats: uncertain or refused outcomes keep them and are flagged
+  for a recovery phase that does not exist yet. Details, provider sources,
+  and limits: `docs/testing.md`.
 
 Browser mutations (`POST /api/guest-session`, `POST /api/orders`) are
 accepted only when the `Origin` header exactly matches `APP_ORIGIN`. A

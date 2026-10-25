@@ -7,20 +7,25 @@ import {
   SERVICE_FEE_RATE,
 } from "@/lib/constants";
 import {
-  attachPaymentId,
-  clearPaymentAttempt,
   getRemainingInventory,
   InventoryStateError,
   listGuestOrders,
-  markPaymentAttempt,
+  peekBookingAttempt,
+  peekOrder,
   recordDemandSignal,
-  reserveAndCreateOrder,
-  updateOrderStatus,
+  reserveBookingAttempt,
 } from "@/lib/store";
-import { hyperswitchFetch } from "@/lib/hyperswitch";
+import { newPaymentRequestId } from "@/lib/hyperswitch";
+import { ensureOrderPayment } from "@/lib/booking";
 import { checkRequestOrigin } from "@/lib/app-origin";
 import { authenticateGuest, ownsOrder } from "@/lib/guest-session";
-import { jsonNoStore, originRejected, sessionRequired, toOrderView } from "@/lib/order-access";
+import {
+  isValidAttemptId,
+  jsonNoStore,
+  originRejected,
+  sessionRequired,
+  toOrderView,
+} from "@/lib/order-access";
 import type { Order } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -37,16 +42,32 @@ export async function GET(request: Request) {
   });
 }
 
-// Creates an order: atomically reserves inventory with a 10-minute hold
-// AND persists the order, then creates a matching Hyperswitch payment.
-// The charged amount is always computed here — tier price × quantity,
-// plus a flat SERVICE_FEE_RATE service fee on that subtotal — the client
-// only ever sends eventId, tierName, and quantity, never an amount.
+// Books a checkout attempt: reserves inventory with a 10-minute hold AND
+// persists the order, then makes sure the order's provider payment exists.
+// The charged amount is always computed here — tier price × quantity, plus
+// a flat SERVICE_FEE_RATE service fee on that subtotal — the client only
+// ever sends eventId, tierName, quantity, and its booking attemptId.
 //
-// Phase 1B.4: the request must come from the trusted origin and must
-// already carry a valid guest session (POST /api/guest-session). The order
-// is bound to that guest inside the atomic reservation. This route never
-// issues a session cookie itself, so a lost response cannot lose ownership.
+// The request must come from the trusted origin and already carry a valid
+// guest session (POST /api/guest-session); the order is bound to that guest
+// inside the atomic reservation, and this route never issues a cookie.
+//
+// Idempotent per booking attempt (Phase 1B.5): the same guest submitting
+// the same attemptId with the same tickets gets the SAME order back — same
+// hold expiry, pricing, and payment — however many times it retries, and
+// concurrent submissions reserve once. Response contract (all no-store):
+//   200 { code: "ready", clientSecret, ... }      booking + payment ready
+//   202 { code: "processing", retryAfterMs, ... } payment still being set
+//        up or its outcome is uncertain; retry the SAME attempt
+//   409 { code: "attempt_conflict" }              attempt reused with
+//        different tickets; nothing changed
+//   409 { code: "attempt_closed", orderStatus }   the attempt's order is
+//        paid, failed, or its hold lapsed; never re-booked
+//   502 { code: "payment_setup_failed", held: true } provider refused this
+//        create request; the hold is KEPT (a refusal does not prove no
+//        payment exists) and flagged; retrying the same attempt is allowed
+//   400/503 { code, error }                       invalid request, sold
+//        out, or inventory/service unavailable
 export async function POST(request: Request) {
   const origin = checkRequestOrigin(request);
   if (!origin.ok) return originRejected(origin);
@@ -57,160 +78,162 @@ export async function POST(request: Request) {
   const eventId = body?.eventId;
   const tierName = body?.tierName;
   const quantity = Number(body?.quantity);
+  const attemptId = body?.attemptId;
+
+  if (!isValidAttemptId(attemptId)) {
+    return jsonNoStore({ code: "invalid_request", error: "Missing or invalid booking attempt" }, 400);
+  }
 
   const event = getEvent(eventId);
   if (!event) {
-    return jsonNoStore({ error: "Unknown event" }, 400);
+    return jsonNoStore({ code: "invalid_request", error: "Unknown event" }, 400);
   }
 
   const tier = event.tiers.find((t) => t.name === tierName);
   if (!tier) {
-    return jsonNoStore({ error: "Unknown ticket tier" }, 400);
+    return jsonNoStore({ code: "invalid_request", error: "Unknown ticket tier" }, 400);
   }
 
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_QUANTITY_PER_ORDER) {
-    return jsonNoStore({ error: `Quantity must be between 1 and ${MAX_QUANTITY_PER_ORDER}` }, 400);
+    return jsonNoStore(
+      { code: "invalid_request", error: `Quantity must be between 1 and ${MAX_QUANTITY_PER_ORDER}` },
+      400
+    );
   }
 
   // Friendly pre-check for a nice error message in the common case — the
-  // atomic reserve below is what actually prevents overselling under
-  // real concurrency; this just avoids a wasted Hyperswitch call when
-  // it's obviously sold out. If inventory state can't be established
-  // safely (e.g. a lost counter), refuse rather than guess.
-  let remaining: number;
-  try {
-    remaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
-  } catch (err) {
-    if (err instanceof InventoryStateError) {
-      return jsonNoStore({ error: "Inventory temporarily unavailable" }, 503);
+  // atomic reserve below is what actually prevents overselling under real
+  // concurrency. Skipped when this attempt is already bound to an order: a
+  // retry must reach its own reservation even if the tier has since sold
+  // out (those seats are already its). If inventory state can't be
+  // established safely (e.g. a lost counter), refuse rather than guess.
+  const alreadyBound = await peekBookingAttempt(guest.ownerHash, attemptId);
+  if (!alreadyBound) {
+    let remaining: number;
+    try {
+      remaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
+    } catch (err) {
+      if (err instanceof InventoryStateError) {
+        return jsonNoStore({ code: "inventory_unavailable", error: "Inventory temporarily unavailable" }, 503);
+      }
+      throw err;
     }
-    throw err;
-  }
-  if (quantity > remaining) {
-    return jsonNoStore({ error: `Only ${remaining} ${tier.name} ticket(s) left` }, 400);
+    if (quantity > remaining) {
+      return jsonNoStore({ code: "sold_out", error: `Only ${remaining} ${tier.name} ticket(s) left` }, 400);
+    }
   }
 
   const subtotalCents = tier.priceCents * quantity;
   const feeCents = Math.round(subtotalCents * SERVICE_FEE_RATE);
-  const amountCents = subtotalCents + feeCents;
-
-  const order: Order = {
+  const now = Date.now();
+  const candidate: Order = {
     id: randomUUID(),
     eventId: event.id,
     tierName: tier.name,
     quantity,
     unitPriceCents: tier.priceCents,
     feeCents,
-    amountCents,
+    amountCents: subtotalCents + feeCents,
     currency: "USD",
     status: "pending",
-    holdExpiresAt: Date.now() + HOLD_DURATION_MS,
-    createdAt: Date.now(),
+    holdExpiresAt: now + HOLD_DURATION_MS,
+    createdAt: now,
     ownerHash: guest.ownerHash,
+    attemptId,
+    // The provider payment identity is fixed HERE, stored with the order by
+    // the atomic reservation, before any provider call.
+    paymentRequestId: newPaymentRequestId(),
   };
 
-  // Atomic reserve + persist: either the seat is reserved AND the order
-  // and its hold entry are stored, or nothing is. This closes the old
-  // gap where a crash (or lost response) between the inventory decrement
-  // and the order write would strand a seat with no recoverable order to
-  // reap. The order is persisted here, before the provider call, because
-  // its id has to exist to embed in Hyperswitch's metadata.orderId.
-  // order.id is a fresh UUID, so "exists"/"conflict" are not expected on
-  // this path; they're handled defensively. "lost" means the counter for
-  // an initialized tier is missing — refuse rather than reset to full.
-  const reservation = await reserveAndCreateOrder(order, tier.totalInventory);
-  if (reservation === "sold_out") {
-    // Lost a race with another buyer between the pre-check above and
-    // here — report the current count (guarding the re-read too).
-    let nowRemaining = 0;
-    try {
-      nowRemaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
-    } catch (err) {
-      if (!(err instanceof InventoryStateError)) throw err;
+  // Atomic reserve + persist + attempt binding: either the seats are
+  // reserved AND the order, its hold, its owner index entry, and its attempt
+  // record are stored, or nothing is. An attempt already bound to an order
+  // returns that order instead. "lost" means the counter for an initialized
+  // tier is missing — refuse rather than reset to full.
+  const reservation = await reserveBookingAttempt(candidate, tier.totalInventory);
+  let order: Order;
+  let replayed = false;
+  switch (reservation.result) {
+    case "created":
+      order = candidate;
+      // Counts toward the event page's demand signal; never blocks a booking.
+      await recordDemandSignal(event.id).catch(() => {});
+      break;
+    case "attempt_exists": {
+      const bound = reservation.boundOrderId ? await peekOrder(reservation.boundOrderId) : undefined;
+      if (!bound || !ownsOrder(bound, guest.ownerHash)) {
+        return jsonNoStore({ code: "error", error: "Could not load this booking" }, 500);
+      }
+      order = bound;
+      replayed = true;
+      break;
     }
-    return jsonNoStore({ error: `Only ${nowRemaining} ${tier.name} ticket(s) left` }, 400);
-  }
-  if (reservation === "lost") {
-    return jsonNoStore({ error: "Inventory temporarily unavailable" }, 503);
-  }
-  if (reservation !== "created") {
-    // exists / conflict / error
-    return jsonNoStore({ error: "Could not create order" }, 500);
-  }
-
-  // Fire-and-forget-ish: counts toward the event page's "N reserved
-  // recently" demand signal. Not awaited-for-correctness the way the
-  // reservation is — worst case it fails silently and the badge just
-  // under-counts; it never blocks or fails the purchase.
-  await recordDemandSignal(event.id).catch(() => {});
-
-  // Record that we are about to create a provider payment for this order,
-  // BEFORE the call; cleared once the payment id is attached. Diagnostic
-  // only: if attachment never completes, expiry notes the marker in the
-  // reconciliation reason. Expiry never treats its ABSENCE as proof that no
-  // payment exists — a payment-less expired order is always retained.
-  await markPaymentAttempt(order.id);
-
-  const response = await hyperswitchFetch("/payments", {
-    method: "POST",
-    body: JSON.stringify({
-      amount: amountCents,
-      currency: "USD",
-      confirm: false,
-      metadata: {
-        orderId: order.id,
-        eventId: event.id,
-        tierName: tier.name,
-        quantity: String(quantity),
-        unitPrice: String(tier.priceCents),
-      },
-    }),
-  });
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    // Atomic pending -> failed transition releases the reservation and
-    // removes the hold (see lib/store.ts). Safe no-op if something else
-    // already resolved the order in the meantime.
-    // The provider's error body is logged in outline only and never
-    // returned to the browser.
-    await updateOrderStatus(order.id, "failed");
-    console.warn(`[orders] payment create failed for order ${order.id}: HTTP ${response.status}`);
-    return jsonNoStore({ error: "Could not set up payment" }, 502);
+    case "attempt_conflict":
+      return jsonNoStore(
+        {
+          code: "attempt_conflict",
+          error: "This booking was started with different tickets. Start a new booking to change them.",
+        },
+        409
+      );
+    case "sold_out": {
+      // Lost a race with another buyer between the pre-check and here —
+      // report the current count (guarding the re-read too).
+      let nowRemaining = 0;
+      try {
+        nowRemaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
+      } catch (err) {
+        if (!(err instanceof InventoryStateError)) throw err;
+      }
+      return jsonNoStore({ code: "sold_out", error: `Only ${nowRemaining} ${tier.name} ticket(s) left` }, 400);
+    }
+    case "lost":
+      return jsonNoStore({ code: "inventory_unavailable", error: "Inventory temporarily unavailable" }, 503);
+    default:
+      // exists / conflict (fresh UUID: not expected) / error
+      return jsonNoStore({ code: "error", error: "Could not create order" }, 500);
   }
 
-  // Attach ONLY the payment id to the current stored order — never a
-  // whole-object rewrite. The old rewrite re-persisted the in-memory
-  // pending snapshot, which could reset a status a webhook or the
-  // payment-status poll had already advanced in the sub-second window
-  // between the create above and here, resurrecting a resolved hold.
-  const attached = await attachPaymentId(order.id, data.payment_id);
-  if (attached === "ok" || attached === "noop") {
-    // The payment id is attached, so the order is no longer in the
-    // orphan-risk window — drop the attempt marker. (Best-effort: if this
-    // fails, the marker simply expires via its TTL.)
-    await clearPaymentAttempt(order.id).catch(() => {});
-  } else {
-    // conflict/not_found/error: the order was resolved or removed out
-    // from under us in that window. The payment exists and carries
-    // metadata.orderId, so the webhook / payment-status route will
-    // reconcile by order id; log and return the payment either way. The
-    // attempt marker is deliberately LEFT set here — a payment was created
-    // but not attached, so expiry must treat this order as a possible
-    // orphan rather than release it.
-    console.warn(
-      `[orders] payment attach '${attached}' for order ${order.id} (payment ${data.payment_id})`
-    );
-  }
-
-  // The widget needs the payment's client secret; the provider payment id is
-  // deliberately not returned — the browser navigates by the order id.
-  return jsonNoStore({
-    clientSecret: data.client_secret,
+  const summary = {
     orderId: order.id,
     holdExpiresAt: order.holdExpiresAt,
     feeCents: order.feeCents,
     amountCents: order.amountCents,
-  });
+    replayed,
+  };
+
+  let outcome;
+  try {
+    outcome = await ensureOrderPayment(order);
+  } catch (err) {
+    // Infrastructure failure mid-way: the reservation stands and the attempt
+    // stays bound, so a retry of the same attempt resumes it.
+    console.error(
+      `[orders] payment setup error for order ${order.id}:`,
+      err instanceof Error ? err.message : "unknown"
+    );
+    return jsonNoStore({ code: "processing", retryAfterMs: 2000, ...summary }, 202);
+  }
+
+  switch (outcome.kind) {
+    case "ready":
+      // The widget needs the client secret; the provider payment id is not
+      // returned — the browser navigates by the order id.
+      return jsonNoStore({ code: "ready", clientSecret: outcome.clientSecret, ...summary });
+    case "processing":
+      return jsonNoStore({ code: "processing", retryAfterMs: 2000, ...summary }, 202);
+    case "closed": {
+      const lapsed = outcome.order.status === "pending";
+      return jsonNoStore(
+        { code: "attempt_closed", orderStatus: lapsed ? "expired" : outcome.order.status, ...summary },
+        409
+      );
+    }
+    case "refused":
+      console.warn(`[orders] payment creation refused for order ${order.id} (${outcome.reason})`);
+      return jsonNoStore(
+        { code: "payment_setup_failed", held: true, error: "Could not set up payment", ...summary },
+        502
+      );
+  }
 }

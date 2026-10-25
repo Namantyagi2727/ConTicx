@@ -342,6 +342,8 @@ describe("[regression] payment-to-order binding", () => {
       holdExpiresAt: Date.now() + 10 * 60 * 1000,
       createdAt: Date.now(),
       ownerHash: "a".repeat(64), // Phase 1B.4: every new order has an owner
+      attemptId: randomUUID(), // Phase 1B.5: and a booking attempt
+      paymentRequestId: "pay_" + "b".repeat(26), // and a provider payment identity
     };
     expect(await reserveAndCreateOrder(order, 10)).toBe("created");
     getFake().seedPayment({

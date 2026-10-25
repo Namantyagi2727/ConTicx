@@ -7,6 +7,7 @@ import { MAX_QUANTITY_PER_ORDER } from "@/lib/constants";
 import { formatCents } from "@/lib/format";
 import { posterColorClasses } from "@/lib/theme";
 import type { EventRecord, TierAvailability } from "@/lib/types";
+import { newBookingAttemptId } from "@/lib/guest-client";
 
 // A tier reads as low-stock once fewer than a fifth of its total
 // inventory remains — real enough to be worth flagging, not so
@@ -45,8 +46,11 @@ export function TierPicker({
     // registered instead of appearing to do nothing while the route
     // transition and the reservation call are in flight.
     setIsNavigating(true);
+    // Each click is a deliberate new booking, so it gets a new attempt id —
+    // even for the same tickets. Checkout keeps it in its URL, so reloading
+    // or retrying that checkout resumes the same booking (Phase 1B.5).
     router.push(
-      `/checkout?eventId=${event.id}&tierName=${tierName}&quantity=${quantity}`
+      `/checkout?eventId=${event.id}&tierName=${tierName}&quantity=${quantity}&attempt=${newBookingAttemptId()}`
     );
   }
 

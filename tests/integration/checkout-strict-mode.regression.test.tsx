@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { POST as guestSessionRoute } from "@/app/api/guest-session/route";
 import { POST as createOrderRoute } from "@/app/api/orders/route";
+import { randomUUID } from "node:crypto";
 import type { Order } from "@/lib/types";
 import { getFake } from "../setup/integration";
 import { TEST_APP_ORIGIN } from "../setup/constants";
@@ -28,10 +29,11 @@ vi.mock("@juspay-tech/react-hyper-js", () => import("../browser/checkout-harness
 const nav = vi.hoisted(() => ({
   params: new URLSearchParams(),
   push: (() => {}) as (href: string) => void,
+  replaced: [] as string[],
 }));
 vi.mock("next/navigation", () => ({
   useSearchParams: () => nav.params,
-  useRouter: () => ({ push: nav.push }),
+  useRouter: () => ({ push: nav.push, replace: (href: string) => nav.replaced.push(href) }),
 }));
 vi.mock("next/link", async () => {
   const { createElement } = await import("react");
@@ -134,8 +136,15 @@ async function waitUntil(cond: () => boolean | Promise<boolean>, what: string): 
 
 const widgetShown = (m: Mounted) => m.container.querySelector('[data-testid="hyper-stub-widget"]') !== null;
 
+// A checkout URL for one booking attempt (Phase 1B.5: the attempt id travels
+// in the URL, minted by the event page's Get-tickets action).
+function checkoutQuery(tier: string, quantity: number, attemptId = randomUUID()): string {
+  return `eventId=midnight-parade&tierName=${tier}&quantity=${quantity}&attempt=${attemptId}`;
+}
+
 beforeEach(() => {
   vi.resetModules();
+  nav.replaced.length = 0;
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   cookieJar = "";
   browserRequests.length = 0;
@@ -149,8 +158,22 @@ afterEach(() => {
 });
 
 describe("[regression] checkout books once per checkout attempt under Strict Mode", () => {
+  it("gives a URL without an attempt exactly one new attempt, and books nothing before it", async () => {
+    const page = await mountCheckout("eventId=midnight-parade&tierName=VIP&quantity=1");
+    await waitUntil(() => nav.replaced.length > 0, "the attempt to be written into the URL");
+
+    // Strict Mode re-ran the effect, but the minted attempt is the same one.
+    expect(new Set(nav.replaced).size).toBe(1);
+    const attempt = new URL(nav.replaced[0], "http://x").searchParams.get("attempt");
+    expect(attempt).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(count("POST /api/orders")).toBe(0);
+
+    await page.unmount();
+  });
+
   it("issues one session, one booking, one payment, and renders the widget with its result", async () => {
-    const page = await mountCheckout("eventId=midnight-parade&tierName=VIP&quantity=2");
+    const attemptId = randomUUID();
+    const page = await mountCheckout(checkoutQuery("VIP", 2, attemptId));
     await waitUntil(() => widgetShown(page), "the payment widget");
 
     // One session identity, one booking request, one provider payment.
@@ -162,6 +185,7 @@ describe("[regression] checkout books once per checkout attempt under Strict Mod
     // One order, one inventory decrement (10 VIP seats, 2 reserved).
     const orders = await storedOrders();
     expect(orders).toHaveLength(1);
+    expect(orders[0].attemptId).toBe(attemptId); // the URL's attempt was booked
     expect(await r.get(INV_KEY)).toBe(8);
     expect(await r.zcard("pending_holds")).toBe(1);
 
@@ -178,12 +202,13 @@ describe("[regression] checkout books once per checkout attempt under Strict Mod
   });
 
   it("still makes a deliberate separate booking, under the same guest", async () => {
-    const first = await mountCheckout("eventId=midnight-parade&tierName=VIP&quantity=2");
+    const first = await mountCheckout(checkoutQuery("VIP", 2));
     await waitUntil(() => widgetShown(first), "the first widget");
     await first.unmount();
 
-    // A new checkout visit (a fresh mount) is a new attempt and books again.
-    const second = await mountCheckout("eventId=midnight-parade&tierName=VIP&quantity=1");
+    // A new checkout visit with a NEW attempt (a fresh Get-tickets click)
+    // books again.
+    const second = await mountCheckout(checkoutQuery("VIP", 1));
     await waitUntil(() => widgetShown(second), "the second widget");
 
     expect(count("POST /api/orders")).toBe(2);
@@ -200,7 +225,7 @@ describe("[regression] checkout books once per checkout attempt under Strict Mod
 
   it("shows a booking error once, from a single request", async () => {
     await r.set(INV_KEY, 1); // fewer seats than requested
-    const page = await mountCheckout("eventId=midnight-parade&tierName=VIP&quantity=2");
+    const page = await mountCheckout(checkoutQuery("VIP", 2));
     await waitUntil(
       () => page.container.textContent?.includes("Couldn't reserve those tickets") ?? false,
       "the error state"
@@ -217,7 +242,7 @@ describe("[regression] checkout books once per checkout attempt under Strict Mod
 
   it("does not book twice or error when unmounted while the booking is in flight", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
-    const page = await mountCheckout("eventId=midnight-parade&tierName=VIP&quantity=1");
+    const page = await mountCheckout(checkoutQuery("VIP", 1));
     await page.unmount(); // leave before the booking resolves
 
     await waitUntil(async () => (await r.keys("order:*")).length === 1, "the in-flight booking");

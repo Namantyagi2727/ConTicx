@@ -87,6 +87,21 @@ behavior against the sandbox remain unverified (addendum S1–S10).
 - Refunds, the `/admin` organizer view, and the public payment-id lookup
   are disabled in this phase.
 
+### Booking idempotency relies on unverified provider behaviour (Phase 1B.5)
+
+Order creation sends its own Hyperswitch `payment_id` and, after an
+ambiguous result, retries under that same id and resolves a duplicate by
+retrieval. The idempotency of a merchant-provided `payment_id` is
+documented; the specific duplicate response (400 / `HE_01`, without the
+existing payment) comes from the upstream implementation and has not been
+exercised against the sandbox. Before relying on it in a deployment,
+confirm in the sandbox that a repeated create with the same `payment_id`
+returns `HE_01` and that `GET /payments/{payment_id}` returns the
+`client_secret`; how long a `payment_id` stays reserved is also
+unverified. Payment creation never releases seats — refused or uncertain
+creations stay held and flagged until recovery exists — so expect such
+holds to accumulate in `reconcile_needed`. See `docs/testing.md`.
+
 ## 3. Whether a branch push triggers a deployment
 
 On Vercel's Git integration, pushing a branch normally creates a

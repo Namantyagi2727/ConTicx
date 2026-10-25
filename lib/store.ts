@@ -28,6 +28,7 @@
 // to check first and write last. See reserveAndCreateOrder /
 // transitionOrder / attachPaymentId below.
 
+import { randomUUID } from "node:crypto";
 import { redis } from "./redis";
 import {
   hyperswitchFetch,
@@ -97,6 +98,23 @@ function guestOrdersKey(ownerHash: string) {
   return `guest_orders:${ownerHash}`;
 }
 
+// Per-guest booking-attempt record (Phase 1B.5): binds one attempt id to one
+// order and its canonical request. Written only inside
+// RESERVE_AND_CREATE_SCRIPT and never expires — an attempt must not lapse
+// while its order (and any unresolved payment) still exists, or a retry
+// could be recreated as a fresh booking. Scoped by owner hash, so another
+// guest presenting the same attempt id addresses a different record.
+function bookingAttemptKey(ownerHash: string, attemptId: string) {
+  return `booking_attempt:${ownerHash}:${attemptId}`;
+}
+
+// Payment-creation lease for one order (Phase 1B.5). See
+// BOOKING_PAYMENT_LEASE_MS: an optimisation against redundant provider
+// calls, never the justification for retrying one.
+function paymentLeaseKey(orderId: string) {
+  return `payment_create_lease:${orderId}`;
+}
+
 // Per-order marker that a provider payment was ATTEMPTED (set just before
 // the create call, cleared once its id is attached). Read only when an
 // expired hold has no attached payment id.
@@ -122,14 +140,26 @@ function paymentAttemptKey(id: string) {
 // is never attached afterwards, and a replay under a different owner — or
 // against a legacy order that has no owner — is a CONFLICT with no write.
 //
+// Phase 1B.5: the order MUST also carry its booking attempt (attemptId, a
+// UUID) and its provider payment identity (paymentRequestId, "pay_" + 26
+// lowercase alphanumerics = 30 chars). The attempt record (KEYS[6],
+// booking_attempt:<ownerHash>:<attemptId>) is written in the same step and
+// never expires. When the attempt is already bound to another order, the
+// script returns that order instead of booking again: ATTEMPT_EXISTS if the
+// canonical request (event, tier, quantity) matches, ATTEMPT_CONFLICT if
+// not — either way with no write. Pricing, timestamps, hold expiry, and the
+// payment identity therefore always come from the ORIGINAL order.
+//
 // Returns: {'OK', remaining} | {'SOLD_OUT', remaining} | {'EXISTS', status}
-//        | {'CONFLICT', status} | {'LOST'} | {'ERR', reason}
+//        | {'CONFLICT', status} | {'ATTEMPT_EXISTS', orderId}
+//        | {'ATTEMPT_CONFLICT', orderId} | {'LOST'} | {'ERR', reason}
 const RESERVE_AND_CREATE_SCRIPT = `
 local invKey = KEYS[1]
 local orderKey = KEYS[2]
 local holdsKey = KEYS[3]
 local initKey = KEYS[4]
 local ownerIndexKey = KEYS[5]
+local attemptKey = KEYS[6]
 local orderJson = ARGV[1]
 local total = tonumber(ARGV[2])
 local maxInv = tonumber(ARGV[3])
@@ -162,6 +192,18 @@ if type(owner) ~= 'string' or #owner ~= 64 or not string.match(owner, '^[0-9a-f]
 end
 if ownerIndexKey ~= 'guest_orders:' .. owner then return {'ERR', 'bad_owner_index'} end
 if not createdAt then return {'ERR', 'bad_created_at'} end
+-- Booking attempt: a lowercase UUID, and the attempt key must be this
+-- owner's record for it (attempts are scoped per guest).
+local attemptId = incoming['attemptId']
+if type(attemptId) ~= 'string' or #attemptId ~= 36 or not string.match(attemptId, '^[0-9a-f-]+$') then
+  return {'ERR', 'bad_attempt'}
+end
+if attemptKey ~= 'booking_attempt:' .. owner .. ':' .. attemptId then return {'ERR', 'bad_attempt_key'} end
+-- Provider payment identity, fixed before any provider call.
+local payReq = incoming['paymentRequestId']
+if type(payReq) ~= 'string' or #payReq ~= 30 or not string.match(payReq, '^pay_[a-z0-9]+$') then
+  return {'ERR', 'bad_payment_request_id'}
+end
 -- Quantity must be a POSITIVE INTEGER within the safe bound: a value Lua
 -- could parse numerically (e.g. 1.5) is not enough — DECRBY needs a whole
 -- number and the result must stay in range.
@@ -179,6 +221,8 @@ local holdsType = redis.call('TYPE', holdsKey).ok
 if holdsType ~= 'zset' and holdsType ~= 'none' then return {'ERR', 'holds_type'} end
 local ownerIndexType = redis.call('TYPE', ownerIndexKey).ok
 if ownerIndexType ~= 'zset' and ownerIndexType ~= 'none' then return {'ERR', 'owner_index_type'} end
+local attemptType = redis.call('TYPE', attemptKey).ok
+if attemptType ~= 'string' and attemptType ~= 'none' then return {'ERR', 'attempt_type'} end
 
 -- Replay / order-id collision guard. Never overwrite an existing order,
 -- reset its status, recreate its hold, or decrement again. A matching
@@ -214,6 +258,22 @@ if existingRaw then
     return {'EXISTS', tostring(existing['status'])}
   end
   return {'CONFLICT', tostring(existing['status'])}
+end
+
+-- Booking-attempt replay. The attempt is already bound to an order (under a
+-- different order id, or the order-id check above would have answered):
+-- return that order, never book again. Only the canonical client request
+-- is compared; the bound order keeps its original server-side pricing.
+if attemptType == 'string' then
+  local okA, attempt = pcall(cjson.decode, redis.call('GET', attemptKey))
+  if not okA or type(attempt) ~= 'table' or type(attempt['orderId']) ~= 'string' then
+    return {'ERR', 'bad_attempt_json'}
+  end
+  if attempt['eventId'] == eventId and attempt['tierName'] == tierName
+      and tonumber(attempt['quantity']) == qty then
+    return {'ATTEMPT_EXISTS', attempt['orderId']}
+  end
+  return {'ATTEMPT_CONFLICT', attempt['orderId']}
 end
 
 -- Availability WITHOUT mutation, distinguishing a genuinely new tier from
@@ -258,6 +318,9 @@ local after = redis.call('DECRBY', invKey, qty)
 redis.call('SET', orderKey, orderJson)
 redis.call('ZADD', holdsKey, holdExpiresAt, orderId)
 redis.call('ZADD', ownerIndexKey, createdAt, orderId)
+redis.call('SET', attemptKey, cjson.encode({
+  orderId = orderId, eventId = eventId, tierName = tierName, quantity = qty, createdAt = createdAt
+}))
 return {'OK', after}
 `;
 
@@ -270,7 +333,7 @@ return {'OK', after}
 // inventory effect twice.
 //
 // Returns: {'OK', prevStatus} | {'NOOP', curStatus} | {'CONFLICT', curStatus}
-//        | {'NOT_FOUND'} | {'ERR', reason}
+//        | {'HAS_PAYMENT'} | {'NOT_FOUND'} | {'ERR', reason}
 const TRANSITION_SCRIPT = `
 local orderKey = KEYS[1]
 local invKey = KEYS[2]
@@ -280,6 +343,11 @@ local expectedFrom = ARGV[2]
 local toStatus = ARGV[3]
 local release = ARGV[4] == '1'
 local maxInv = tonumber(ARGV[5])
+-- Phase 1B.5: when set, refuse to transition an order that already has a
+-- confirmed payment attached (HAS_PAYMENT) — a stale request that saw a
+-- definitive provider rejection must not fail an order whose payment
+-- another request has since confirmed.
+local requireNoPaymentId = ARGV[6] == '1'
 
 if not maxInv or maxInv < 1 then return {'ERR', 'bad_max'} end
 
@@ -291,6 +359,10 @@ if not ok or type(order) ~= 'table' then return {'ERR', 'bad_order_json'} end
 local cur = order['status']
 if cur == toStatus then return {'NOOP', tostring(cur)} end
 if cur ~= expectedFrom then return {'CONFLICT', tostring(cur)} end
+if requireNoPaymentId then
+  local pid = order['paymentId']
+  if pid ~= nil and pid ~= cjson.null and pid ~= '' then return {'HAS_PAYMENT'} end
+end
 
 -- Validate every key we will write BEFORE mutating. We always ZREM the
 -- hold, so the hold index must be a zset (or absent). For a releasing
@@ -486,9 +558,17 @@ export type ReserveResult =
   | "sold_out"
   | "exists"
   | "conflict"
+  | "attempt_exists"
+  | "attempt_conflict"
   | "lost"
   | "error";
-export type TransitionResult = "applied" | "noop" | "conflict" | "not_found" | "error";
+export type TransitionResult =
+  | "applied"
+  | "noop"
+  | "conflict"
+  | "has_payment"
+  | "not_found"
+  | "error";
 export type AttachResult = "ok" | "noop" | "conflict" | "not_found" | "error";
 
 async function evalScript(script: string, keys: string[], args: string[]): Promise<unknown[]> {
@@ -786,12 +866,29 @@ export async function getRemainingInventory(
 // This is internal-operation replay safety, NOT client checkout
 // idempotency (a fresh HTTP checkout still mints a new order id).
 //
-// The order must carry its guest owner (order.ownerHash). Without one the
-// script refuses ("error"); a replay by a different owner is "conflict".
+// The order must carry its guest owner (order.ownerHash), its booking
+// attempt (attemptId), and its provider payment identity (paymentRequestId).
+// Without them the script refuses ("error"); a replay by a different owner
+// is "conflict"; an attempt already bound to another order is
+// "attempt_exists" / "attempt_conflict" (see reserveBookingAttempt for the
+// bound order's id).
 export async function reserveAndCreateOrder(
   order: Order,
   totalInventory: number
 ): Promise<ReserveResult> {
+  return (await reserveBookingAttempt(order, totalInventory)).result;
+}
+
+export interface ReserveOutcome {
+  result: ReserveResult;
+  // For attempt_exists / attempt_conflict: the order the attempt is bound to.
+  boundOrderId?: string;
+}
+
+export async function reserveBookingAttempt(
+  order: Order,
+  totalInventory: number
+): Promise<ReserveOutcome> {
   await reapExpiredHolds();
   const result = await evalScript(
     RESERVE_AND_CREATE_SCRIPT,
@@ -801,16 +898,31 @@ export async function reserveAndCreateOrder(
       PENDING_HOLDS_KEY,
       inventoryInitKey(order.eventId, order.tierName),
       guestOrdersKey(order.ownerHash ?? ""),
+      bookingAttemptKey(order.ownerHash ?? "", order.attemptId ?? ""),
     ],
     [JSON.stringify(order), String(totalInventory), String(MAX_INVENTORY)]
   );
   const code = resultCode(result);
-  if (code === "OK") return "created";
-  if (code === "SOLD_OUT") return "sold_out";
-  if (code === "EXISTS") return "exists";
-  if (code === "CONFLICT") return "conflict";
-  if (code === "LOST") return "lost";
-  return "error";
+  if (code === "OK") return { result: "created" };
+  if (code === "SOLD_OUT") return { result: "sold_out" };
+  if (code === "EXISTS") return { result: "exists" };
+  if (code === "CONFLICT") return { result: "conflict" };
+  if (code === "ATTEMPT_EXISTS") return { result: "attempt_exists", boundOrderId: String(result[1]) };
+  if (code === "ATTEMPT_CONFLICT") {
+    return { result: "attempt_conflict", boundOrderId: String(result[1]) };
+  }
+  if (code === "LOST") return { result: "lost" };
+  return { result: "error" };
+}
+
+// The order an owner's booking attempt is bound to, if any. A plain read for
+// the order route's pre-check; the reserve script re-checks atomically.
+export async function peekBookingAttempt(
+  ownerHash: string,
+  attemptId: string
+): Promise<string | null> {
+  const record = await redis.get<{ orderId?: unknown }>(bookingAttemptKey(ownerHash, attemptId));
+  return record && typeof record.orderId === "string" ? record.orderId : null;
 }
 
 // Guarded compare-and-set status transition with its inventory effect.
@@ -820,7 +932,8 @@ export async function transitionOrder(
   id: string,
   from: OrderStatus,
   to: OrderStatus,
-  releasesInventory: boolean
+  releasesInventory: boolean,
+  options: { requireNoPaymentId?: boolean } = {}
 ): Promise<TransitionResult> {
   // Read once to derive the inventory key (eventId/tierName never change
   // for an order). The transition's correctness does not depend on this
@@ -832,12 +945,20 @@ export async function transitionOrder(
   const result = await evalScript(
     TRANSITION_SCRIPT,
     [orderKey(id), inventoryKey(order.eventId, order.tierName), PENDING_HOLDS_KEY],
-    [id, from, to, releasesInventory ? "1" : "0", String(MAX_INVENTORY)]
+    [
+      id,
+      from,
+      to,
+      releasesInventory ? "1" : "0",
+      String(MAX_INVENTORY),
+      options.requireNoPaymentId ? "1" : "0",
+    ]
   );
   const code = resultCode(result);
   if (code === "OK") return "applied";
   if (code === "NOOP") return "noop";
   if (code === "CONFLICT") return "conflict";
+  if (code === "HAS_PAYMENT") return "has_payment";
   if (code === "NOT_FOUND") return "not_found";
   return "error";
 }
@@ -1007,6 +1128,24 @@ export async function markPaymentAttempt(orderId: string): Promise<void> {
 
 export async function clearPaymentAttempt(orderId: string): Promise<void> {
   await redis.del(paymentAttemptKey(orderId));
+}
+
+// Claims the payment-creation lease for an order; returns a token to release
+// it with, or null when another request holds it.
+export async function claimPaymentLease(orderId: string, ttlMs: number): Promise<string | null> {
+  const token = randomUUID();
+  const ok = await redis.set(paymentLeaseKey(orderId), token, { nx: true, px: ttlMs });
+  return ok === "OK" ? token : null;
+}
+
+// Releases the lease only if this token still holds it (a lapsed lease
+// re-claimed by another request is left alone).
+export async function releasePaymentLease(orderId: string, token: string): Promise<void> {
+  await redis.eval(
+    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0",
+    [paymentLeaseKey(orderId)],
+    [token]
+  );
 }
 
 async function hasPaymentAttempt(orderId: string): Promise<boolean> {

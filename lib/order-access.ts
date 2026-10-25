@@ -20,6 +20,12 @@ export function isValidOrderId(id: unknown): id is string {
   return typeof id === "string" && ORDER_ID_RE.test(id);
 }
 
+// Booking-attempt ids (Phase 1B.5) are also client-generated UUID v4 values.
+// They are scoped to the guest server-side and grant no access by themselves.
+export function isValidAttemptId(id: unknown): id is string {
+  return typeof id === "string" && ORDER_ID_RE.test(id);
+}
+
 // Guest-specific responses must never be stored by a browser or shared cache.
 export const NO_STORE_HEADERS = { "Cache-Control": "no-store" } as const;
 

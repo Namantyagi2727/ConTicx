@@ -73,3 +73,15 @@ export const GUEST_SESSION_TTL_SECONDS = 90 * 24 * 60 * 60;
 // returns (newest first). Far above normal use; it only bounds the work one
 // listing request can trigger.
 export const GUEST_ORDER_LIST_LIMIT = 50;
+
+// Payment-creation lease (Phase 1B.5). While one request is creating or
+// resolving an order's provider payment, concurrent requests for the same
+// booking attempt answer "processing" instead of issuing redundant provider
+// calls. Longer than the provider request timeout (10 s) so a live worker
+// normally finishes before another may claim. The lease is only an
+// optimisation against redundant calls: its lapse does NOT show that an
+// earlier request stopped. A request that claims after it lapses reuses the
+// SAME provider payment_id, relying on the provider's documented creation
+// idempotency for merchant-provided ids; no creation outcome releases seats.
+// Overridable via BOOKING_PAYMENT_LEASE_MS (read per call) for tests.
+export const BOOKING_PAYMENT_LEASE_MS = 15_000;

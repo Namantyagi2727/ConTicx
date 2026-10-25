@@ -12,7 +12,7 @@ import {
 } from "@juspay-tech/react-hyper-js";
 import { getEvent } from "@/lib/events";
 import { formatCents } from "@/lib/format";
-import { ensureGuestSession } from "@/lib/guest-client";
+import { ensureGuestSession, newBookingAttemptId } from "@/lib/guest-client";
 
 // Load Hyper once, outside the component, so it isn't recreated on every render.
 // Guarded to the browser only — loadHyper touches `document`, which
@@ -47,76 +47,159 @@ interface OrderCreateResponse {
   amountCents: number;
 }
 
+// What one checkout attempt resolved to (see POST /api/orders).
+type BookingResult =
+  | { kind: "ready"; order: OrderCreateResponse }
+  | { kind: "pending"; orderId?: string; holdExpiresAt?: number; refused?: boolean }
+  | { kind: "conflict"; message: string }
+  | { kind: "closed"; orderId: string; orderStatus: string }
+  | { kind: "error"; message: string };
+
+const ATTEMPT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const BOOKING_RETRY_MS = 2000;
+const MAX_BOOKING_TRIES = 6;
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // Establishes the guest session FIRST, so the booking request already carries
-// the cookie that will own the order (see /api/guest-session), then creates
-// the inventory hold + Hyperswitch payment.
+// the cookie that will own the order (see /api/guest-session), then books
+// this checkout attempt. Every request — including retries after a lost or
+// garbled response and while payment setup is still "processing" — sends
+// the SAME attemptId, so the server returns the same order and hold rather
+// than booking again. It never mints a new attempt on an uncertain outcome.
 async function createBooking(
+  attemptId: string,
   eventId: string,
   tierName: string,
   quantity: number
-): Promise<OrderCreateResponse> {
+): Promise<BookingResult> {
   const sessionOk = await ensureGuestSession();
   if (!sessionOk) {
-    throw new Error(
-      "We couldn't start a secure session in this browser — check that cookies are allowed"
-    );
+    return {
+      kind: "error",
+      message: "We couldn't start a secure session in this browser — check that cookies are allowed",
+    };
   }
-  const res = await fetch("/api/orders", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ eventId, tierName, quantity }),
-  });
-  const data = await res.json();
-  if (res.status === 401) {
-    throw new Error(
-      "Your browser session wasn't available — check that cookies are allowed, then try again"
-    );
+
+  let pending: { orderId?: string; holdExpiresAt?: number } = {};
+  for (let attempt = 0; attempt < MAX_BOOKING_TRIES; attempt++) {
+    let res: Response;
+    let data: Record<string, unknown>;
+    try {
+      res = await fetch("/api/orders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ eventId, tierName, quantity, attemptId }),
+      });
+      data = await res.json();
+    } catch {
+      // The request may or may not have reached us: retry the same attempt.
+      await sleep(BOOKING_RETRY_MS);
+      continue;
+    }
+
+    if (res.status === 401) {
+      return {
+        kind: "error",
+        message: "Your browser session wasn't available — check that cookies are allowed, then try again",
+      };
+    }
+    switch (data.code) {
+      case "ready":
+        return { kind: "ready", order: data as unknown as OrderCreateResponse };
+      case "processing":
+        pending = {
+          orderId: data.orderId as string | undefined,
+          holdExpiresAt: data.holdExpiresAt as number | undefined,
+        };
+        await sleep(typeof data.retryAfterMs === "number" ? data.retryAfterMs : BOOKING_RETRY_MS);
+        continue;
+      case "attempt_conflict":
+        return { kind: "conflict", message: String(data.error ?? "This booking can't be changed") };
+      case "attempt_closed":
+        return { kind: "closed", orderId: String(data.orderId), orderStatus: String(data.orderStatus) };
+      case "payment_setup_failed":
+        // The provider refused this attempt's payment setup, but the seats
+        // stay held for it (a refusal does not prove no payment exists). Do
+        // not loop; let the shopper retry this same booking deliberately.
+        return {
+          kind: "pending",
+          refused: true,
+          orderId: data.orderId as string | undefined,
+          holdExpiresAt: data.holdExpiresAt as number | undefined,
+        };
+    }
+    if (res.status === 503) {
+      await sleep(BOOKING_RETRY_MS);
+      continue;
+    }
+    return { kind: "error", message: String(data.error ?? "Could not reserve tickets") };
   }
-  if (!res.ok) throw new Error(data.error ?? "Could not reserve tickets");
-  return data;
+  return { kind: "pending", ...pending };
+}
+
+function checkoutHref(eventId: string, tierName: string, quantity: number, attemptId: string) {
+  const params = new URLSearchParams({ eventId, tierName, quantity: String(quantity), attempt: attemptId });
+  return `/checkout?${params.toString()}`;
 }
 
 function CheckoutContent() {
   const searchParams = useSearchParams();
+  const router = useRouter();
   const eventId = searchParams.get("eventId");
   const tierName = searchParams.get("tierName");
   const quantity = Number(searchParams.get("quantity"));
+  const attemptParam = searchParams.get("attempt");
+  const attemptId = attemptParam && ATTEMPT_RE.test(attemptParam) ? attemptParam : null;
 
   const event = eventId ? getEvent(eventId) : undefined;
   const tier = event?.tiers.find((t) => t.name === tierName);
 
-  const [order, setOrder] = useState<OrderCreateResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<BookingResult | null>(null);
+  const [retryNonce, setRetryNonce] = useState(0);
   const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
+  const order = result?.kind === "ready" ? result.order : null;
 
-  // One booking per checkout attempt (this mounted page, for these exact
-  // event/tier/quantity values). React Strict Mode runs the effect below
-  // setup → cleanup → setup on the SAME component instance, and refs survive
-  // that cycle, so the second setup finds the first setup's in-flight booking
-  // here and subscribes to it instead of POSTing again. A new checkout visit
-  // mounts a new instance (empty ref) and books anew; different parameters
-  // change the key and book anew.
-  const bookingRef = useRef<{ key: string; promise: Promise<OrderCreateResponse> } | null>(null);
-
-  // Create the inventory hold + Hyperswitch payment as soon as we land here.
+  // A checkout URL without a booking attempt (an old link, or typed by hand)
+  // gets ONE new attempt, written into the URL so a reload resumes it. The
+  // ref keeps that id stable across Strict Mode's effect re-run.
+  const generatedAttemptRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!event || !tier || !quantity) return;
+    if (attemptId || !event || !tier || !Number.isInteger(quantity) || quantity < 1) return;
+    generatedAttemptRef.current ??= newBookingAttemptId();
+    router.replace(checkoutHref(event.id, tier.name, quantity, generatedAttemptRef.current));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attemptId, eventId, tierName, quantity]);
 
-    const key = `${event.id}|${tier.name}|${quantity}`;
+  // One in-flight booking per checkout attempt. React Strict Mode runs the
+  // effect below setup → cleanup → setup on the SAME component instance, and
+  // refs survive that cycle, so the second setup finds the first setup's
+  // in-flight booking here and subscribes to it instead of POSTing again.
+  // The server is idempotent per attempt as well (Phase 1B.5), so even a
+  // reload or a second request for this attempt resumes the same order.
+  const bookingRef = useRef<{ key: string; promise: Promise<BookingResult> } | null>(null);
+
+  // Book (or resume) this attempt as soon as we land here.
+  useEffect(() => {
+    if (!event || !tier || !quantity || !attemptId) return;
+
+    const key = `${attemptId}|${event.id}|${tier.name}|${quantity}|${retryNonce}`;
     if (bookingRef.current?.key !== key) {
-      bookingRef.current = { key, promise: createBooking(event.id, tier.name, quantity) };
+      bookingRef.current = { key, promise: createBooking(attemptId, event.id, tier.name, quantity) };
     }
 
     // Cleanup only silences THIS setup's subscription; it never discards the
     // booking itself, so the setup that survives Strict Mode's remount still
-    // receives the result (or the error). After a real unmount nothing is set.
+    // receives the result. After a real unmount nothing is set.
     let active = true;
     bookingRef.current.promise.then(
-      (data) => {
-        if (active) setOrder(data);
+      (outcome) => {
+        if (active) setResult(outcome);
       },
-      (err: unknown) => {
-        if (active) setError(err instanceof Error ? err.message : "Could not reserve tickets");
+      () => {
+        if (active) setResult({ kind: "error", message: "Could not reserve tickets" });
       }
     );
     return () => {
@@ -125,19 +208,32 @@ function CheckoutContent() {
     // event/tier are derived from the same query params on every render,
     // so keying off the primitives avoids re-firing on object identity changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [eventId, tierName, quantity]);
+  }, [eventId, tierName, quantity, attemptId, retryNonce]);
 
-  // Live countdown to the hold expiring.
+  // A paid attempt goes straight to its ticket.
   useEffect(() => {
-    if (!order) return;
-    const tick = () =>
-      setSecondsLeft(
-        Math.max(0, Math.round((order.holdExpiresAt - Date.now()) / 1000))
-      );
+    if (result?.kind !== "closed") return;
+    if (result.orderStatus === "succeeded" || result.orderStatus === "refunded") {
+      router.replace(`/confirmation/${encodeURIComponent(result.orderId)}`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [result]);
+
+  // Live countdown to the hold expiring — always the ORIGINAL hold from the
+  // server, so resuming a booking never resets the window.
+  const holdExpiresAt =
+    result?.kind === "ready"
+      ? result.order.holdExpiresAt
+      : result?.kind === "pending"
+        ? result.holdExpiresAt
+        : undefined;
+  useEffect(() => {
+    if (!holdExpiresAt) return;
+    const tick = () => setSecondsLeft(Math.max(0, Math.round((holdExpiresAt - Date.now()) / 1000)));
     tick();
     const interval = setInterval(tick, 1000);
     return () => clearInterval(interval);
-  }, [order]);
+  }, [holdExpiresAt]);
 
   if (!event || !tier || !Number.isInteger(quantity) || quantity < 1) {
     return (
@@ -151,16 +247,70 @@ function CheckoutContent() {
     );
   }
 
-  if (error) {
+  const newBookingLink = (
+    <Link href={`/events/${event.id}`} className="mt-4 block underline underline-offset-4">
+      Start a new booking for {event.name}
+    </Link>
+  );
+
+  if (result?.kind === "error") {
     return (
       <StatusCard title="Couldn't reserve those tickets" tone="flame">
-        {error}. Nothing was charged.
-        <Link
-          href={`/events/${event.id}`}
-          className="mt-4 block underline underline-offset-4"
+        {result.message}. Nothing was charged.
+        {newBookingLink}
+      </StatusCard>
+    );
+  }
+
+  if (result?.kind === "conflict") {
+    return (
+      <StatusCard title="This booking can't be changed" tone="flame">
+        {result.message}
+        {newBookingLink}
+      </StatusCard>
+    );
+  }
+
+  if (result?.kind === "closed") {
+    if (result.orderStatus === "succeeded" || result.orderStatus === "refunded") {
+      return (
+        <StatusCard title="You already paid for this booking" tone="muted" showSpinner>
+          Opening your ticket…
+        </StatusCard>
+      );
+    }
+    return (
+      <StatusCard title="This booking has ended" tone="flame">
+        {result.orderStatus === "expired"
+          ? "Its hold ran out before payment finished."
+          : "Its payment didn't go through."}{" "}
+        These tickets aren&apos;t reserved for you any more.
+        {newBookingLink}
+      </StatusCard>
+    );
+  }
+
+  if (result?.kind === "pending") {
+    return (
+      <StatusCard
+        title={result.refused ? "We couldn't set up payment yet" : "Still setting up your payment"}
+        tone="muted"
+      >
+        Your tickets stay reserved for this booking
+        {secondsLeft !== null ? ` (${Math.floor(secondsLeft / 60)}:${String(secondsLeft % 60).padStart(2, "0")} left)` : ""}
+        . We haven&apos;t charged anything. Try again to pick up this same
+        booking — trying again never books twice.
+        <button
+          type="button"
+          onClick={() => {
+            setResult(null);
+            setRetryNonce((n) => n + 1);
+          }}
+          className="mt-4 block bg-flame px-4 py-2 font-display text-sm font-bold tracking-wide text-ink"
         >
-          Back to {event.name}
-        </Link>
+          TRY AGAIN
+        </button>
+        {newBookingLink}
       </StatusCard>
     );
   }
@@ -260,6 +410,15 @@ function CheckoutContent() {
           />
         </HyperElements>
       </div>
+
+      {/* Reloading this page resumes this same booking; a separate booking
+          is a deliberate, different action. */}
+      <p className="mt-4 text-center font-body text-xs text-text-faint">
+        Reloading keeps this booking and its hold.{" "}
+        <Link href={`/events/${event.id}`} className="text-text underline underline-offset-2">
+          Start a separate booking
+        </Link>
+      </p>
     </div>
   );
 }

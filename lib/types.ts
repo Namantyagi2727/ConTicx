@@ -48,6 +48,14 @@ export interface Order {
   // bound atomically at reservation (Phase 1B.4). Absent on legacy orders,
   // which are therefore not accessible to any guest. Never sent to a client.
   ownerHash?: string;
+  // The booking attempt this order was created for (Phase 1B.5): a
+  // client-generated UUID, scoped to the owner, never an access credential.
+  attemptId?: string;
+  // The provider payment_id this order's payment is (or will be) created
+  // under, chosen by us and stored at reservation — BEFORE any provider call
+  // — so every creation retry uses the same identity. paymentId is set only
+  // once the provider has confirmed a payment under this id.
+  paymentRequestId?: string;
 }
 
 // The only order fields a guest-facing response carries. Deliberately
