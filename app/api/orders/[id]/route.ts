@@ -1,4 +1,5 @@
 import { jsonNoStore, loadOwnedOrder, orderNotFound, sessionRequired, toOrderView } from "@/lib/order-access";
+import { bookingEnabled, browseOnlyResponse } from "@/lib/app-mode";
 
 // Reads one of the current guest's orders. Ownership is checked before
 // anything is returned, using a side-effect-free read: no hold expiry, no
@@ -12,6 +13,7 @@ export async function GET(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  if (!bookingEnabled()) return browseOnlyResponse();
   const { id } = await params;
   const lookup = await loadOwnedOrder(request, id);
   if (lookup.kind === "no_session") return sessionRequired();

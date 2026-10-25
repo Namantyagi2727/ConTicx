@@ -11,6 +11,8 @@ const nextConfig: NextConfig = {
   // localhost, so a check can start from a fresh browser); the dev server only
   // serves its own dev assets to listed hosts.
   allowedDevOrigins: ["127.0.0.1"],
+  // Keep the dev-mode indicator out of harness screenshots.
+  devIndicators: false,
   turbopack: {
     resolveAlias: {
       "@juspay-tech/hyper-js": "./tests/browser/checkout-harness/hyper-js.ts",

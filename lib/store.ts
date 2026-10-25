@@ -30,6 +30,7 @@
 
 import { randomUUID } from "node:crypto";
 import { redis } from "./redis";
+import { errorKind, logEvent } from "./log";
 import {
   hyperswitchFetch,
   retrievePayment,
@@ -684,11 +685,9 @@ async function reapExpiredHolds(): Promise<void> {
         // reconciliation flag could not be recorded) is NOT treated as
         // handled: a hold only ever leaves the pending index together with
         // its recorded flag, so it stays discoverable there and a later pass
-        // retries it. Logged without payment details.
-        console.error(
-          `[expiry] hold ${orderId} left pending after an error:`,
-          err instanceof Error ? err.message : "unknown"
-        );
+        // retries it. Logged by error class only: an error message can embed
+        // Redis command arguments (an order JSON with its owner hash).
+        logEvent("error", "expiry.hold_left_pending", { orderId, errorKind: errorKind(err) });
         continue;
       }
       // Budget exhausted: start no more provider work this pass. Every hold

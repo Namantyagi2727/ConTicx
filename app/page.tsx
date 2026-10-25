@@ -3,13 +3,19 @@ import { events } from "@/lib/events";
 import { formatCents, formatDateStamp } from "@/lib/format";
 import { posterColorClasses } from "@/lib/theme";
 import { PosterArt } from "@/components/PosterArt";
+import { appMode } from "@/lib/app-mode";
 
 // Tailwind's default rotate scale only covers a few steps (1, 2, 3, 6,
 // 12...) — "-rotate-0.5" isn't one of them and gets silently dropped,
 // so these need explicit arbitrary-value degrees to actually apply.
 const CARD_ROTATIONS = ["rotate-[-1.75deg]", "rotate-[1.5deg]", "rotate-[-1deg]"];
 
+// Read at request time so the page's description of the demo always matches
+// what the server actually enforces (see lib/app-mode.ts).
+export const dynamic = "force-dynamic";
+
 export default function Home() {
+  const browseOnly = appMode() === "browse-only";
   return (
     <main className="flex-1">
       <header className="border-b border-ink-line px-6 py-5 sm:px-10">
@@ -18,14 +24,14 @@ export default function Home() {
             CONTICX
           </span>
           <span className="font-mono text-xs text-text-faint">
-            BROOKLYN · SANDBOX ISSUE
+            {browseOnly ? "BROWSE-ONLY DEMO" : "BROOKLYN · TEST PAYMENTS"}
           </span>
         </div>
       </header>
 
       <section className="mx-auto max-w-5xl px-6 pt-16 pb-12 sm:px-10 sm:pt-24">
         <p className="font-mono text-xs tracking-[0.2em] text-flame">
-          NOW BOOKING
+          {browseOnly ? "PORTFOLIO DEMO" : "NOW BOOKING"}
         </p>
         <h1 className="mt-3 font-display text-6xl leading-[0.92] font-black tracking-tight sm:text-8xl">
           SMALL ROOMS.
@@ -34,8 +40,15 @@ export default function Home() {
         </h1>
         <p className="mt-6 max-w-md font-body text-base text-text-muted">
           Three shows, three rooms, this fall in Brooklyn. Tickets held for
-          ten minutes at checkout — sandbox payments, real urgency.
+          ten minutes at checkout — test payments, real urgency.
         </p>
+        {browseOnly && (
+          <p className="mt-4 max-w-md border-l-2 border-acid pl-3 font-body text-sm text-text-muted">
+            This public demo is browse-only: booking and payments are
+            switched off. The complete checkout runs locally against a
+            simulated payment provider — see the project README.
+          </p>
+        )}
       </section>
 
       <section className="mx-auto max-w-5xl px-6 pb-24 sm:px-10">
@@ -139,34 +152,36 @@ export default function Home() {
                 HOW IT WORKS
               </p>
               <p className="mt-2 font-body text-xs leading-relaxed text-text-muted">
-                Pick a tier and we hold your seat for ten minutes at
-                checkout. Pay by card or PayPal — nothing&apos;s reserved
-                until you do.
+                Pick a tier and your seats are held for ten minutes while
+                you pay in the checkout widget. Reloading checkout picks up
+                the same booking instead of starting another.
               </p>
             </div>
             <div>
               <p className="font-display text-sm font-bold tracking-wide">
-                REFUNDS
+                TICKETS
               </p>
               <p className="mt-2 font-body text-xs leading-relaxed text-text-muted">
-                Full refund, any time before the show, no questions asked
-                — cancel from your ticket page.
+                Tickets live in the browser you booked with and can be added
+                to your calendar. Online cancellation and refunds aren&apos;t
+                available in this demo.
               </p>
             </div>
             <div>
               <p className="font-display text-sm font-bold tracking-wide">
-                SANDBOX NOTICE
+                {browseOnly ? "DEMO NOTICE" : "TEST NOTICE"}
               </p>
               <p className="mt-2 font-body text-xs leading-relaxed text-text-muted">
-                This is a test environment. Payments run through
-                Hyperswitch&apos;s sandbox — no real cards, no real charges.
+                {browseOnly
+                  ? "Browse-only: nothing can be booked or paid for here, and no payment provider is contacted."
+                  : "Test environment: payments use Hyperswitch sandbox keys or a local simulated provider — no real cards, no real charges."}
               </p>
             </div>
           </div>
 
           <div className="mt-10 flex flex-wrap items-center justify-between gap-4 border-t border-ink-line pt-6">
             <p className="font-mono text-[10px] text-text-faint">
-              CONTICX · BROOKLYN · BUILT FOR A HACKATHON
+              CONTICX · A PORTFOLIO PROJECT · FICTIONAL SHOWS
             </p>
             <Link
               href="/my-tickets"

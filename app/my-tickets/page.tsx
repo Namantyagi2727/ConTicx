@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { getEvent } from "@/lib/events";
 import { formatCents } from "@/lib/format";
-import { ensureGuestSession, SAME_BROWSER_NOTE } from "@/lib/guest-client";
+import { BROWSE_ONLY_NOTE, ensureGuestSession, SAME_BROWSER_NOTE } from "@/lib/guest-client";
 import type { OrderView } from "@/lib/types";
 
 // Lists the orders owned by THIS browser's guest session (GET /api/orders).
@@ -15,6 +15,7 @@ type State =
   | { kind: "loading" }
   | { kind: "ready"; orders: OrderView[] }
   | { kind: "no_session" }
+  | { kind: "browse_only" }
   | { kind: "error" };
 
 const STATUS_LABEL: Record<OrderView["status"], string> = {
@@ -31,9 +32,10 @@ export default function MyTicketsPage() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const ok = await ensureGuestSession();
+      const session = await ensureGuestSession();
       if (cancelled) return;
-      if (!ok) return setState({ kind: "no_session" });
+      if (session === "browse_only") return setState({ kind: "browse_only" });
+      if (session !== "ok") return setState({ kind: "no_session" });
       try {
         const res = await fetch("/api/orders", { cache: "no-store" });
         if (cancelled) return;
@@ -69,6 +71,10 @@ export default function MyTicketsPage() {
               We couldn&apos;t start a ticket session in this browser. Check
               that cookies are allowed for this site, then reload.
             </p>
+          )}
+
+          {state.kind === "browse_only" && (
+            <p className="font-body text-sm text-text-muted">{BROWSE_ONLY_NOTE}</p>
           )}
 
           {state.kind === "error" && (

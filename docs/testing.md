@@ -754,6 +754,67 @@ different quantity showed the conflict state and changed nothing.
   parameter expires after 15 minutes; holds are 10 minutes, so a resumed
   checkout re-reads it from the provider each time.
 
+## Closeout: calendar, structured logging, browse-only demo
+
+### Add to calendar
+
+`lib/calendar.ts` builds an RFC 5545 `.ics` from the event catalog:
+`DTSTART` is the event's ISO-8601 start (which carries a UTC offset) written
+in UTC, so no `VTIMEZONE` is needed; there is no `DTEND`/`DURATION` because
+the catalog has none and none is invented (§3.6.1: a DATE-TIME start with no
+end is an event at that instant); TEXT values are escaped (§3.3.11) and lines
+folded at 75 octets without splitting UTF-8 characters (§3.1). The UID is
+derived from the event id; no order id, URL, payment id, or credential is
+included. The ticket generates it in the browser from the already-authorized
+ticket. `tests/unit/calendar.test.ts` checks the instant, fields, absent end,
+CRLF and folding, escaping, and the absence of identifiers.
+
+### Structured logging and request correlation
+
+`lib/log.ts` (no new dependency): one JSON line per event through the
+runtime console; allow-listed field names only; errors by class name only
+(Redis error messages can embed command arguments such as an order's owner
+hash); strings truncated; all failures swallowed. `runLogged` wraps the
+booking, order-status, and webhook routes: a server-generated `requestId`
+(`req_` + 96 random bits) returned as `X-Request-Id`, an inbound
+`x-request-id`/`x-vercel-id` kept as `upstreamRequestId` only if it matches
+a strict pattern, and one summary line per request (operation, outcome,
+status, duration, plus `orderId` only for an owned order and
+`webhookEventId` only after signature verification). This is request
+correlation, not distributed tracing.
+
+`tests/unit/log.test.ts` covers the allow-list, error handling, ids, and that
+a throwing log sink or handler exception leaves the response unchanged.
+`observability-and-demo-mode.regression.test.ts` checks representative
+booking, status, and webhook lines; that no cookie value, owner hash, client
+secret, attempt id, provider payment id, webhook body, or signature appears
+in any log line; that an unauthorized status poll logs no order id; that an
+infrastructure error is logged by class only; and that a throwing console
+changes neither the response nor the stored order or payment.
+
+### Browse-only demo mode
+
+`CONTICX_MODE=full` is the only setting that enables booking. Otherwise
+(including unset), the guest-session, order, order-read, order-status, and
+webhook routes answer `503 browse_only` before any Redis or provider work,
+and the event page shows the catalog without reading inventory (that read
+runs lazy expiry, which can call the provider and write, and seeds
+counters). Checkout loads the Hyperswitch SDK only once a booking is ready,
+so the browse-only checkout page never loads it. The regression suite
+asserts each route's refusal with a byte-for-byte unchanged store and no
+provider calls (with an expired hold queued to detect any expiry pass), that
+unset/unknown values are browse-only, and that the event page in browse-only
+mode leaves the store untouched while the same page in full mode does read
+inventory. The jsdom checkout suite asserts the browse-only checkout never
+loads the SDK or books. Mutations that ungate a route, read inventory in
+browse-only mode, or load the SDK eagerly each fail a test.
+
+Browser check: a production build (`next build` + `next start`) with **no
+environment variables** served every page; booking, order, status, and
+webhook routes refused with `browse_only`; checkout, My Tickets, and
+confirmation showed the browse-only explanation; no request reached a
+Hyperswitch domain.
+
 ## Known-defect characterization tests
 
 No characterization tests remain. The last one, `refund-authorization`

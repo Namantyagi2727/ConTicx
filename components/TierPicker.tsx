@@ -17,9 +17,14 @@ const LOW_STOCK_RATIO = 0.2;
 export function TierPicker({
   event,
   availability,
+  bookingEnabled = true,
 }: {
   event: EventRecord;
   availability: TierAvailability[];
+  // False in the browse-only demo: tiers are shown without availability and
+  // the buy controls are replaced by an explanation. (The server refuses
+  // booking in that mode regardless of this flag.)
+  bookingEnabled?: boolean;
 }) {
   const router = useRouter();
   const colors = posterColorClasses[event.posterColor];
@@ -96,7 +101,11 @@ export function TierPicker({
               <p className="mt-2 font-body text-sm text-text-muted">{tier.perk}</p>
 
               <div className="mt-4">
-                {soldOut ? (
+                {!bookingEnabled ? (
+                  <span className="font-mono text-[11px] text-text-faint">
+                    {tier.totalInventory} capacity
+                  </span>
+                ) : soldOut ? (
                   <span className="font-mono text-[11px] font-bold text-text-faint">
                     SOLD OUT
                   </span>
@@ -115,7 +124,18 @@ export function TierPicker({
         })}
       </div>
 
-      {maxSelectable > 0 ? (
+      {!bookingEnabled ? (
+        <div className="mt-6 border border-dashed border-ink-line p-4">
+          <p className="font-mono text-[11px] font-bold tracking-wide text-acid">
+            BROWSE-ONLY DEMO
+          </p>
+          <p className="mt-1 font-body text-sm text-text-muted">
+            Booking and payments are switched off on this public demo. The full
+            checkout — seat hold, payment widget, ticket — runs locally against a
+            simulated payment provider; see the project README.
+          </p>
+        </div>
+      ) : maxSelectable > 0 ? (
         <div className="mt-6 flex items-center gap-4">
           <div className="flex items-center border border-ink-line">
             <button

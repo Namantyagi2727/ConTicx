@@ -1,379 +1,283 @@
 # ConTicx
 
-A concert ticket booking prototype: browse events, pick a GA or VIP tier, hold
-your seat for 10 minutes, pay through [Hyperswitch](https://hyperswitch.io)'s
-Unified Checkout, and get a ticket with a QR code. Built as a hackathon-scoped
-prototype — real payment flow against Hyperswitch's sandbox, everything else
-kept intentionally minimal. Each event's poster art
-([`components/PosterArt.tsx`](components/PosterArt.tsx)) is a small
-deterministic SVG generator seeded from the event id, standing in for real
-photography this prototype doesn't have.
+ConTicx is a concert-ticket booking app built with Next.js, Upstash Redis, and
+[Hyperswitch](https://hyperswitch.io)'s Unified Checkout. You browse three
+fictional Brooklyn shows, pick a GA or VIP tier, get a ten-minute seat hold
+at checkout, pay in the Hyperswitch widget, and receive a QR-code ticket you
+can add to your calendar.
+
+It is a portfolio project. The interesting part is not the UI but the
+booking and payment correctness work underneath it: atomic inventory,
+authenticated webhooks, guest ownership without accounts, idempotent booking
+attempts, and conservative handling of uncertain payment outcomes. **It is
+not production software**, and the limits of what has been verified are
+listed below.
+
+## Demo
+
+There are two ways to see it.
+
+**1. Public demo — browse-only.** The deployed site runs with booking
+switched off: the home and event pages work, and every booking, order,
+ticket, and webhook route refuses with `503 browse_only` *on the server*
+before touching Redis or Hyperswitch. Browsing cannot reserve seats, run hold
+expiry, or call the payment provider, and the deployment needs no
+credentials. (The currently hosted build predates this release; replacing it
+is a pending, separately approved step — see [Release status](#release-status).)
+
+**2. Full booking flow — locally, with a simulated payment provider.** The
+checkout harness runs the real app against a local Redis and an in-process
+fake Hyperswitch, with the payment widget replaced by a clearly labelled stub
+(`TEST PAYMENT WIDGET (STUB)`). You can book, "pay", watch the confirmation
+page resolve, see the ticket in My Tickets, and download the calendar file —
+in about two minutes. See [Run the full demo locally](#run-the-full-demo-locally).
+**Payments in this mode are simulated**; it proves the app's own behaviour,
+not compatibility with real Hyperswitch.
+
+A step-by-step walkthrough script is in [`docs/walkthrough.md`](docs/walkthrough.md).
+
+## Screenshots
+
+| Event page (full mode) | Checkout (simulated widget) | Ticket |
+| --- | --- | --- |
+| ![Event page](docs/screenshots/event-desktop.jpg) | ![Checkout](docs/screenshots/checkout-desktop.jpg) | ![Ticket](docs/screenshots/ticket-desktop.jpg) |
+
+| Browse-only demo — home | Browse-only demo — event (mobile) | Ticket (mobile) | My Tickets (mobile) |
+| --- | --- | --- | --- |
+| ![Browse-only home](docs/screenshots/browse-home-desktop.jpg) | ![Browse-only event](docs/screenshots/browse-event-mobile.jpg) | ![Ticket mobile](docs/screenshots/ticket-mobile.jpg) | ![My Tickets](docs/screenshots/my-tickets-mobile.jpg) |
+
+Full-mode screenshots come from the local checkout harness (simulated
+provider). Browse-only screenshots come from a production build running with
+no environment variables at all.
 
 ## Architecture
 
-**Stack:** Next.js (App Router, TypeScript), deployed on Vercel. API routes
-are the backend, so the Hyperswitch secret key never reaches the browser —
-only `NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY` is client-visible.
+```mermaid
+flowchart LR
+  subgraph browser["Browser"]
+    pages["Next.js pages<br/>event · checkout · ticket · My Tickets"]
+    widget["Hyperswitch<br/>Unified Checkout widget"]
+  end
 
-### Server-side amount computation
+  subgraph server["Next.js route handlers"]
+    gate{"CONTICX_MODE"}
+    refuse["503 browse_only<br/>no Redis · no provider"]
+    routes["guest-session · orders · order status<br/>origin check · guest ownership · request logs"]
+    booking["lib/booking + lib/store<br/>atomic Lua reservation · attempt binding<br/>shared reconciliation policy"]
+    webhook["webhook route<br/>HMAC-SHA512 verification"]
+  end
 
-The client never gets to say how much it's paying. `POST /api/orders`
-accepts only `eventId`, `tierName`, and `quantity` — the charge amount is
-always computed here, from the hardcoded event catalog in
-[`lib/events.ts`](lib/events.ts), never trusted from the request body:
-subtotal is `tier.priceCents × quantity`, plus a flat `SERVICE_FEE_RATE`
-(10%, [`lib/constants.ts`](lib/constants.ts)) service fee on that
-subtotal. Both the fee and the subtotal are returned from the order-create
-response and shown as their own line items in the checkout order summary
-— nothing is folded silently into a bigger number. The Hyperswitch
-payment, and any later refund, both use the fee-inclusive total
-(`Order.amountCents`), so a refund always returns the full amount actually
-charged, fee included.
+  redis[("Upstash Redis<br/>orders · inventory · holds<br/>attempts · reconciliation flags")]
+  hs["Hyperswitch API"]
 
-### Storage: Redis for orders/inventory, hardcoded catalog for events
-
-Orders and tier inventory counters live in [Upstash Redis](https://upstash.com)
-([`lib/store.ts`](lib/store.ts)); the event catalog stays a hardcoded module
-([`lib/events.ts`](lib/events.ts)). That split is deliberate, not
-inconsistent:
-
-- Orders and inventory are read-modify-write state that changes on every
-  purchase, and every serverless instance needs to see the same, current
-  copy of it. This app started with that state in a single in-memory `Map`,
-  which works fine locally but breaks in production: a Hyperswitch webhook
-  can land on a completely different Vercel instance than the one that
-  created the order, so an in-memory update on instance A is simply
-  invisible to instance B. Shared storage is a correctness requirement here,
-  not an optimization.
-- The event catalog is static and read-only — three hardcoded events, never
-  written to at runtime. There's nothing to synchronize across instances, so
-  a database round trip would only add latency for no benefit.
-
-Orders are stored as JSON values keyed by order id (`order:{id}`), using the
-Upstash SDK's automatic JSON serialization. Inventory is a plain integer per
-`(eventId, tierName)` (`inventory:{eventId}:{tierName}`), mutated with
-atomic `DECRBY`/`INCRBY` rather than derived by scanning orders — see
-"Atomic oversell protection" below.
-
-### Inventory holds + lazy expiry with intent cancellation
-
-Placing an order writes a `"pending"` order with a `holdExpiresAt` 10
-minutes out and atomically reserves its inventory (decrements the counter).
-
-There's no background timer expiring holds (this runs on serverless —
-nothing guarantees a timer keeps firing between requests). Instead, expiry
-is lazy: every store read/write first checks a Redis sorted set of pending
-order ids scored by `holdExpiresAt` (`ZRANGEBYSCORE ... -inf <now>` finds
-exactly the expired ones, no scan of every order key needed), and for each
-expired one, **cancels the Hyperswitch payment intent before** marking the
-order expired:
-
-- Cancel succeeds → the intent was still genuinely unpaid → order becomes
-  `"expired"`, inventory releases (atomic `INCRBY`).
-- Cancel is rejected (Hyperswitch returns 400 because the intent already
-  moved past a cancellable state — succeeded, or mid-flight) → the order is
-  treated as paid and its inventory is **not** released. A later webhook or
-  status check corrects this if it turns out to have actually failed.
-- Cancel fails for an unrelated reason (network error, 5xx) → inconclusive,
-  left `"pending"` to retry on the next reap pass.
-
-This ordering exists specifically to avoid reselling a seat that was paid
-for in the same window its hold happened to expire. See the comment above
-`reapExpiredHolds` in `lib/store.ts` for the full reasoning, including a
-concurrency bug that was caught and fixed during testing (against the
-original in-memory version, still relevant to the Redis one): two tiers'
-availability checks running concurrently (`Promise.all`) could both see the
-same expired order and race to cancel the same payment twice. Fixed with a
-single in-flight promise per instance so concurrent callers on that
-instance join one reap pass instead of starting duplicates — Redis's own
-atomicity is what keeps two *different* instances reaping at the same
-moment from causing the same problem.
-
-### Atomic oversell protection
-
-`reserveInventory` decrements a tier's counter with a single atomic `DECRBY`
-— Redis serializes concurrent commands against the same key, so two
-simultaneous purchase requests (from the same instance or different ones)
-can never both read "1 left" and both succeed. If a decrement takes the
-counter below zero, it's immediately rolled back with a compensating
-`INCRBY` and that request is told the tier is sold out. The route handler
-also does a plain read-and-compare first, but only for a friendlier error
-message in the common case — the atomic decrement is what actually
-prevents overselling, not the pre-check.
-
-`getRemainingInventory` also clamps the counter to `[0, totalInventory]`
-on read, not just `>= 0` as before. This isn't a fix for an active bug in
-the reserve/release path — that path was already verified live under real
-concurrency (see the spike test below) — but building the organizer view
-(below) surfaced actual drift on two VIP counters in the long-lived dev
-database this project used throughout building it: extensive ad-hoc
-testing (interrupted dev-server restarts mid-reap, direct Redis edits for
-screenshots) had pushed two counters 1 unit above their seeded total,
-which the old floor-only clamp let through as a negative "reserved" count.
-The counters were reset once the clamp was added; the clamp itself stays,
-as a read-time safety net against whatever future test-database mess
-produces the same symptom.
-
-### Webhook-driven status, never the browser alone
-
-The browser redirect after payment only tells you the shopper's screen
-changed — not what actually happened at Hyperswitch. Order status
-transitions (`"succeeded"` / `"failed"`) are driven by two server-side
-sources instead:
-
-1. `POST /api/webhooks/hyperswitch` — authenticates each delivery
-   (HMAC-SHA512 over the raw body, `X-Webhook-Signature-512`, keyed by the
-   profile's `payment_response_hash_key`; fail-closed), then re-reads the
-   payment from Hyperswitch and applies only the transition its
-   authoritative status justifies. See `docs/testing.md`.
-2. `GET /api/orders/[id]/status` — called by the confirmation page for the
-   guest's own order. Ownership is checked first; then the server reads
-   the payment id **stored on that order** (shape-checked before it is
-   used in a provider path), retrieves it from Hyperswitch, and reconciles
-   with the same policy as the webhook — exactly as the old payment-status
-   route did, now only for the owner. A pending order may resolve; an
-   already-terminal order keeps its state and inventory, and a conflicting
-   provider outcome is recorded for reconciliation. A safety net in case
-   webhook delivery is delayed or missed.
-
-The confirmation page polls that endpoint (up to 10 times, 2s apart) while
-the order is still `"pending"`, then falls back to a "still confirming"
-message that points to My Tickets.
-
-### Redirect-based payment methods (PayPal)
-
-Card payments confirm in-page — `hyper.confirmPayment({ redirect: "if_required" })`
-resolves with a status directly, no navigation. Wallet methods (PayPal,
-GPay, Apple Pay) don't: they render as their own button inside the
-Unified Checkout widget and handle their own click-to-redirect
-internally, which means they **never call our `confirmPayment()` handler
-at all** and never see `confirmParams.return_url`. Hyperswitch's docs
-call this out as a separate, mandatory option — `options.wallets.walletReturnUrl`
-on `<UnifiedCheckout>` itself — and the checkout page was missing it
-entirely (`<UnifiedCheckout id="unified-checkout" />`, no options) until
-this was reviewed for the PayPal routing change. Both return URLs point at
-`/confirmation/[orderId]` — our own order id, in the path.
-
-Hyperswitch appends its own parameters (such as
-`payment_intent_client_secret`) to the return URL for any redirect it
-initiates. The confirmation page ignores them: it identifies the order by
-the path segment and asks the server for that order's status, so a
-provider id is never what grants access to a ticket. (Real wallet and 3DS
-redirects have not been re-verified against the sandbox since this
-change.)
-
-If a PayPal hold happens to run past its 10-minute window while the
-shopper is off on PayPal's site, the existing cancel-first reap logic
-above handles it exactly like a slow card confirmation would: no
-PayPal-specific case was needed.
-
-### Refunds (disabled)
-
-Online refunds are **turned off** (Phase 1B.4). `POST
-/api/orders/[id]/refund` now answers `503` with a fixed message and does
-nothing else: no order read, no provider call, no state change. The old
-handler refunded any order whose id the caller knew (audit finding
-SEC-02), and it had no safe handling of duplicate or asynchronous
-provider refunds. The ticket page says online refunds aren't available
-yet. A later refund phase will add guest authorization and
-duplicate-safe provider handling before refunds come back.
-`markOrderRefunded` and the `"refunded"` ticket state remain in place for
-that phase.
-
-### No metadata fallback
-
-Every Hyperswitch payment still carries `orderId`, `eventId`, `tierName`,
-`quantity`, and `unitPrice` as metadata, and binding checks use it. But a
-ticket is never *displayed* from payment metadata any more: if the
-browser cannot access the stored order, the page says the order isn't
-available rather than reconstructing a ticket from provider data.
-
-### Organizer view (disabled)
-
-`/admin` answers 404 for everyone (Phase 1B.4). It had no authentication
-— the unlinked URL was its only protection — while showing sales and
-revenue figures and running hold expiry (and therefore provider calls) on
-every view. Hiding the link was not protection, so the page itself was
-disabled. A protected organizer view needs an admin login, which is out
-of scope for now.
-
-### Live demand signal
-
-The event page shows "N people grabbed tickets in the last hour" once
-reservation attempts for that event cross a small threshold
-(`DEMAND_DISPLAY_THRESHOLD`, `lib/constants.ts`) — revives the "show a
-spike in demand" idea from the original project scope that got cut for
-time earlier on. `recordDemandSignal` does a plain Redis `INCR` on
-`demand:{eventId}` every time an order is created, `EXPIRE`-ing the key
-only on the first increment of a window (`DEMAND_WINDOW_SECONDS`, default
-1 hour) — an approximate rolling window, not a true sliding one, and
-counts reservation *attempts* rather than confirmed sales (the same
-"people are actively trying to buy this" signal a real site's urgency
-badge is usually making). Good enough for a demand badge; not something
-to build billing or analytics on top of.
-
-### Guest ownership and My Tickets
-
-There are no accounts. Instead each browser gets a **guest session**
-(Phase 1B.4), and every order belongs to the session that created it:
-
-- **Credential.** `POST /api/guest-session` issues 32 random bytes
-  (256 bits) in an `HttpOnly`, `SameSite=Lax`, `Path=/` cookie with no
-  `Domain`. On an https `APP_ORIGIN` it is also `Secure`, under the
-  `__Host-` name prefix. The server stores only its SHA-256 hash, as a
-  session record and as each order's `ownerHash`. The credential never
-  appears in a URL, a response body, client-readable storage, or a log.
-- **Lifetime.** 90 days, sliding. It restarts each time the browser
-  starts a booking or opens My Tickets. A valid session is reused for
-  every booking, never rotated per order.
-- **Before booking.** Checkout establishes the session *first*, so the
-  booking request already carries the cookie that will own the order.
-  `POST /api/orders` refuses a request without a valid session (`401`) and
-  never sets a cookie itself, so a lost booking response can't also lose
-  ownership.
-- **Atomic binding.** The owner is written in the same Redis script that
-  reserves inventory and stores the order, and the order is indexed under
-  its owner in that step. A replay by a different guest, or against a
-  legacy order with no owner, is a conflict with no write.
-- **Access.**
-  - `GET /api/orders/[id]`, `GET /api/orders/[id]/status`, and
-    `GET /api/orders` (the list) authenticate the guest before reading
-    anything.
-  - None of them runs hold expiry.
-  - They return one generic `404` for a missing order and for someone
-    else's order alike.
-  - They expose only allow-listed fields (never `ownerHash` or the
-    provider payment id), with `Cache-Control: no-store`.
-- **Legacy orders.** Orders created before this phase have no owner, so no
-  guest can open them — not by order id, and not by payment id. There is
-  no migration or backfill.
-- **Same browser only.** `/my-tickets` lists this browser's orders; an
-  order id is no longer a lookup credential. Clearing browser data, or
-  letting the session lapse, removes access. Cross-device and email
-  recovery are not implemented.
-- **Known limitation.** Two tabs on a brand-new visit can both ask for a
-  session before either has a cookie. The browser keeps whichever cookie
-  arrives last, so an order booked with the other one would be unreachable
-  from this browser. Each page shares a single session request, and a
-  browser that already has a valid session is never re-issued one, so
-  this needs two first-ever tabs racing.
-- **One booking per booking attempt (Phase 1B.5).** Each *Get tickets*
-  click mints a booking-attempt id that checkout keeps in its URL. The
-  server binds it, per guest and atomically with the reservation, to one
-  order: reloading checkout, retrying after a lost response, or
-  submitting concurrently returns that same order (same hold, pricing,
-  and payment). Reusing it with different tickets is refused, and a paid,
-  failed, or lapsed attempt is never re-booked. The order's provider
-  `payment_id` is chosen and stored before any provider call, so every
-  creation retry reuses the same id (relying on the provider's documented
-  creation idempotency for merchant-provided ids). Payment creation never
-  releases seats: uncertain or refused outcomes keep them and are flagged
-  for a recovery phase that does not exist yet. Details, provider sources,
-  and limits: `docs/testing.md`.
-
-Browser mutations (`POST /api/guest-session`, `POST /api/orders`) are
-accepted only when the `Origin` header exactly matches `APP_ORIGIN`. A
-missing, `null`, malformed, or foreign origin gets `403`, and an unset
-`APP_ORIGIN` fails closed with `503`. The trusted origin is never derived
-from `Host` or `X-Forwarded-Host`. There is no CORS. The signed provider
-webhook is exempt from this check.
-
-The old public `GET /api/payments/[id]` lookup and the prototype `POST
-/api/payments/create` endpoint now answer `410` without contacting
-Hyperswitch or touching state.
-
-## Local setup
-
-```bash
-npm install
-cp .env.example .env.local
+  pages -->|"fetch /api/*"| gate
+  gate -->|"browse-only (default)"| refuse
+  gate -->|"full"| routes
+  routes --> booking
+  webhook --> booking
+  booking <--> redis
+  booking -->|"create / retrieve / cancel<br/>under a fixed payment_id"| hs
+  pages --> widget
+  widget -->|"confirm payment"| hs
+  hs -->|"signed webhook"| webhook
 ```
 
-Fill in `.env.local` with your Hyperswitch sandbox keys (Developers > API
-keys on the dashboard):
+- **Pages** are App Router pages. Checkout loads the Hyperswitch SDK only
+  once a booking is ready to pay.
+- **Route handlers** are the backend, so the Hyperswitch secret key never
+  reaches the browser. In full mode they check the request's `Origin`
+  against `APP_ORIGIN`, authenticate the guest session, and log one
+  structured line per request.
+- **`lib/store.ts`** holds every state change as a Redis Lua script that
+  validates before it writes. **`lib/booking.ts`** creates or resumes a
+  booking's provider payment. **`lib/payment-policy.ts`** is the single
+  status → action mapping shared by the webhook, the status refresh, and
+  hold expiry.
+- **Redis** is the only store (the event catalog is a static module). There
+  is no background worker: expired holds are reconciled lazily, bounded, on
+  later requests.
 
-| Variable | Description |
-|---|---|
-| `HYPERSWITCH_API_KEY` | Secret key — server-side only, never sent to the browser |
-| `NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY` | Publishable key — used by the checkout widget |
-| `HYPERSWITCH_BASE_URL` | `https://sandbox.hyperswitch.io` |
-| `UPSTASH_REDIS_REST_URL` | From an Upstash Redis database's "REST API" tab (console.upstash.com) |
-| `UPSTASH_REDIS_REST_TOKEN` | Same tab as above |
-| `HYPERSWITCH_WEBHOOK_SECRET` | The business profile's `payment_response_hash_key`; without it every webhook is refused (`503`) |
-| `APP_ORIGIN` | The app's own origin, exactly — `http://localhost:3000` locally, `https://<your-domain>` when deployed. Browser mutations from any other origin are refused, and with it unset they fail closed |
+## Key engineering decisions
+
+| Decision | Why |
+| --- | --- |
+| Prices are computed on the server from the catalog; the client sends only event, tier, quantity, and a booking-attempt id. | The browser never decides what it pays. |
+| Each state change is one Redis Lua script that validates inputs and key types *before* its first write. | Lua does not roll back; checking first means a failure can't leave a half-written reservation. Concurrent buyers can't oversell. |
+| Webhooks are authenticated (HMAC-SHA512 over the raw body) and treated only as notifications; the app re-reads the payment from Hyperswitch and binds it to the order (id, order, amount, currency) before acting. | A forged or stale webhook can't mark an order paid. |
+| One provider status → action policy for webhooks, status refreshes, and expiry; a failed payment is retained, not released. | The three paths can't disagree, and a retryable failure doesn't free a seat. |
+| Guest ownership instead of accounts: a 256-bit HttpOnly session cookie; only its SHA-256 hash is stored, bound to each order inside the reservation. | Order ids and payment ids are not access credentials. Missing and foreign orders get the same 404. |
+| A booking attempt id (per *Get tickets* click) is bound atomically to one order. | Reloads, retries, lost responses, and concurrent submissions return the same order, hold, and price instead of booking again. |
+| The provider `payment_id` is chosen and stored before any provider call; every creation retry reuses it. | Relies on Hyperswitch's documented creation idempotency for merchant-provided ids, so retries don't create unrelated payments. |
+| Payment creation never releases seats; uncertain or refused outcomes are kept and flagged for reconciliation. | No provider response proves a payment doesn't exist; seats are released only on authoritative evidence. |
+| `CONTICX_MODE=full` is the only way to enable booking. | A deployment that forgets the setting fails safe (browse-only). |
+| Structured JSON logs with server-generated request ids and an allow-list of fields. | Requests can be correlated without logging cookies, owner hashes, client secrets, bodies, or provider payloads. |
+
+The full reasoning, failure tables, and provider-contract sources are in
+[`docs/testing.md`](docs/testing.md).
+
+## What it does
+
+- Browse events; pick a tier and quantity (up to 4).
+- Checkout holds the seats for ten minutes and shows a live countdown.
+  Reloading resumes the same booking and the same countdown; *Start a
+  separate booking* is a deliberate, different action.
+- Pay in the Hyperswitch widget (card in-page, or redirect flows that return
+  to `/confirmation/<order id>`).
+- The confirmation page polls the order's status — refreshed from the
+  provider on the server, for the owner only — until it resolves.
+- Tickets show doors and show times, a QR code of the order id, and an
+  **Add to calendar (.ics)** download.
+- **My Tickets** lists the orders this browser owns.
+- Online refunds and the organizer view are deliberately disabled (see
+  limitations).
+
+## Run the full demo locally
+
+Requirements: Node 24 (see `.nvmrc`), Docker, and npm.
 
 ```bash
+npm ci
+docker compose -f docker-compose.test.yml up -d --wait
+tests/browser/checkout-harness/run.sh
+```
+
+`run.sh` exports the current commit to a temporary directory, swaps the two
+Hyperswitch widget packages for local stubs (harness-only Next config — the
+real `next.config.ts` is untouched), starts the in-process fake Hyperswitch
+with a control port, and runs the app with `CONTICX_MODE=full` and only
+loopback endpoints and fake keys. It never reads `.env.local`.
+
+Then open <http://127.0.0.1:3000>:
+
+1. Pick a show and tier, press **Get tickets** — checkout shows the order
+   summary, the countdown, and the stub widget.
+2. Press **Pay**. The confirmation page polls while the simulated payment is
+   pending.
+3. Move the simulated payment to `succeeded`:
+
+   ```bash
+   curl -s http://127.0.0.1:38172/payments   # find the payment_id
+   curl -s -X POST "http://127.0.0.1:38172/set-status?payment_id=<id>&status=succeeded"
+   ```
+
+4. The ticket appears; **Add to calendar** downloads an `.ics`. **My
+   Tickets** lists the order.
+
+To exercise failure handling, `POST http://127.0.0.1:38172/knobs` with
+`createFailsAfterInsert=1`, `getReturns500=1`, or
+`createResponseDelayMs=<ms>` (see
+[`tests/browser/checkout-harness/fake-provider.ts`](tests/browser/checkout-harness/fake-provider.ts)).
+
+### Running against your own Hyperswitch sandbox
+
+```bash
+cp .env.example .env.local   # then fill it in
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+| Variable | Purpose |
+| --- | --- |
+| `CONTICX_MODE` | `full` enables booking; anything else is browse-only |
+| `APP_ORIGIN` | The app's exact origin, e.g. `http://localhost:3000`; browser mutations from any other origin are refused |
+| `HYPERSWITCH_API_KEY` / `NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY` | Sandbox keys (`snd_` / `pk_snd_`) |
+| `HYPERSWITCH_BASE_URL` | `https://sandbox.hyperswitch.io` |
+| `HYPERSWITCH_WEBHOOK_SECRET` | The business profile's `payment_response_hash_key`; without it webhooks are refused |
+| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | A Redis database used only for this app |
 
-To receive real Hyperswitch webhooks locally, tunnel the app (e.g. `ngrok
-http 3000`) and point a webhook URL at
-`https://<your-tunnel>/api/webhooks/hyperswitch` from the Hyperswitch
-dashboard's business profile settings.
+Use isolated test resources only. Real Hyperswitch behaviour has not been
+verified as part of this project (see limitations).
 
-## Testing a payment
+### Browse-only
 
-1. Go home → pick an event → pick a tier and quantity → **Get tickets**.
-2. On checkout, check the order summary breaks out the ticket subtotal,
-   a 10% service fee, and the total separately — then pay with test card
-   `4242 4242 4242 4242`, any future expiry date, any CVC.
-3. You should land on `/confirmation/<order id>` with a ticket: event
-   details, tier, quantity, order ID, and a QR code encoding the order ID.
-4. To see the expired-hold state, let a checkout session's 10-minute
-   countdown run out without paying — the payment widget is replaced with
-   a "reservation expired" message linking back to the event.
-5. Open `/my-tickets` in the same browser — the order should be listed
-   and link back to its confirmation page. In a different browser (or a
-   private window) the same confirmation link shows "This order isn't
-   available".
-6. Online refunds and `/admin` are disabled in this phase (see above).
+Run with `CONTICX_MODE` unset (or anything other than `full`). No other
+variables are required.
 
-Verify the payment in the Hyperswitch sandbox dashboard to confirm it
-actually cleared, not just that the UI looked right.
-
-To exercise the checkout page locally **without** Hyperswitch (payment
-widget stubbed, fake provider, local test Redis), use the checkout browser
-harness described in `docs/testing.md`.
-
-## Spike test
-
-`scripts/spike-test.ts` fires a configurable number of concurrent
-`POST /api/orders` requests at one event/tier and reports how many
-succeeded vs. were rejected as sold out, plus the tier's inventory count
-before and after — read straight from Redis, not from the UI, so it's
-checking the actual counter rather than a display value. This formalizes
-the concurrency test that was originally run by hand (backgrounded curl
-requests) while moving inventory to Redis; see "Atomic oversell
-protection" above for what it's actually testing.
-
-Run it with the dev server up in another terminal:
+## Testing
 
 ```bash
-npm run dev            # terminal 1
-npm run spike-test -- --event=midnight-parade --tier=VIP --requests=15   # terminal 2
+npm run lint
+npm run typecheck          # next typegen && tsc --noEmit
+npm run test:unit          # no Docker needed
+npm test                   # unit + integration (Docker test Redis required)
+npm run build
 ```
 
-All flags are optional (defaults: `midnight-parade`/`VIP`/15 requests/
-quantity 1). `--quantity=<n>` and `--base-url=<url>` are also available.
+239 tests in 27 files (45 unit, 194 integration). Integration tests drive the
+real route handlers against a dedicated local Redis (behind the same REST
+protocol as Upstash) and an in-process fake Hyperswitch, and assert on raw
+stored state and recorded provider calls — not only HTTP responses. A
+loopback-only network guard makes it impossible for the suite to reach a
+real service. Highlights:
 
-A correct run looks like this — note the tier only had 10 VIP tickets
-left, so 15 requests should produce exactly 10 successes:
+- concurrency: overselling, double releases, concurrent duplicate bookings;
+- webhooks: forged, tampered, replayed, and out-of-order deliveries;
+- guest isolation, legacy-order inaccessibility, origin checks;
+- booking-attempt replay and every payment-creation failure boundary,
+  including deterministic tests of stale workers in the pre-association
+  window;
+- the real checkout component under React Strict Mode (jsdom);
+- calendar file content, structured logs and secret exclusion, and
+  browse-only enforcement.
 
+`scripts/spike-test.ts` fires concurrent bookings at a running local
+instance and checks the raw inventory counter. Details of what each suite
+proves — and what it does not — are in [`docs/testing.md`](docs/testing.md).
+
+## Observability
+
+This is **structured logging with request correlation, not distributed
+tracing**. The booking, order-status, and webhook routes run inside a small
+wrapper ([`lib/log.ts`](lib/log.ts)) that gives each request a
+server-generated id, returns it as `X-Request-Id`, and writes one JSON line
+through the runtime console:
+
+```json
+{"ts":"…","level":"info","event":"request","requestId":"req_…","op":"booking.create","outcome":"ready","status":200,"durationMs":29,"orderId":"…","eventId":"midnight-parade","replayed":false}
 ```
-Firing 15 concurrent requests for 1x VIP @ Midnight Parade
-Available before: 10 (tier total: 10)
 
-Results:
-  succeeded: 10
-  rejected (sold out): 5
-  inventory: 10 -> 0 (expected 0)
+- Only allow-listed fields are written. Errors are logged by class name
+  only, because Redis error messages can embed command arguments such as an
+  order's owner hash.
+- An inbound `x-request-id` / `x-vercel-id` is kept separately as
+  `upstreamRequestId`, and only if it is short and well-formed.
+- Logging failures are swallowed and never change a response.
 
-OK — inventory accounting is exact, no oversell.
-```
+No external monitoring service or logging dependency is used.
 
-If `reserveInventory`'s atomic `DECRBY` were ever replaced with a
-non-atomic read-then-write, this is the test that would catch it: the
-final inventory count would land below zero, or `succeeded` would exceed
-what was actually available.
+## Known limitations and deferred work
+
+- **Not verified against real Hyperswitch.** Webhook delivery and signing,
+  redirect and wallet returns, duplicate-`payment_id` behaviour, and
+  retrieval semantics follow the documentation and upstream source, but have
+  not been exercised against the sandbox. Hosted Upstash parity is likewise
+  unverified.
+- **No background recovery.** Uncertain or refused payment outcomes, and
+  payment-less expired holds, stay held and flagged in `reconcile_needed`;
+  nothing resolves them yet, and flags are not cleared automatically.
+- **Refunds and the organizer view are disabled.** The refund endpoint
+  answers `503`; there is no admin login.
+- **Same-browser tickets only.** No accounts, email, or cross-device
+  recovery; clearing browser data removes access. Two brand-new tabs racing
+  on a first visit can end up with different guest sessions.
+- **No rate limiting** on any route.
+- **Fictional catalog.** Three hard-coded shows dated autumn 2026. Times are
+  shown in the viewer's local time zone; the calendar file uses the exact
+  instant.
+- **Not production-ready.** No load testing, no production deployment
+  review, no real payments.
+
+## Release status
+
+This branch prepares release notes for **v0.1.0**
+([`docs/release-notes/v0.1.0.md`](docs/release-notes/v0.1.0.md)). The tag,
+the GitHub release, and replacing the hosted demo with the browse-only build
+are separate steps that have not been taken. Automatic Vercel Git
+deployments are disabled in [`vercel.json`](vercel.json).
+
+## Documentation
+
+- [`docs/testing.md`](docs/testing.md) — test strategy, per-phase guarantees,
+  failure tables, provider-contract sources.
+- [`docs/deploy-prerequisites.md`](docs/deploy-prerequisites.md) — what must
+  be true before anything is deployed.
+- [`docs/walkthrough.md`](docs/walkthrough.md) — demo recording script.

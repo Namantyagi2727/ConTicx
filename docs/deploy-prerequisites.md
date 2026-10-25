@@ -138,6 +138,20 @@ list confirms that nothing was deployed.
   project's Root Directory ever moves away from the repository root, this
   file must move with it.
 
+### Demo mode and the currently hosted build (closeout)
+
+- `CONTICX_MODE=full` is the only setting that enables booking. A
+  deployment without it is browse-only: event pages work, every booking,
+  order, ticket, and webhook route refuses with `503`, and no Redis,
+  Hyperswitch, or origin configuration is needed. This is the intended mode
+  for the public portfolio demo.
+- The home page reads the mode at request time, so its description always
+  matches what the server enforces.
+- The build Vercel last deployed to Production (from `5a04503`, the Phase 1A
+  merge) predates every later phase — signed webhooks, guest ownership,
+  booking idempotency, and browse-only mode. Replacing it with a browse-only
+  build is a separate, explicitly approved step.
+
 ## Deployment checklist
 
 Any deployment — re-enabling automatic Git deployments, or deploying
@@ -149,8 +163,10 @@ manually — requires **all** of:
    isolated Preview environment (its own Redis DB + sandbox payment keys).
 3. Deployment access protection (Standard Protection) confirmed — this
    gates URL access and is *in addition to*, not a substitute for, (2).
-4. `APP_ORIGIN` set to the deployment's exact https origin, and
-   `HYPERSWITCH_WEBHOOK_SECRET` set (see above).
+4. For a booking-enabled deployment only: `CONTICX_MODE=full`, `APP_ORIGIN`
+   set to the deployment's exact https origin, and
+   `HYPERSWITCH_WEBHOOK_SECRET` set (see above). A browse-only deployment
+   needs none of these.
 
 This maps to addendum prerequisite **P1** (settle the Vercel
 preview-isolation and runtime questions before any branch push) and

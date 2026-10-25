@@ -7,6 +7,7 @@
 // an order id exists.
 
 import { NextResponse } from "next/server";
+import { logEvent } from "./log";
 import { authenticateGuest, ownsOrder, type GuestIdentity } from "./guest-session";
 import type { OriginCheck } from "./app-origin";
 import { peekOrder } from "./store";
@@ -47,7 +48,7 @@ export function sessionRequired(): NextResponse {
 
 export function originRejected(check: Exclude<OriginCheck, { ok: true }>): NextResponse {
   if (check.reason === "not_configured") {
-    console.error("[origin] APP_ORIGIN is not configured; refusing browser mutation");
+    logEvent("error", "origin.not_configured");
     return jsonNoStore({ error: "Service not configured" }, 503);
   }
   return jsonNoStore({ error: "Forbidden" }, 403);

@@ -1,4 +1,6 @@
 import { randomUUID } from "crypto";
+import { errorKind, runLogged, type RequestLog } from "@/lib/log";
+import { bookingEnabled, browseOnlyResponse } from "@/lib/app-mode";
 import { getEvent } from "@/lib/events";
 import {
   GUEST_ORDER_LIST_LIMIT,
@@ -34,6 +36,7 @@ export const dynamic = "force-dynamic";
 // this guest's order index — no hold expiry, no provider call — and re-checks
 // ownership on every order before returning its allow-listed fields.
 export async function GET(request: Request) {
+  if (!bookingEnabled()) return browseOnlyResponse();
   const guest = await authenticateGuest(request);
   if (!guest) return sessionRequired();
   const orders = await listGuestOrders(guest.ownerHash, GUEST_ORDER_LIST_LIMIT);
@@ -69,6 +72,11 @@ export async function GET(request: Request) {
 //   400/503 { code, error }                       invalid request, sold
 //        out, or inventory/service unavailable
 export async function POST(request: Request) {
+  return runLogged("booking.create", request, (log) => handleBooking(request, log));
+}
+
+async function handleBooking(request: Request, log: RequestLog): Promise<Response> {
+  if (!bookingEnabled()) return browseOnlyResponse();
   const origin = checkRequestOrigin(request);
   if (!origin.ok) return originRejected(origin);
   const guest = await authenticateGuest(request);
@@ -194,6 +202,8 @@ export async function POST(request: Request) {
       return jsonNoStore({ code: "error", error: "Could not create order" }, 500);
   }
 
+  log.set({ orderId: order.id, eventId: order.eventId, replayed });
+
   const summary = {
     orderId: order.id,
     holdExpiresAt: order.holdExpiresAt,
@@ -208,10 +218,7 @@ export async function POST(request: Request) {
   } catch (err) {
     // Infrastructure failure mid-way: the reservation stands and the attempt
     // stays bound, so a retry of the same attempt resumes it.
-    console.error(
-      `[orders] payment setup error for order ${order.id}:`,
-      err instanceof Error ? err.message : "unknown"
-    );
+    log.set({ reason: "payment_setup_error", errorKind: errorKind(err) });
     return jsonNoStore({ code: "processing", retryAfterMs: 2000, ...summary }, 202);
   }
 
@@ -221,6 +228,7 @@ export async function POST(request: Request) {
       // returned — the browser navigates by the order id.
       return jsonNoStore({ code: "ready", clientSecret: outcome.clientSecret, ...summary });
     case "processing":
+      log.set({ reason: outcome.reason });
       return jsonNoStore({ code: "processing", retryAfterMs: 2000, ...summary }, 202);
     case "closed": {
       const lapsed = outcome.order.status === "pending";
@@ -230,7 +238,7 @@ export async function POST(request: Request) {
       );
     }
     case "refused":
-      console.warn(`[orders] payment creation refused for order ${order.id} (${outcome.reason})`);
+      log.set({ reason: outcome.reason });
       return jsonNoStore(
         { code: "payment_setup_failed", held: true, error: "Could not set up payment", ...summary },
         502

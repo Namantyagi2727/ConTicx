@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { errorKind, runLogged, type RequestLog } from "@/lib/log";
+import { bookingEnabled, browseOnlyResponse } from "@/lib/app-mode";
 import {
   isWebhookEventProcessed,
   markWebhookEventProcessed,
@@ -37,6 +39,11 @@ export const dynamic = "force-dynamic";
 const MAX_BODY_BYTES = 64 * 1024;
 
 export async function POST(request: Request) {
+  return runLogged("webhook.receive", request, (log) => handle(request, log));
+}
+
+async function handle(request: Request, log: RequestLog): Promise<Response> {
+  if (!bookingEnabled()) return browseOnlyResponse();
   // (1) Bounded raw-body read. Signature verification needs the exact
   // bytes, so we read once here and reuse the buffer for both the HMAC and
   // the JSON parse — never request.json(), which would re-serialize and
@@ -59,15 +66,14 @@ export async function POST(request: Request) {
       // Server misconfiguration: we cannot verify, so we refuse to process
       // an unverifiable body. Retryable once the secret is configured.
       // Never log the (absent) secret.
-      console.error(
-        "[hyperswitch webhook] HYPERSWITCH_WEBHOOK_SECRET is not configured; refusing delivery"
-      );
+      log.set({ reason: "webhook_secret_not_configured" });
       return NextResponse.json(
         { error: "Webhook verification not configured" },
         { status: 503 }
       );
     }
-    // missing / malformed / mismatch — never log the raw signature.
+    // missing / malformed / mismatch — never log the signature or the body.
+    log.set({ reason: `signature_${verified.reason}` });
     return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
   }
 
@@ -101,9 +107,7 @@ export async function POST(request: Request) {
   // is acknowledged as intentionally unsupported so the provider stops
   // retrying it. No mutation, no dedup marker.
   if (!eventType.startsWith("payment")) {
-    console.log(
-      `[hyperswitch webhook] acknowledged unsupported event_type '${eventType}' (event ${eventId})`
-    );
+    log.set({ webhookEventId: eventId, reason: "unsupported_event" });
     return NextResponse.json(
       { received: true, handled: false, reason: "unsupported_event" },
       { status: 200 }
@@ -114,6 +118,8 @@ export async function POST(request: Request) {
   if (!isValidPaymentId(paymentId)) {
     return NextResponse.json({ error: "Malformed payload" }, { status: 400 });
   }
+
+  log.set({ webhookEventId: eventId });
 
   // Everything below can touch Redis or the provider. Collapse any
   // unexpected infrastructure error to a retryable 503 that leaves NO dedup
@@ -136,12 +142,12 @@ export async function POST(request: Request) {
     switch (outcome.result) {
       case "unknown_payment":
         // The provider does not know this payment — a permanent rejection.
-        console.warn(`[hyperswitch webhook] payment not found at provider (event ${eventId})`);
+        log.set({ reason: "unknown_payment" });
         return NextResponse.json({ error: "Unknown payment" }, { status: 422 });
 
       case "mismatch":
         // Binding failed (id / association / amount / currency / merchant).
-        console.warn(`[hyperswitch webhook] binding rejected (event ${eventId}): ${outcome.reason}`);
+        log.set({ reason: `binding_${outcome.reason}` });
         return NextResponse.json({ error: "Binding check failed" }, { status: 422 });
 
       case "not_ready":
@@ -174,10 +180,7 @@ export async function POST(request: Request) {
         // The order is already in a different terminal state; the conflict
         // was recorded, not overwritten. Acknowledge so the provider stops
         // retrying something we deliberately declined to act on.
-        console.warn(
-          `[hyperswitch webhook] unresolved conflict for event ${eventId}: order already ` +
-            `'${outcome.current}' — left for reconciliation`
-        );
+        log.set({ reason: `conflict_over_${outcome.current}` });
         await markWebhookEventProcessed(eventId);
         return NextResponse.json(
           { received: true, handled: false, reason: "conflict" },
@@ -200,10 +203,7 @@ export async function POST(request: Request) {
     }
   } catch (err) {
     // Redis or other infrastructure failure: retryable, no marker.
-    console.error(
-      `[hyperswitch webhook] processing error (event ${eventId}):`,
-      err instanceof Error ? err.message : "unknown"
-    );
+    log.set({ reason: "processing_error", errorKind: errorKind(err) });
     return NextResponse.json({ error: "Processing failed" }, { status: 503 });
   }
 }

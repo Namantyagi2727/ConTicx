@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getEvent } from "@/lib/events";
 import { getRecentDemand, getRemainingInventory } from "@/lib/store";
+import { bookingEnabled } from "@/lib/app-mode";
 import { DEMAND_DISPLAY_THRESHOLD } from "@/lib/constants";
 import { formatDateStamp, formatDoorsTime, formatTime } from "@/lib/format";
 import { posterColorClasses } from "@/lib/theme";
@@ -23,17 +24,24 @@ export default async function EventPage({
   const event = getEvent(id);
   if (!event) notFound();
 
-  const [availability, recentDemand] = await Promise.all([
-    Promise.all(
-      event.tiers.map(
-        async (tier): Promise<TierAvailability> => ({
-          ...tier,
-          remaining: await getRemainingInventory(event.id, tier.name, tier.totalInventory),
-        })
-      )
-    ),
-    getRecentDemand(event.id),
-  ]);
+  // In the browse-only demo the page never reads inventory: that read runs
+  // lazy hold expiry (which can call the payment provider and write) and
+  // seeds counters. The catalog's capacities stand in, and no availability
+  // is shown.
+  const canBook = bookingEnabled();
+  const [availability, recentDemand] = canBook
+    ? await Promise.all([
+        Promise.all(
+          event.tiers.map(
+            async (tier): Promise<TierAvailability> => ({
+              ...tier,
+              remaining: await getRemainingInventory(event.id, tier.name, tier.totalInventory),
+            })
+          )
+        ),
+        getRecentDemand(event.id),
+      ])
+    : [event.tiers.map((tier): TierAvailability => ({ ...tier, remaining: tier.totalInventory })), 0];
 
   const stamp = formatDateStamp(event.date);
   const colors = posterColorClasses[event.posterColor];
@@ -135,7 +143,7 @@ export default async function EventPage({
               </span>
             )}
           </div>
-          <TierPicker event={event} availability={availability} />
+          <TierPicker event={event} availability={availability} bookingEnabled={canBook} />
         </section>
       </div>
     </main>
