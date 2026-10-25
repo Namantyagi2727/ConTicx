@@ -60,7 +60,7 @@ export default defineConfig({
         test: {
           name: "integration",
           environment: "node",
-          include: ["tests/integration/**/*.test.ts"],
+          include: ["tests/integration/**/*.test.{ts,tsx}"],
           setupFiles: ["tests/setup/integration.ts"],
           env: testEnv,
         },
