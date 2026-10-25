@@ -138,7 +138,7 @@ list confirms that nothing was deployed.
   project's Root Directory ever moves away from the repository root, this
   file must move with it.
 
-### Demo mode and the currently hosted build (closeout)
+### Demo mode and the hosted build (closeout)
 
 - `CONTICX_MODE=full` is the only setting that enables booking. A
   deployment without it is browse-only: event pages work, every booking,
@@ -147,10 +147,26 @@ list confirms that nothing was deployed.
   for the public portfolio demo.
 - The home page reads the mode at request time, so its description always
   matches what the server enforces.
-- The build Vercel last deployed to Production (from `5a04503`, the Phase 1A
-  merge) predates every later phase — signed webhooks, guest ownership,
-  booking idempotency, and browse-only mode. Replacing it with a browse-only
-  build is a separate, explicitly approved step.
+- **Production now serves a browse-only build of `v0.1.0`** at
+  <https://conticx.vercel.app>: Vercel deployment
+  `dpl_314eyrUMHanKt6rCXFe6SAjmfDNr`, deployed manually on 2026-10-25 with
+  Production `CONTICX_MODE=browse-only`.
+- **Provenance.** It is a Vercel CLI deployment (source `cli`), so it carries
+  **no Git metadata**. It was built from a `git archive` export of tag
+  `v0.1.0` (commit `df573e222d1f6a268c96f0c8b609884aa2d5dd9f`) into a new,
+  empty directory. Test-only files (`tests/`, `vitest.config.ts`,
+  `docker-compose.test.yml`) and every `.env*` file were left out of the
+  upload; every remaining file was checked byte-for-byte against the tag.
+  The deployment's metadata records `sourceTag`, `sourceCommit`, and
+  `exportManifestSha256` (the SHA-256 of the exported files' checksum
+  list).
+- The previous Production build (`5a04503`, the Phase 1A merge) predates
+  every later phase. It no longer serves the public domain, and Standard
+  Protection puts its deployment URL behind Vercel login. It was not
+  deleted.
+- Production still holds the earlier Redis and Hyperswitch variables.
+  Browse-only mode never reads them; a booking-enabled deployment would
+  additionally need the settings in the checklist below.
 
 ## Deployment checklist
 
