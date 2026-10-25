@@ -50,7 +50,7 @@ interface OrderCreateResponse {
 // What one checkout attempt resolved to (see POST /api/orders).
 type BookingResult =
   | { kind: "ready"; order: OrderCreateResponse }
-  | { kind: "pending"; orderId?: string; holdExpiresAt?: number }
+  | { kind: "pending"; orderId?: string; holdExpiresAt?: number; refused?: boolean }
   | { kind: "conflict"; message: string }
   | { kind: "closed"; orderId: string; orderStatus: string }
   | { kind: "error"; message: string };
@@ -120,6 +120,16 @@ async function createBooking(
         return { kind: "conflict", message: String(data.error ?? "This booking can't be changed") };
       case "attempt_closed":
         return { kind: "closed", orderId: String(data.orderId), orderStatus: String(data.orderStatus) };
+      case "payment_setup_failed":
+        // The provider refused this attempt's payment setup, but the seats
+        // stay held for it (a refusal does not prove no payment exists). Do
+        // not loop; let the shopper retry this same booking deliberately.
+        return {
+          kind: "pending",
+          refused: true,
+          orderId: data.orderId as string | undefined,
+          holdExpiresAt: data.holdExpiresAt as number | undefined,
+        };
     }
     if (res.status === 503) {
       await sleep(BOOKING_RETRY_MS);
@@ -282,7 +292,10 @@ function CheckoutContent() {
 
   if (result?.kind === "pending") {
     return (
-      <StatusCard title="Still setting up your payment" tone="muted">
+      <StatusCard
+        title={result.refused ? "We couldn't set up payment yet" : "Still setting up your payment"}
+        tone="muted"
+      >
         Your tickets stay reserved for this booking
         {secondsLeft !== null ? ` (${Math.floor(secondsLeft / 60)}:${String(secondsLeft % 60).padStart(2, "0")} left)` : ""}
         . We haven&apos;t charged anything. Try again to pick up this same

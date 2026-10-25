@@ -5,14 +5,16 @@ import { GET as readOrderRoute } from "@/app/api/orders/[id]/route";
 import { newPaymentRequestId } from "@/lib/hyperswitch";
 import {
   attachPaymentId,
+  claimPaymentLease,
   getReconciliationFlag,
+  releasePaymentLease,
   reserveBookingAttempt,
   transitionOrder,
   updateOrderStatus,
 } from "@/lib/store";
 import type { Order } from "@/lib/types";
 import { getFake } from "../setup/integration";
-import { failRedisCommand, rejectRequests } from "../helpers/faults";
+import { beforeRedisCommandOnce, failRedisCommand, rejectRequests } from "../helpers/faults";
 import { makeTestRedis, snapshotRedis } from "../helpers/redis";
 import { makeOrder } from "../helpers/orders";
 import { guestRequest, newGuest, orderRequest } from "../helpers/guest";
@@ -63,6 +65,22 @@ function attemptKey(cookie: string, attemptId: string) {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// A promise plus its resolver, for deterministic barriers.
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+// A provider rejection that is NOT the documented duplicate (HE_01): an
+// authentication error, as a retry after a key change could see.
+const AUTH_REJECTION = {
+  status: 401,
+  body: { error: { type: "invalid_request_error", code: "IR_01", message: "API key not provided or invalid" } },
+};
+
+const ATTACH_SCRIPT = "ORDER['PAYMENTID'] = PAYMENTID";
 
 describe("[regression] one booking attempt → one owned order and reservation", () => {
   it("collapses concurrent identical submissions into one order, index entry, decrement, and payment", async () => {
@@ -281,30 +299,30 @@ describe("[regression] payment creation under uncertain outcomes", () => {
     expect((await r.get<Order>(`order:${order.id}`))!.paymentId).toBe(order.paymentRequestId);
   });
 
-  it("a definitive rejection fails the order and releases its seats; the attempt then stays closed", async () => {
+  it("a non-duplicate refusal keeps the reservation and flags it; a later retry uses the same id", async () => {
     getFake().createRejection = {
-      status: 400,
-      body: { error: { type: "invalid_request", code: "IR_06", message: "invalid amount" } },
+      status: 422,
+      body: { error: { type: "invalid_request_error", code: "IR_05", message: "unprocessable" } },
     };
     const guest = await newGuest();
     const attemptId = randomUUID();
 
     const res = await book(guest, attemptId, 2);
     expect(res.status).toBe(502);
-    expect((await bodyOf(res)).code).toBe("payment_setup_failed");
+    expect(await bodyOf(res)).toMatchObject({ code: "payment_setup_failed", held: true });
     const order = (await orders())[0];
-    expect(order.status).toBe("failed");
-    expect(await inventory()).toBe(10); // released
-    expect(getFake().allPayments()).toHaveLength(0);
+    expect(order.status).toBe("pending"); // not failed
+    expect(await inventory()).toBe(8); // not released
+    expect((await getReconciliationFlag(order.id))?.reason).toBe("payment_create_rejected_422_IR_05");
 
     getFake().createRejection = null;
-    const creates = getFake().createCalls().length;
-    const replay = await book(guest, attemptId, 2);
-    expect(replay.status).toBe(409);
-    expect(await bodyOf(replay)).toMatchObject({ code: "attempt_closed", orderStatus: "failed" });
+    const retry = await book(guest, attemptId, 2);
+    expect(retry.status).toBe(200);
+    expect((await bodyOf(retry)).orderId).toBe(order.id);
     expect(await orders()).toHaveLength(1);
-    expect(getFake().createCalls()).toHaveLength(creates);
-    expect(await inventory()).toBe(10);
+    expect(getFake().allPayments()).toHaveLength(1);
+    expect(getFake().allPayments()[0].payment_id).toBe(order.paymentRequestId);
+    expect(await inventory()).toBe(8);
   });
 });
 
@@ -356,6 +374,111 @@ describe("[regression] concurrent and stale payment workers", () => {
 
     expect(result).toBe("has_payment");
     expect(await snapshotRedis(r)).toBe(before);
+  });
+});
+
+describe("[regression] rejections inside the pre-association window (deterministic)", () => {
+  it("a stale worker's rejection cannot fail the order while another worker is about to bind the payment", async () => {
+    const guest = await newGuest();
+    const attemptId = randomUUID();
+    const aArrived = deferred();
+    const aResponse = deferred<{ status: number; body: unknown }>();
+    // Worker A's create reaches the provider, which STORES the payment under
+    // the saved id, and A's response is held.
+    getFake().createGates.push({ arrived: aArrived.resolve, response: aResponse.promise });
+    const workerA = book(guest, attemptId, 2);
+    await aArrived.promise;
+    const order = (await orders())[0];
+
+    // A's lease lapses / ownership changes.
+    await r.del(`payment_create_lease:${order.id}`);
+
+    // Worker B retries, finds the payment by id, and is held just before it
+    // writes the local association.
+    const bAtAttach = deferred();
+    const releaseAttach = deferred();
+    const restore = beforeRedisCommandOnce((body) => body.includes(ATTACH_SCRIPT), async () => {
+      bAtAttach.resolve();
+      await releaseAttach.promise;
+    });
+    const workerB = book(guest, attemptId, 2);
+    await bAtAttach.promise;
+
+    // Stale worker A now returns a non-duplicate rejection.
+    aResponse.resolve(AUTH_REJECTION);
+    const resA = await workerA;
+
+    // It changes nothing: still pending, seats held, nothing released.
+    const afterA = (await r.get<Order>(`order:${order.id}`))!;
+    expect(resA.status).toBe(502);
+    expect(afterA.status).toBe("pending");
+    expect(afterA.paymentId).toBeUndefined();
+    expect(await inventory()).toBe(8);
+    expect((await getReconciliationFlag(order.id))?.reason).toMatch(/^payment_create_rejected/);
+
+    // B then binds the existing payment — no new reservation or payment.
+    releaseAttach.resolve();
+    const resB = await workerB;
+    restore();
+    expect(resB.status).toBe(200);
+    const final = (await r.get<Order>(`order:${order.id}`))!;
+    expect(final.status).toBe("pending");
+    expect(final.paymentId).toBe(order.paymentRequestId);
+    expect(await inventory()).toBe(8);
+    expect(await orders()).toHaveLength(1);
+    expect(getFake().allPayments()).toHaveLength(1);
+  });
+
+  it("a rejection on a later retry cannot release seats while an earlier create may still land", async () => {
+    const guest = await newGuest();
+    const attemptId = randomUUID();
+    const aArrived = deferred();
+    const aStore = deferred();
+    // Worker A's create is in flight at the provider but NOT stored yet.
+    getFake().createGates.push({ arrived: aArrived.resolve, beforeStore: aStore.promise });
+    // Worker B's create (the retry) is refused without storing anything.
+    getFake().createGates.push({ skipStore: true, response: Promise.resolve(AUTH_REJECTION) });
+
+    const workerA = book(guest, attemptId);
+    await aArrived.promise;
+    const order = (await orders())[0];
+    await r.del(`payment_create_lease:${order.id}`);
+
+    // B: GET by id is not-found (A has not stored yet), so B creates and is
+    // rejected. That proves nothing about A's request.
+    const resB = await book(guest, attemptId);
+    expect(resB.status).toBe(502);
+    const afterB = (await r.get<Order>(`order:${order.id}`))!;
+    expect(afterB.status).toBe("pending");
+    expect(await inventory()).toBe(9);
+    expect((await getReconciliationFlag(order.id))?.reason).toMatch(/^payment_create_rejected/);
+
+    // A's create then lands and is bound to the still-held order.
+    aStore.resolve();
+    const resA = await workerA;
+    expect(resA.status).toBe(200);
+    const final = (await r.get<Order>(`order:${order.id}`))!;
+    expect(final.status).toBe("pending");
+    expect(final.paymentId).toBe(order.paymentRequestId);
+    expect(await inventory()).toBe(9);
+    expect(getFake().allPayments()).toHaveLength(1);
+    expect(await orders()).toHaveLength(1);
+  });
+
+  it("a stale lease holder cannot release the current holder's lease", async () => {
+    const orderId = randomUUID();
+    const tokenA = await claimPaymentLease(orderId, 60_000);
+    expect(tokenA).not.toBeNull();
+    await r.del(`payment_create_lease:${orderId}`); // A's lease lapsed
+    const tokenB = await claimPaymentLease(orderId, 60_000);
+    expect(tokenB).not.toBeNull();
+
+    await releasePaymentLease(orderId, tokenA!); // stale release
+    expect(await r.get(`payment_create_lease:${orderId}`)).toBe(tokenB);
+    expect(await claimPaymentLease(orderId, 60_000)).toBeNull(); // B still holds it
+
+    await releasePaymentLease(orderId, tokenB!);
+    expect(await r.exists(`payment_create_lease:${orderId}`)).toBe(0);
   });
 });
 

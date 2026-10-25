@@ -63,8 +63,9 @@ export async function GET(request: Request) {
 //        different tickets; nothing changed
 //   409 { code: "attempt_closed", orderStatus }   the attempt's order is
 //        paid, failed, or its hold lapsed; never re-booked
-//   502 { code: "payment_setup_failed" }          provider definitively
-//        refused; the hold was released
+//   502 { code: "payment_setup_failed", held: true } provider refused this
+//        create request; the hold is KEPT (a refusal does not prove no
+//        payment exists) and flagged; retrying the same attempt is allowed
 //   400/503 { code, error }                       invalid request, sold
 //        out, or inventory/service unavailable
 export async function POST(request: Request) {
@@ -228,8 +229,11 @@ export async function POST(request: Request) {
         409
       );
     }
-    case "failed":
-      console.warn(`[orders] payment creation definitively rejected for order ${order.id}`);
-      return jsonNoStore({ code: "payment_setup_failed", error: "Could not set up payment", ...summary }, 502);
+    case "refused":
+      console.warn(`[orders] payment creation refused for order ${order.id} (${outcome.reason})`);
+      return jsonNoStore(
+        { code: "payment_setup_failed", held: true, error: "Could not set up payment", ...summary },
+        502
+      );
   }
 }

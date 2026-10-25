@@ -20,6 +20,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 
+export interface CreateGate {
+  arrived?: () => void;
+  beforeStore?: Promise<void>;
+  skipStore?: boolean;
+  response?: Promise<{ status: number; body: unknown } | void>;
+}
+
 export interface RecordedCall {
   method: string;
   path: string;
@@ -93,6 +100,15 @@ export class FakeHyperswitch {
   createResponseDelayMs = 0;
   createFailsAfterInsert = false;
   createRejection: { status: number; body: unknown } | null = null;
+  // Deterministic per-request gates for POST /payments, consumed one per
+  // create request in arrival order (tests drive them with deferred
+  // promises, never sleeps):
+  //   arrived      called as soon as the request reaches the fake
+  //   beforeStore  awaited before the duplicate check and store
+  //   skipStore    do not store a payment for this request
+  //   response     awaited after storing; if it yields a response, that is
+  //                what the request receives
+  readonly createGates: CreateGate[] = [];
 
   // `port` 0 binds an ephemeral port (used by the fake's own unit
   // self-test); the integration setup passes the fixed loopback port
@@ -135,6 +151,7 @@ export class FakeHyperswitch {
     this.createResponseDelayMs = 0;
     this.createFailsAfterInsert = false;
     this.createRejection = null;
+    this.createGates.length = 0;
   }
 
   // Create requests the fake received (accepted or not).
@@ -213,11 +230,14 @@ export class FakeHyperswitch {
       if (this.createRejection) {
         return json(res, this.createRejection.status, this.createRejection.body);
       }
+      const gate = this.createGates.shift();
+      gate?.arrived?.();
+      if (gate?.beforeStore) await gate.beforeStore;
       const requested = typeof input.payment_id === "string" ? input.payment_id : null;
       if (requested && this.payments.has(requested)) {
         return json(res, 400, {
           error: {
-            type: "invalid_request",
+            type: "duplicate_request",
             code: "HE_01",
             message: "The payment with the specified payment_id already exists in our records",
           },
@@ -232,7 +252,11 @@ export class FakeHyperswitch {
         currency: input.currency ?? "USD",
         metadata: input.metadata ?? null,
       };
-      this.payments.set(id, payment);
+      if (!gate?.skipStore) this.payments.set(id, payment);
+      if (gate?.response) {
+        const override = await gate.response;
+        if (override) return json(res, override.status, override.body);
+      }
       if (this.createResponseDelayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, this.createResponseDelayMs));
       }

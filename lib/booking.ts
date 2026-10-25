@@ -9,18 +9,24 @@
 // payment; it is rejected as a duplicate, and the existing payment is then
 // retrieved by id.
 //
-// ensureOrderPayment never invents a new identity, never releases inventory
-// on an uncertain outcome, and never attaches a provider payment that does
-// not bind to the order (id, order id, amount, currency). Outcomes:
+// ensureOrderPayment never invents a new identity, never releases
+// inventory, and never attaches a provider payment that does not bind to the
+// order (id, order id, amount, currency). No creation response — not even a
+// 4xx — proves that no payment exists under the id: an earlier request may
+// have created it, or may still be in flight and land later (a lease lapsing
+// or a GET-not-found does not show that it stopped). Seats are therefore
+// released only by the existing authoritative reconciliation paths (bound
+// provider status via webhook, status refresh, or expiry), never here.
+// Outcomes:
 //   ready       payment confirmed and attached; client secret for checkout.
 //   processing  another request holds the creation lease, the provider is
 //               unavailable, or the outcome is uncertain (flagged for
 //               reconciliation). The caller retries the same attempt later.
+//   refused     the provider refused THIS create request (a non-duplicate
+//               4xx). The reservation is kept and flagged; a later retry of
+//               the same attempt uses the same id.
 //   closed      the order is no longer bookable: terminal, or its hold has
 //               lapsed. Never turned into a new booking.
-//   failed      the provider definitively rejected creation; the order was
-//               failed and its seats released (only if no payment had been
-//               attached in the meantime).
 
 import { BOOKING_PAYMENT_LEASE_MS } from "./constants";
 import { createPayment, retrievePayment, type ProviderPayment } from "./hyperswitch";
@@ -32,7 +38,6 @@ import {
   markPaymentAttempt,
   peekOrder,
   releasePaymentLease,
-  transitionOrder,
 } from "./store";
 import { isValidPaymentId } from "./webhook-security";
 import type { Order } from "./types";
@@ -41,7 +46,7 @@ export type EnsurePaymentResult =
   | { kind: "ready"; order: Order; clientSecret: string }
   | { kind: "processing"; order: Order; reason: string }
   | { kind: "closed"; order: Order }
-  | { kind: "failed"; order: Order };
+  | { kind: "refused"; order: Order; reason: string };
 
 function leaseMs(): number {
   const raw = Number(process.env.BOOKING_PAYMENT_LEASE_MS);
@@ -157,17 +162,13 @@ export async function ensureOrderPayment(order: Order): Promise<EnsurePaymentRes
       return processing(current, "payment_create_duplicate_unretrieved", true);
     }
 
-    if (created.kind === "rejected") {
-      // Definitive: no payment under this id. Fail the order and release its
-      // seats — but only if no payment has been attached meanwhile.
-      const tr = await transitionOrder(current.id, "pending", "failed", true, {
-        requireNoPaymentId: true,
-      });
-      const latest = (await peekOrder(current.id)) ?? current;
-      if (tr === "applied" || tr === "noop") return { kind: "failed", order: latest };
-      if (tr === "has_payment" && latest.paymentId) return resume(latest, latest.paymentId);
-      if (tr === "conflict") return { kind: "closed", order: latest };
-      return processing(latest, "payment_reject_transition_failed", true);
+    if (created.kind === "refused") {
+      // THIS request was refused. It does not show that no payment exists
+      // under the id (an earlier or concurrent create may have made one, or
+      // may still), so the reservation stays and the order is flagged.
+      const reason = `payment_create_rejected_${created.status}${created.code ? `_${created.code}` : ""}`;
+      await flagForReconciliation(current.id, reason);
+      return { kind: "refused", order: current, reason };
     }
 
     // Uncertain: the payment may exist. Keep the reservation, record it, and

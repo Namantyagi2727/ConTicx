@@ -154,26 +154,30 @@ export async function retrievePayment(
 // Provider contract this relies on (see docs/testing.md for sources):
 //   - documented: the create request accepts a merchant-provided
 //     `payment_id` (30 characters in the v1 reference) which "ensures
-//     idempotency for the payment creation request";
+//     idempotency for the payment creation request"; error code HE_01 is
+//     documented as type `duplicate_request` (HTTP 400 or 422);
 //   - observed in the upstream implementation, not documented: a create
-//     whose payment_id already exists is rejected with HTTP 400, error code
-//     HE_01 ("The payment with the specified payment_id already exists in
-//     our records") and does NOT return the existing payment, so the caller
-//     must retrieve it by id.
-// Classification:
+//     whose payment_id already exists gets HE_01 and does NOT return the
+//     existing payment, so the caller must retrieve it by id.
+//   - NOT documented anywhere: that an error response means no payment was
+//     created. The error-code reference lists codes, statuses, and types
+//     only.
+// Classification (none of these is evidence that no payment exists):
 //   created    2xx whose body names the requested payment_id and carries a
 //              client_secret.
-//   duplicate  400 with error code HE_01: a payment with this id exists.
-//   rejected   any other 4xx except 408/425/429 — a definitive refusal of
-//              the request (treated as: no payment was created).
-//   uncertain  network error, timeout, 5xx, 408/425/429, or a 2xx we cannot
-//              interpret — the payment may or may not exist.
+//   duplicate  error code HE_01 (documented duplicate_request): a payment
+//              with this id exists; retrieve it.
+//   refused    any other 4xx except 408/425/429. THIS request was refused;
+//              it says nothing about an earlier or concurrent request under
+//              the same id, so it never justifies releasing inventory.
+//   uncertain  network error, timeout, 5xx, 408/425/429, or a response we
+//              cannot interpret — the payment may or may not exist.
 // ---------------------------------------------------------------------------
 
 export type CreatePaymentResult =
   | { kind: "created"; payment: ProviderPayment & { client_secret: string } }
   | { kind: "duplicate" }
-  | { kind: "rejected"; status: number }
+  | { kind: "refused"; status: number; code: string | null }
   | { kind: "uncertain"; reason: string };
 
 const RETRYABLE_4XX = new Set([408, 425, 429]);
@@ -231,10 +235,13 @@ export async function createPayment(request: {
     return { kind: "uncertain", reason: "unrecognised_success" };
   }
 
-  const errorCode = (body.error as { code?: unknown } | undefined)?.code;
-  if (response.status === 400 && errorCode === "HE_01") return { kind: "duplicate" };
+  const rawCode = (body.error as { code?: unknown } | undefined)?.code;
+  const errorCode = typeof rawCode === "string" && /^[A-Z]{2}_\d{2}$/.test(rawCode) ? rawCode : null;
+  if ((response.status === 400 || response.status === 422) && errorCode === "HE_01") {
+    return { kind: "duplicate" };
+  }
   if (response.status >= 400 && response.status < 500 && !RETRYABLE_4XX.has(response.status)) {
-    return { kind: "rejected", status: response.status };
+    return { kind: "refused", status: response.status, code: errorCode };
   }
   return { kind: "uncertain", reason: `http_${response.status}` };
 }
