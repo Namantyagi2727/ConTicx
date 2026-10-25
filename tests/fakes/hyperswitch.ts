@@ -84,6 +84,16 @@ export class FakeHyperswitch {
   readonly getDelayMsFor = new Map<string, number>();
   private cancelSeen = false;
 
+  // Phase 1B.5 create-path knobs. The payment is STORED before any of these
+  // shape the response, modelling a provider that processed the request:
+  //   createResponseDelayMs    respond late (drive the client timeout: the
+  //                            payment exists but the caller never hears)
+  //   createFailsAfterInsert   respond 500 although the payment was created
+  //   createRejection          refuse definitively BEFORE storing anything
+  createResponseDelayMs = 0;
+  createFailsAfterInsert = false;
+  createRejection: { status: number; body: unknown } | null = null;
+
   // `port` 0 binds an ephemeral port (used by the fake's own unit
   // self-test); the integration setup passes the fixed loopback port
   // that vitest's test.env already told the app to call.
@@ -122,6 +132,14 @@ export class FakeHyperswitch {
     this.cancelDelayMs = 0;
     this.getDelayMsFor.clear();
     this.cancelSeen = false;
+    this.createResponseDelayMs = 0;
+    this.createFailsAfterInsert = false;
+    this.createRejection = null;
+  }
+
+  // Create requests the fake received (accepted or not).
+  createCalls(): RecordedCall[] {
+    return this.calls.filter((c) => c.method === "POST" && c.path === "/payments");
   }
 
   getPayment(id: string): StoredPayment | undefined {
@@ -175,9 +193,37 @@ export class FakeHyperswitch {
     }
 
     // POST /payments
+    //
+    // A caller-chosen `payment_id` is honoured (documented: it "ensures
+    // idempotency for the payment creation request"). A create whose id
+    // already exists is rejected with 400 / code HE_01 and does NOT return
+    // the existing payment — this mirrors the upstream implementation
+    // (ApiErrorResponse::DuplicatePayment), which the documentation does not
+    // spell out. The check-and-store below runs synchronously after the body
+    // is read, so concurrent creates under one id store exactly one payment,
+    // like the provider's unique constraint. None of this establishes parity
+    // with the hosted provider.
     if (method === "POST" && path === "/payments") {
-      const input = (body ?? {}) as { amount?: number; currency?: string; metadata?: Record<string, unknown> };
-      const id = `pay_${++this.seq}_${randomUUID().slice(0, 8)}`;
+      const input = (body ?? {}) as {
+        payment_id?: unknown;
+        amount?: number;
+        currency?: string;
+        metadata?: Record<string, unknown>;
+      };
+      if (this.createRejection) {
+        return json(res, this.createRejection.status, this.createRejection.body);
+      }
+      const requested = typeof input.payment_id === "string" ? input.payment_id : null;
+      if (requested && this.payments.has(requested)) {
+        return json(res, 400, {
+          error: {
+            type: "invalid_request",
+            code: "HE_01",
+            message: "The payment with the specified payment_id already exists in our records",
+          },
+        });
+      }
+      const id = requested ?? `pay_${++this.seq}_${randomUUID().slice(0, 8)}`;
       const payment: StoredPayment = {
         payment_id: id,
         client_secret: `${id}_secret_${randomUUID().slice(0, 12)}`,
@@ -187,6 +233,12 @@ export class FakeHyperswitch {
         metadata: input.metadata ?? null,
       };
       this.payments.set(id, payment);
+      if (this.createResponseDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.createResponseDelayMs));
+      }
+      if (this.createFailsAfterInsert) {
+        return json(res, 500, { error: { message: "provider error after create" } });
+      }
       return json(res, 200, payment);
     }
 

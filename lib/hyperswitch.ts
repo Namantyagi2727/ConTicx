@@ -2,6 +2,8 @@
 // HYPERSWITCH_API_KEY has no NEXT_PUBLIC_ prefix, so Next.js only ever
 // makes it available here — it's never bundled into client-side JS.
 
+import { randomInt } from "node:crypto";
+
 const BASE_URL = process.env.HYPERSWITCH_BASE_URL;
 const API_KEY = process.env.HYPERSWITCH_API_KEY;
 
@@ -74,6 +76,9 @@ export interface ProviderPayment {
   metadata: Record<string, unknown> | null;
   merchant_id?: string;
   profile_id?: string;
+  // Present on create and retrieve responses (documented for retrieve). Only
+  // ever forwarded to the order's owner during checkout; never logged.
+  client_secret?: string;
 }
 
 // A deliberately small, stable set of failure categories. The webhook
@@ -138,6 +143,108 @@ export async function retrievePayment(
       metadata: (p.metadata as Record<string, unknown> | null) ?? null,
       merchant_id: typeof p.merchant_id === "string" ? p.merchant_id : undefined,
       profile_id: typeof p.profile_id === "string" ? p.profile_id : undefined,
+      client_secret: typeof p.client_secret === "string" ? p.client_secret : undefined,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Payment creation under a caller-chosen payment_id (Phase 1B.5).
+//
+// Provider contract this relies on (see docs/testing.md for sources):
+//   - documented: the create request accepts a merchant-provided
+//     `payment_id` (30 characters in the v1 reference) which "ensures
+//     idempotency for the payment creation request";
+//   - observed in the upstream implementation, not documented: a create
+//     whose payment_id already exists is rejected with HTTP 400, error code
+//     HE_01 ("The payment with the specified payment_id already exists in
+//     our records") and does NOT return the existing payment, so the caller
+//     must retrieve it by id.
+// Classification:
+//   created    2xx whose body names the requested payment_id and carries a
+//              client_secret.
+//   duplicate  400 with error code HE_01: a payment with this id exists.
+//   rejected   any other 4xx except 408/425/429 — a definitive refusal of
+//              the request (treated as: no payment was created).
+//   uncertain  network error, timeout, 5xx, 408/425/429, or a 2xx we cannot
+//              interpret — the payment may or may not exist.
+// ---------------------------------------------------------------------------
+
+export type CreatePaymentResult =
+  | { kind: "created"; payment: ProviderPayment & { client_secret: string } }
+  | { kind: "duplicate" }
+  | { kind: "rejected"; status: number }
+  | { kind: "uncertain"; reason: string };
+
+const RETRYABLE_4XX = new Set([408, 425, 429]);
+
+export async function createPayment(request: {
+  paymentId: string;
+  amount: number;
+  currency: string;
+  metadata: Record<string, string>;
+}): Promise<CreatePaymentResult> {
+  let response: Response;
+  try {
+    response = await hyperswitchFetch("/payments", {
+      method: "POST",
+      body: JSON.stringify({
+        payment_id: request.paymentId,
+        amount: request.amount,
+        currency: request.currency,
+        confirm: false,
+        metadata: request.metadata,
+      }),
+    });
+  } catch {
+    return { kind: "uncertain", reason: "transport" };
+  }
+
+  let data: unknown = null;
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
+  }
+  const body = (data ?? {}) as Record<string, unknown>;
+
+  if (response.ok) {
+    if (
+      body.payment_id === request.paymentId &&
+      typeof body.client_secret === "string" &&
+      typeof body.status === "string" &&
+      typeof body.amount === "number" &&
+      typeof body.currency === "string"
+    ) {
+      return {
+        kind: "created",
+        payment: {
+          payment_id: body.payment_id,
+          status: body.status,
+          amount: body.amount,
+          currency: body.currency,
+          metadata: (body.metadata as Record<string, unknown> | null) ?? null,
+          client_secret: body.client_secret,
+        },
+      };
+    }
+    return { kind: "uncertain", reason: "unrecognised_success" };
+  }
+
+  const errorCode = (body.error as { code?: unknown } | undefined)?.code;
+  if (response.status === 400 && errorCode === "HE_01") return { kind: "duplicate" };
+  if (response.status >= 400 && response.status < 500 && !RETRYABLE_4XX.has(response.status)) {
+    return { kind: "rejected", status: response.status };
+  }
+  return { kind: "uncertain", reason: `http_${response.status}` };
+}
+
+// A fresh provider payment_id in the documented 30-character shape:
+// "pay_" + 26 uniformly random characters from [a-z0-9] (26 × log2 36 ≈ 134
+// bits), drawn with crypto.randomInt so there is no modulo bias.
+export function newPaymentRequestId(): string {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let id = "pay_";
+  for (let i = 0; i < 26; i++) id += alphabet[randomInt(alphabet.length)];
+  return id;
 }
