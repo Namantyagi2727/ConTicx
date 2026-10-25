@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useState, type FormEvent } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { loadHyper } from "@juspay-tech/hyper-js";
@@ -47,6 +47,35 @@ interface OrderCreateResponse {
   amountCents: number;
 }
 
+// Establishes the guest session FIRST, so the booking request already carries
+// the cookie that will own the order (see /api/guest-session), then creates
+// the inventory hold + Hyperswitch payment.
+async function createBooking(
+  eventId: string,
+  tierName: string,
+  quantity: number
+): Promise<OrderCreateResponse> {
+  const sessionOk = await ensureGuestSession();
+  if (!sessionOk) {
+    throw new Error(
+      "We couldn't start a secure session in this browser — check that cookies are allowed"
+    );
+  }
+  const res = await fetch("/api/orders", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ eventId, tierName, quantity }),
+  });
+  const data = await res.json();
+  if (res.status === 401) {
+    throw new Error(
+      "Your browser session wasn't available — check that cookies are allowed, then try again"
+    );
+  }
+  if (!res.ok) throw new Error(data.error ?? "Could not reserve tickets");
+  return data;
+}
+
 function CheckoutContent() {
   const searchParams = useSearchParams();
   const eventId = searchParams.get("eventId");
@@ -60,34 +89,39 @@ function CheckoutContent() {
   const [error, setError] = useState<string | null>(null);
   const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
 
+  // One booking per checkout attempt (this mounted page, for these exact
+  // event/tier/quantity values). React Strict Mode runs the effect below
+  // setup → cleanup → setup on the SAME component instance, and refs survive
+  // that cycle, so the second setup finds the first setup's in-flight booking
+  // here and subscribes to it instead of POSTing again. A new checkout visit
+  // mounts a new instance (empty ref) and books anew; different parameters
+  // change the key and book anew.
+  const bookingRef = useRef<{ key: string; promise: Promise<OrderCreateResponse> } | null>(null);
+
   // Create the inventory hold + Hyperswitch payment as soon as we land here.
-  // The guest session is established FIRST, so the booking request already
-  // carries the cookie that will own the order (see /api/guest-session).
   useEffect(() => {
     if (!event || !tier || !quantity) return;
 
-    ensureGuestSession()
-      .then(async (ok) => {
-        if (!ok) {
-          throw new Error(
-            "We couldn't start a secure session in this browser — check that cookies are allowed"
-          );
-        }
-        const res = await fetch("/api/orders", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ eventId: event.id, tierName: tier.name, quantity }),
-        });
-        const data = await res.json();
-        if (res.status === 401) {
-          throw new Error(
-            "Your browser session wasn't available — check that cookies are allowed, then try again"
-          );
-        }
-        if (!res.ok) throw new Error(data.error ?? "Could not reserve tickets");
-        setOrder(data);
-      })
-      .catch((err) => setError(err.message));
+    const key = `${event.id}|${tier.name}|${quantity}`;
+    if (bookingRef.current?.key !== key) {
+      bookingRef.current = { key, promise: createBooking(event.id, tier.name, quantity) };
+    }
+
+    // Cleanup only silences THIS setup's subscription; it never discards the
+    // booking itself, so the setup that survives Strict Mode's remount still
+    // receives the result (or the error). After a real unmount nothing is set.
+    let active = true;
+    bookingRef.current.promise.then(
+      (data) => {
+        if (active) setOrder(data);
+      },
+      (err: unknown) => {
+        if (active) setError(err instanceof Error ? err.message : "Could not reserve tickets");
+      }
+    );
+    return () => {
+      active = false;
+    };
     // event/tier are derived from the same query params on every render,
     // so keying off the primitives avoids re-firing on object identity changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
