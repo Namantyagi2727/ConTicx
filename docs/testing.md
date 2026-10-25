@@ -525,13 +525,40 @@ Hyperswitch's actual `confirmPayment` results, its real redirect and
 wallet return behavior, or cookie behavior on a deployed https origin.
 Those remain unverified.
 
-Observed while running it: in `next dev`, React Strict Mode runs
-checkout's booking effect twice, so each checkout visit created **two**
-owned orders (one session request, shared; two `POST /api/orders`), and
-the extra pending order appears in My Tickets until its hold expires.
-This predates Phase 1B.4 (the booking effect is unchanged); production
-builds do not double-run effects, but that has not been confirmed in a
-browser here.
+**Strict Mode double booking (found by the harness, fixed).** In `next
+dev`, React Strict Mode runs effects setup → cleanup → setup on the same
+component. Checkout's booking effect had no cleanup and no reuse, so each
+visit sent `POST /api/orders` twice — two holds, two provider payments,
+two owned orders, the extra one left pending in My Tickets. Checkout now
+keeps the booking promise in a ref keyed by the checkout attempt (event,
+tier, quantity): the second setup subscribes to the in-flight booking
+instead of posting again, and cleanup only silences that setup's
+subscription, so the surviving setup still renders the result. A new
+visit (new mount) or different parameters still book. Strict Mode stays
+on.
+
+- `checkout-strict-mode.regression.test.tsx` renders the real
+  `CheckoutPage` under `<StrictMode>` with react-dom in jsdom (the only
+  added dev dependency, pinned), the widget stubs above, and the page's
+  same-origin `fetch` routed in-process to the real `/api/guest-session`
+  and `/api/orders` handlers with a browser-like cookie jar and Origin
+  header. It asserts one session, one booking request, one provider
+  payment, one order and one inventory decrement; that the surviving
+  component renders the widget with that booking's client secret and
+  return URL; that a deliberate second visit books again under the same
+  guest; that a booking error is shown from one request; and that
+  unmounting mid-flight neither double-books nor logs errors. All four
+  failed against the old effect. Mutations that discard the booking in
+  cleanup, or skip the second setup without subscribing (a stuck page),
+  each fail it.
+- Re-run in the harness from a flushed test Redis: one session request
+  and one `POST /api/orders` per visit, one provider payment, the GA
+  counter down by exactly one; after paying, My Tickets listed only that
+  order and no pending hold remained.
+
+This prevents the client from duplicating a booking inside one checkout
+attempt. It is **not** server-side idempotency for payment creation — see
+the limitation below.
 
 **Limitations.**
 
@@ -550,6 +577,14 @@ browser here.
   cookie behavior behind the production proxy have not been checked
   against the sandbox or a deployment.
 - **No rate limiting** on session creation or status polling.
+- **No server-side idempotency for order and payment creation.** Each
+  `POST /api/orders` mints a new order id, reserves seats, and creates a
+  provider payment (with no provider idempotency key). A page reload or a
+  second tab on checkout, two concurrent requests, or a client retry after
+  an ambiguous network failure (request sent, response lost) each create
+  another order and payment; the extra ones hold seats until their holds
+  expire. The Strict Mode fix above covers only React re-running one
+  mounted page's effect.
 
 ## Known-defect characterization tests
 

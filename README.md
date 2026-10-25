@@ -257,6 +257,12 @@ There are no accounts. Instead each browser gets a **guest session**
   from this browser. Each page shares a single session request, and a
   browser that already has a valid session is never re-issued one, so
   this needs two first-ever tabs racing.
+- **One booking per checkout visit, not per purchase intent.** Checkout
+  reuses its in-flight booking across React Strict Mode's effect re-run,
+  so a single visit makes one order. Order and payment creation are not
+  idempotent on the server, though: reloading checkout, opening it in a
+  second tab, or retrying after a lost response creates another order and
+  provider payment, whose hold lapses if it is never paid.
 
 Browser mutations (`POST /api/guest-session`, `POST /api/orders`) are
 accepted only when the `Origin` header exactly matches `APP_ORIGIN`. A
