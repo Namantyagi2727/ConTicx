@@ -317,6 +317,42 @@ describe("[regression] ownership is bound inside the atomic reservation", () => 
     expect(await r.exists(INV_KEY)).toBe(0);
   });
 
+  // Lua does not roll back writes that ran before a failing command. If the
+  // owner index were not type-checked up front, the final ZADD on a
+  // wrong-type key would fail AFTER the counter seed, decrement, order write,
+  // and hold write had landed — a reserved seat with no indexed owner.
+  it("refuses a wrong-type owner index before any write, on a new tier", async () => {
+    const order = makeOrder();
+    const indexKey = `guest_orders:${order.ownerHash}`;
+    await r.set(indexKey, "not-a-zset");
+    const before = await snapshot();
+
+    expect(await reserveAndCreateOrder(order, 10)).toBe("error");
+
+    expect(await snapshot()).toBe(before);
+    expect(await r.exists(INV_KEY, `inventory_init:${EVENT_ID}:${TIER}`, `order:${order.id}`)).toBe(0);
+    expect(await r.zscore("pending_holds", order.id)).toBeNull();
+    expect(await r.type(indexKey)).toBe("string");
+    expect(await r.get(indexKey)).toBe("not-a-zset");
+  });
+
+  it("refuses a wrong-type owner index before any write, on an initialized tier", async () => {
+    // Seed the tier through a valid booking by someone else first.
+    expect(await reserveAndCreateOrder(makeOrder(), 10)).toBe("created");
+    const order = makeOrder();
+    await r.hset(`guest_orders:${order.ownerHash}`, { unexpected: "hash" });
+    const before = await snapshot();
+    const inventory = await r.get(INV_KEY);
+
+    expect(await reserveAndCreateOrder(order, 10)).toBe("error");
+
+    expect(await snapshot()).toBe(before);
+    expect(await r.get(INV_KEY)).toEqual(inventory);
+    expect(await r.exists(`order:${order.id}`)).toBe(0);
+    expect(await r.zscore("pending_holds", order.id)).toBeNull();
+    expect(await r.hgetall(`guest_orders:${order.ownerHash}`)).toEqual({ unexpected: "hash" });
+  });
+
   it("indexes the order under its owner in the same step", async () => {
     const order = makeOrder();
     await reserveAndCreateOrder(order, 10);
