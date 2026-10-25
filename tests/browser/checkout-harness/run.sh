@@ -5,6 +5,8 @@
 # Hyperswitch network traffic.
 #
 #   tests/browser/checkout-harness/run.sh [APP_ORIGIN]   (default http://127.0.0.1:3000)
+#   HARNESS_REF=<commit> exports that commit instead of HEAD (for example
+#   "$(git stash create)" to include uncommitted tracked changes).
 #
 # Prerequisites: the test Redis is up (docker compose -f docker-compose.test.yml
 # up -d --wait), ports 3000 and 38171-38172 are free. It uses that test Redis
@@ -20,7 +22,7 @@ ROOT="$(git rev-parse --show-toplevel)"
 WORK="${HARNESS_DIR:-$(mktemp -d)}"
 echo "harness export: $WORK"
 
-git -C "$ROOT" archive HEAD | tar -x -C "$WORK"
+git -C "$ROOT" archive "${HARNESS_REF:-HEAD}" | tar -x -C "$WORK"
 cp "$WORK/tests/browser/checkout-harness/next.config.harness.ts" "$WORK/next.config.ts"
 (cd "$WORK" && npm ci --no-audit --no-fund >/dev/null)
 
