@@ -1,4 +1,6 @@
 import { retrievePayment } from "@/lib/hyperswitch";
+import { errorKind, runLogged, type RequestLog } from "@/lib/log";
+import { bookingEnabled, browseOnlyResponse } from "@/lib/app-mode";
 import { peekOrder, reconcileRetrievedPayment } from "@/lib/store";
 import { isValidPaymentId } from "@/lib/webhook-security";
 import {
@@ -29,16 +31,27 @@ export async function GET(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  return runLogged("order.status", request, (log) => handle(request, params, log));
+}
+
+async function handle(
+  request: Request,
+  params: Promise<{ id: string }>,
+  log: RequestLog
+): Promise<Response> {
+  if (!bookingEnabled()) return browseOnlyResponse();
   const { id } = await params;
   const lookup = await loadOwnedOrder(request, id);
   if (lookup.kind === "no_session") return sessionRequired();
   if (lookup.kind === "not_found") return orderNotFound();
+  // Only an order this caller owns is named in the log.
+  log.set({ orderId: lookup.order.id });
 
   let order = lookup.order;
   if (order.paymentId && !isValidPaymentId(order.paymentId)) {
     // A stored id that is not a well-formed provider id is never put into a
     // provider URL. Nothing to refresh; report the order as stored.
-    console.warn(`[orders] status refresh skipped for order ${order.id}: malformed payment id`);
+    log.set({ reason: "malformed_payment_id" });
   } else if (order.paymentId) {
     const paymentId = order.paymentId;
     // Best effort: a provider or Redis hiccup leaves the stored status as it
@@ -50,12 +63,10 @@ export async function GET(
         order = (await peekOrder(order.id)) ?? order;
       }
     } catch (err) {
-      console.error(
-        `[orders] status refresh failed for order ${order.id}:`,
-        err instanceof Error ? err.message : "unknown"
-      );
+      log.set({ reason: "refresh_failed", errorKind: errorKind(err) });
     }
   }
 
+  log.set({ outcome: order.status });
   return jsonNoStore(toOrderView(order));
 }

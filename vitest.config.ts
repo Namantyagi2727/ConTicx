@@ -26,6 +26,9 @@ const testEnv = {
   NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY: TEST_HYPERSWITCH_PUBLISHABLE_KEY,
   HYPERSWITCH_WEBHOOK_SECRET: TEST_HYPERSWITCH_WEBHOOK_SECRET,
   APP_ORIGIN: TEST_APP_ORIGIN,
+  // The suite exercises the full booking flow; browse-only mode is tested
+  // by switching this per test.
+  CONTICX_MODE: "full",
 };
 
 export default defineConfig({

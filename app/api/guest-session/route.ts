@@ -1,4 +1,6 @@
 import { checkRequestOrigin } from "@/lib/app-origin";
+import { errorKind, logEvent } from "@/lib/log";
+import { bookingEnabled, browseOnlyResponse } from "@/lib/app-mode";
 import { establishGuestSession } from "@/lib/guest-session";
 import { jsonNoStore, originRejected } from "@/lib/order-access";
 
@@ -12,6 +14,7 @@ import { jsonNoStore, originRejected } from "@/lib/order-access";
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
+  if (!bookingEnabled()) return browseOnlyResponse();
   const origin = checkRequestOrigin(request);
   if (!origin.ok) return originRejected(origin);
 
@@ -19,10 +22,7 @@ export async function POST(request: Request) {
     const session = await establishGuestSession(request);
     return jsonNoStore({ ok: true }, 200, { "Set-Cookie": session.setCookie });
   } catch (err) {
-    console.error(
-      "[guest-session] could not establish session:",
-      err instanceof Error ? err.message : "unknown"
-    );
+    logEvent("error", "guest_session.create_failed", { errorKind: errorKind(err) });
     return jsonNoStore({ error: "Could not start a session" }, 503);
   }
 }

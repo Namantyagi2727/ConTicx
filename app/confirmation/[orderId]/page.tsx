@@ -5,7 +5,7 @@ import { useParams } from "next/navigation";
 import Link from "next/link";
 import { Ticket } from "@/components/Ticket";
 import { getEvent } from "@/lib/events";
-import { SAME_BROWSER_NOTE } from "@/lib/guest-client";
+import { BROWSE_ONLY_NOTE, SAME_BROWSER_NOTE } from "@/lib/guest-client";
 import type { OrderView } from "@/lib/types";
 
 // Where checkout — and every provider redirect (3DS, wallets) — returns. The
@@ -20,6 +20,7 @@ type Lookup =
   | { kind: "found"; order: OrderView; polling: boolean }
   | { kind: "no_session" }
   | { kind: "not_found" }
+  | { kind: "browse_only" }
   | { kind: "error" };
 
 const POLL_INTERVAL_MS = 2000;
@@ -52,6 +53,10 @@ function ConfirmationContent({ orderId }: { orderId: string }) {
 
         if (res.status === 401) return setLookup({ kind: "no_session" });
         if (res.status === 404) return setLookup({ kind: "not_found" });
+        if (res.status === 503) {
+          const body = (await res.json().catch(() => null)) as { code?: unknown } | null;
+          if (body?.code === "browse_only") return setLookup({ kind: "browse_only" });
+        }
         if (!res.ok) return setLookup({ kind: "error" });
 
         const order: OrderView = await res.json();
@@ -92,6 +97,15 @@ function ConfirmationContent({ orderId }: { orderId: string }) {
       <StatusLine title="This order isn't available">
         There&apos;s no order with that link in this browser. If you bought
         tickets here, you&apos;ll find them under My Tickets.
+        <BackLinks />
+      </StatusLine>
+    );
+  }
+
+  if (lookup.kind === "browse_only") {
+    return (
+      <StatusLine title="Tickets are off in this demo">
+        {BROWSE_ONLY_NOTE}
         <BackLinks />
       </StatusLine>
     );

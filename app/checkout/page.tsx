@@ -12,7 +12,7 @@ import {
 } from "@juspay-tech/react-hyper-js";
 import { getEvent } from "@/lib/events";
 import { formatCents } from "@/lib/format";
-import { ensureGuestSession, newBookingAttemptId } from "@/lib/guest-client";
+import { BROWSE_ONLY_NOTE, ensureGuestSession, newBookingAttemptId } from "@/lib/guest-client";
 
 // Load Hyper once, outside the component, so it isn't recreated on every render.
 // Guarded to the browser only — loadHyper touches `document`, which
@@ -53,7 +53,8 @@ type BookingResult =
   | { kind: "pending"; orderId?: string; holdExpiresAt?: number; refused?: boolean }
   | { kind: "conflict"; message: string }
   | { kind: "closed"; orderId: string; orderStatus: string }
-  | { kind: "error"; message: string };
+  | { kind: "error"; message: string }
+  | { kind: "browse_only" };
 
 const ATTEMPT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const BOOKING_RETRY_MS = 2000;
@@ -75,8 +76,9 @@ async function createBooking(
   tierName: string,
   quantity: number
 ): Promise<BookingResult> {
-  const sessionOk = await ensureGuestSession();
-  if (!sessionOk) {
+  const session = await ensureGuestSession();
+  if (session === "browse_only") return { kind: "browse_only" };
+  if (session !== "ok") {
     return {
       kind: "error",
       message: "We couldn't start a secure session in this browser — check that cookies are allowed",
@@ -107,6 +109,8 @@ async function createBooking(
       };
     }
     switch (data.code) {
+      case "browse_only":
+        return { kind: "browse_only" };
       case "ready":
         return { kind: "ready", order: data as unknown as OrderCreateResponse };
       case "processing":
@@ -252,6 +256,17 @@ function CheckoutContent() {
       Start a new booking for {event.name}
     </Link>
   );
+
+  if (result?.kind === "browse_only") {
+    return (
+      <StatusCard title="Booking is off in this demo" tone="muted">
+        {BROWSE_ONLY_NOTE}
+        <Link href={`/events/${event.id}`} className="mt-4 block underline underline-offset-4">
+          Back to {event.name}
+        </Link>
+      </StatusCard>
+    );
+  }
 
   if (result?.kind === "error") {
     return (

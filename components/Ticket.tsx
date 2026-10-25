@@ -4,10 +4,26 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import QRCode from "qrcode";
 import { getEvent } from "@/lib/events";
-import { formatCents, formatDateStamp, formatTime } from "@/lib/format";
+import { buildEventIcs, icsFileName } from "@/lib/calendar";
+import { formatCents, formatDateStamp, formatDoorsTime, formatTime } from "@/lib/format";
 import { SAME_BROWSER_NOTE } from "@/lib/guest-client";
 import { posterColorClasses } from "@/lib/theme";
-import type { OrderView } from "@/lib/types";
+import type { EventRecord, OrderView } from "@/lib/types";
+
+// Builds the .ics in the browser from the event catalog and this already
+// authorized ticket (tier and quantity only) and hands it to the browser as
+// a download. Nothing is sent anywhere.
+function downloadCalendarFile(event: EventRecord, order: OrderView) {
+  const blob = new Blob([buildEventIcs(event, order)], { type: "text/calendar;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = icsFileName(event);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
 
 // The printed e-ticket for one of the guest's own orders. Display only:
 // online cancellation and refunds are disabled until the refund phase adds
@@ -59,6 +75,7 @@ export function Ticket({ order }: { order: OrderView }) {
               {stamp && (
                 <p className="mt-3 font-mono text-[11px] font-bold tracking-wide text-paper-ink/70">
                   {stamp.weekday} {stamp.month} {stamp.day} · DOORS{" "}
+                  {formatDoorsTime(event.date, event.doorsMinutesBeforeShow)} · SHOW{" "}
                   {formatTime(event.date)} · {event.venue.toUpperCase()}
                 </p>
               )}
@@ -129,6 +146,15 @@ export function Ticket({ order }: { order: OrderView }) {
       </div>
 
       <div className="mt-6 text-center">
+        {event && !refunded && (
+          <button
+            type="button"
+            onClick={() => downloadCalendarFile(event, order)}
+            className="mb-4 inline-flex items-center gap-2 border border-ink-line px-4 py-2 font-mono text-xs font-bold tracking-wide text-text transition-colors hover:border-flame hover:text-flame"
+          >
+            ADD TO CALENDAR (.ics)
+          </button>
+        )}
         {!refunded && (
           <p className="font-body text-xs text-text-faint">
             Online cancellation and refunds aren&apos;t available yet.

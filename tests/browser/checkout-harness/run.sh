@@ -37,5 +37,6 @@ env -i PATH="$PATH" HOME="$HOME" \
   NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY=pk_snd_harness_fake_key \
   HYPERSWITCH_WEBHOOK_SECRET=whsec_harness_fake \
   APP_ORIGIN="$APP_ORIGIN_VALUE" \
+  CONTICX_MODE=full \
   NEXT_TELEMETRY_DISABLED=1 \
   npx next dev -p 3000
