@@ -11,10 +11,12 @@ import { createOwnedOrder, guestRequest } from "../helpers/guest";
 // now through the order-scoped GET /api/orders/[id]/status (Phase 1B.4)
 // instead of the retired public GET /api/payments/[id]. The provider payment
 // id comes from the OWNED stored order, never from the client, so a retryable
-// failed payment is retained, a payment whose metadata merely names the order
-// cannot bind to it, and nothing is refreshed for an order that is no longer
-// pending. Authorization of the caller is covered in
-// guest-authorization.regression.test.ts.
+// failed payment is retained and a payment whose metadata merely names the
+// order cannot bind to it. As with the old route, an already-terminal owned
+// order is still reconciled: its state and inventory stay put and a
+// conflicting authoritative outcome is recorded. Authorization of the caller
+// (an unauthorized poll makes no provider call and changes nothing) is
+// covered in guest-authorization.regression.test.ts.
 
 const EVENT_ID = "midnight-parade";
 const TIER = "VIP";
@@ -110,19 +112,53 @@ describe("[regression] order status refresh uses the shared reconciliation polic
     expect(await statusOf(orderId)).toBe("pending");
   });
 
-  it("does not refresh an order that is no longer pending (no provider call)", async () => {
+  it("records, rather than overwrites, a success conflicting with an owned terminal order", async () => {
     const { orderId, paymentId, cookie } = await createOwnedOrder();
     await updateOrderStatus(orderId, "expired"); // already released locally
     const afterRelease = await counter();
-    getFake().getPayment(paymentId)!.status = "succeeded"; // late evidence
-    const reads0 = paymentReads().length;
+    getFake().getPayment(paymentId)!.status = "succeeded"; // late, authoritative
+    const reads0 = paymentReads();
 
     const res = await poll(orderId, cookie);
 
+    // The provider WAS consulted, with the order's own payment id ...
+    expect(paymentReads().slice(reads0.length)).toEqual([`/payments/${paymentId}`]);
+    // ... but the terminal state and inventory are untouched (no ticket) ...
     expect((await res.json()).status).toBe("expired");
-    expect(paymentReads().length).toBe(reads0);
     expect(await statusOf(orderId)).toBe("expired");
     expect(await counter()).toBe(afterRelease);
+    // ... and the conflict is recorded through the shared policy.
+    expect((await getReconciliationFlag(orderId))?.reason).toBe(
+      "conflict_succeeded_over_expired"
+    );
+    expect(await r.zscore("reconcile_needed", orderId)).not.toBeNull();
+  });
+
+  it("re-polling a settled owned order keeps it settled without a second effect", async () => {
+    const { orderId, paymentId, cookie } = await createOwnedOrder();
+    getFake().getPayment(paymentId)!.status = "succeeded";
+    await poll(orderId, cookie);
+    const afterPaid = await counter();
+
+    await poll(orderId, cookie);
+
+    expect(await statusOf(orderId)).toBe("succeeded");
+    expect(await counter()).toBe(afterPaid);
+    expect(await getReconciliationFlag(orderId)).toBeNull();
+  });
+
+  it("never puts a malformed stored payment id into a provider path", async () => {
+    const { orderId, cookie } = await createOwnedOrder();
+    const stored = (await r.get<Order>(`order:${orderId}`))!;
+    stored.paymentId = "../refunds?x=1";
+    await r.set(`order:${orderId}`, stored);
+    const calls = getFake().calls.length;
+
+    const res = await poll(orderId, cookie);
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("pending");
+    expect(getFake().calls.length).toBe(calls);
   });
 
   it("returns the stored view, without provider detail, when the provider fails", async () => {

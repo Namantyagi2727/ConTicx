@@ -1,5 +1,6 @@
 import { retrievePayment } from "@/lib/hyperswitch";
 import { peekOrder, reconcileRetrievedPayment } from "@/lib/store";
+import { isValidPaymentId } from "@/lib/webhook-security";
 import {
   jsonNoStore,
   loadOwnedOrder,
@@ -12,12 +13,16 @@ import {
 // public GET /api/payments/[id], which let anyone who knew a provider payment
 // id read it and trigger reconciliation.
 //
-// Ownership is verified FIRST. Only then, and only for a still-pending order
-// that has an attached payment, is the provider read — using the payment id
-// stored on the owned order, never one supplied by the client — and the
-// result reconciled through the shared policy (same binding and outcomes as
-// the webhook and expiry). The response is the order's allow-listed view
-// after that refresh; provider bodies are never returned.
+// Ownership is verified FIRST. Only then, for an owned order with an attached
+// payment, is the provider read — using the payment id stored on the owned
+// order (shape-checked with the same rule as webhook payment ids), never one
+// supplied by the client — and the result reconciled through the shared
+// policy, exactly as the old payment-status route did for every lookup:
+// a pending order may resolve, and an already-terminal order is left as it
+// is while a conflicting authoritative outcome is recorded for
+// reconciliation. Authorization changed WHO can trigger this, not what it
+// does. The response is the order's allow-listed view after the refresh;
+// provider bodies are never returned.
 export const dynamic = "force-dynamic";
 
 export async function GET(
@@ -30,7 +35,11 @@ export async function GET(
   if (lookup.kind === "not_found") return orderNotFound();
 
   let order = lookup.order;
-  if (order.status === "pending" && order.paymentId) {
+  if (order.paymentId && !isValidPaymentId(order.paymentId)) {
+    // A stored id that is not a well-formed provider id is never put into a
+    // provider URL. Nothing to refresh; report the order as stored.
+    console.warn(`[orders] status refresh skipped for order ${order.id}: malformed payment id`);
+  } else if (order.paymentId) {
     const paymentId = order.paymentId;
     // Best effort: a provider or Redis hiccup leaves the stored status as it
     // is, and the page simply polls again.
