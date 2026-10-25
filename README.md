@@ -17,13 +17,12 @@ listed below.
 
 There are two ways to see it.
 
-**1. Public demo — browse-only.** The deployed site runs with booking
-switched off: the home and event pages work, and every booking, order,
-ticket, and webhook route refuses with `503 browse_only` *on the server*
-before touching Redis or Hyperswitch. Browsing cannot reserve seats, run hold
-expiry, or call the payment provider, and the deployment needs no
-credentials. (The currently hosted build predates this release; replacing it
-is a pending, separately approved step — see [Release status](#release-status).)
+**1. Public demo — browse-only: <https://conticx.vercel.app>.** The site
+runs with booking switched off: the home and event pages work, and every
+booking, order, ticket, and webhook route refuses with `503 browse_only`
+*on the server* before touching Redis or Hyperswitch. Browsing cannot
+reserve seats, run hold expiry, or call the payment provider. It serves the
+`v0.1.0` release — see [Release and hosting status](#release-and-hosting-status).
 
 **2. Full booking flow — locally, with a simulated payment provider.** The
 checkout harness runs the real app against a local Redis and an in-process
@@ -260,19 +259,30 @@ No external monitoring service or logging dependency is used.
   recovery; clearing browser data removes access. Two brand-new tabs racing
   on a first visit can end up with different guest sessions.
 - **No rate limiting** on any route.
-- **Fictional catalog.** Three hard-coded shows dated autumn 2026. Times are
-  shown in the viewer's local time zone; the calendar file uses the exact
-  instant.
+- **Fictional catalog.** Three hard-coded shows dated autumn 2026.
+- **Event times on server-rendered pages use the server's time zone.** The
+  home and event pages format times without an explicit zone, so on the
+  hosted demo (UTC) they read four hours later than the venue's local time,
+  and Indie Echoes (Sat Sep 20, 8 PM) is listed as Mon Sep 21. Tickets
+  render in the viewer's time zone, and the calendar file uses the exact
+  instant. Not fixed in v0.1.0.
 - **Not production-ready.** No load testing, no production deployment
   review, no real payments.
 
-## Release status
+## Release and hosting status
 
-This branch prepares release notes for **v0.1.0**
-([`docs/release-notes/v0.1.0.md`](docs/release-notes/v0.1.0.md)). The tag,
-the GitHub release, and replacing the hosted demo with the browse-only build
-are separate steps that have not been taken. Automatic Vercel Git
-deployments are disabled in [`vercel.json`](vercel.json).
+**v0.1.0** is tagged and published as a
+[GitHub release](https://github.com/Namantyagi2727/ConTicx/releases/tag/v0.1.0)
+(notes: [`docs/release-notes/v0.1.0.md`](docs/release-notes/v0.1.0.md)).
+
+The public demo at <https://conticx.vercel.app> is a browse-only Production
+build of that tag (`df573e2`), deployed manually with the Vercel CLI on
+2026-10-25 — see
+[`docs/deploy-prerequisites.md`](docs/deploy-prerequisites.md) for its
+provenance. Automatic Vercel Git deployments stay disabled in
+[`vercel.json`](vercel.json), so merging to `main` does not change the hosted
+demo. Standard Deployment Protection keeps every other deployment URL,
+including older builds, behind Vercel login.
 
 ## Documentation
 
