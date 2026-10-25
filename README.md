@@ -261,8 +261,12 @@ There are no accounts. Instead each browser gets a **guest session**
   reuses its in-flight booking across React Strict Mode's effect re-run,
   so a single visit makes one order. Order and payment creation are not
   idempotent on the server, though: reloading checkout, opening it in a
-  second tab, or retrying after a lost response creates another order and
-  provider payment, whose hold lapses if it is never paid.
+  second tab, or retrying after a lost response can create another order,
+  provider payment, and inventory hold. Releasing that hold is not
+  automatic: expiry releases it only with authoritative evidence (such as
+  a confirmed cancellation) under the shared reconciliation policy, and
+  uncertain outcomes are retained and flagged for a recovery phase that
+  does not exist yet, so they can stay held.
 
 Browser mutations (`POST /api/guest-session`, `POST /api/orders`) are
 accepted only when the `Origin` header exactly matches `APP_ORIGIN`. A

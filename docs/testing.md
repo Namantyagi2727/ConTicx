@@ -581,10 +581,15 @@ the limitation below.
   `POST /api/orders` mints a new order id, reserves seats, and creates a
   provider payment (with no provider idempotency key). A page reload or a
   second tab on checkout, two concurrent requests, or a client retry after
-  an ambiguous network failure (request sent, response lost) each create
-  another order and payment; the extra ones hold seats until their holds
-  expire. The Strict Mode fix above covers only React re-running one
-  mounted page's effect.
+  an ambiguous network failure (request sent, response lost) can each
+  create another order, provider payment, and inventory hold. Whether an
+  unpaid extra hold is ever released depends on the shared reconciliation
+  policy and the evidence it gets: expiry releases it only on authoritative
+  proof (e.g. a confirmed cancellation), while a failed payment, an
+  inconclusive cancel or provider read, or a missing payment id is retained
+  and flagged in `reconcile_needed`. Those unresolved holds can stay held
+  until the recovery phase exists. The Strict Mode fix above covers only
+  React re-running one mounted page's effect.
 
 ## Known-defect characterization tests
 
