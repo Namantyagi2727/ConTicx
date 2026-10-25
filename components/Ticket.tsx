@@ -33,7 +33,7 @@ export function Ticket({ order }: { order: OrderView }) {
   const refunded = order.status === "refunded";
   const event = getEvent(order.eventId);
   const colors = event ? posterColorClasses[event.posterColor] : null;
-  const stamp = event ? formatDateStamp(event.date) : null;
+  const stamp = event ? formatDateStamp(event.date, event.venueTimeZone) : null;
 
   useEffect(() => {
     QRCode.toDataURL(order.id, {
@@ -75,8 +75,8 @@ export function Ticket({ order }: { order: OrderView }) {
               {stamp && (
                 <p className="mt-3 font-mono text-[11px] font-bold tracking-wide text-paper-ink/70">
                   {stamp.weekday} {stamp.month} {stamp.day} · DOORS{" "}
-                  {formatDoorsTime(event.date, event.doorsMinutesBeforeShow)} · SHOW{" "}
-                  {formatTime(event.date)} · {event.venue.toUpperCase()}
+                  {formatDoorsTime(event.date, event.doorsMinutesBeforeShow, event.venueTimeZone)} · SHOW{" "}
+                  {formatTime(event.date, event.venueTimeZone)} · {event.venue.toUpperCase()}
                 </p>
               )}
             </>

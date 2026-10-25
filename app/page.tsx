@@ -65,7 +65,7 @@ export default function Home() {
         <div className="grid gap-8 sm:grid-cols-2 lg:grid-cols-3">
           {events.map((event, i) => {
             const startingPrice = Math.min(...event.tiers.map((t) => t.priceCents));
-            const stamp = formatDateStamp(event.date);
+            const stamp = formatDateStamp(event.date, event.venueTimeZone);
             const colors = posterColorClasses[event.posterColor];
             const rotation = CARD_ROTATIONS[i % CARD_ROTATIONS.length];
 

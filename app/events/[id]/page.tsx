@@ -43,7 +43,7 @@ export default async function EventPage({
       ])
     : [event.tiers.map((tier): TierAvailability => ({ ...tier, remaining: tier.totalInventory })), 0];
 
-  const stamp = formatDateStamp(event.date);
+  const stamp = formatDateStamp(event.date, event.venueTimeZone);
   const colors = posterColorClasses[event.posterColor];
 
   return (
@@ -96,8 +96,11 @@ export default async function EventPage({
         {/* Key facts strip */}
         <div className="grid grid-cols-2 gap-px overflow-hidden rounded-sm border border-ink-line bg-ink-line sm:grid-cols-4">
           {[
-            { label: "DOORS", value: formatDoorsTime(event.date, event.doorsMinutesBeforeShow) },
-            { label: "SHOW", value: formatTime(event.date) },
+            {
+              label: "DOORS",
+              value: formatDoorsTime(event.date, event.doorsMinutesBeforeShow, event.venueTimeZone),
+            },
+            { label: "SHOW", value: formatTime(event.date, event.venueTimeZone) },
             { label: "VENUE", value: event.venue },
             { label: "AGE", value: event.ageRestriction },
           ].map((fact) => (
