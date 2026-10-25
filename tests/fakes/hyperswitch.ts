@@ -128,6 +128,12 @@ export class FakeHyperswitch {
     return this.payments.get(id);
   }
 
+  // Every stored payment, in creation order (used by the checkout browser
+  // harness's control port).
+  allPayments(): StoredPayment[] {
+    return [...this.payments.values()];
+  }
+
   // Seeds a payment directly (bypassing POST /payments) so a test can set
   // up a specific retrieve result — e.g. a payment whose metadata.orderId
   // points at an order, or one carrying a particular merchant_id — without
