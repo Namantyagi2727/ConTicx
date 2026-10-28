@@ -282,10 +282,10 @@ The public demo at <https://conticx.vercel.app> is a browse-only Production
 build of the latest release tag, deployed manually with the Vercel CLI from
 a clean export of that tag. Each release's GitHub page records its
 deployment; [`docs/deploy-prerequisites.md`](docs/deploy-prerequisites.md)
-describes how the build is made and its provenance. Automatic Vercel Git deployments stay disabled in
-[`vercel.json`](vercel.json), so merging to `main` does not change the hosted
-demo. Standard Deployment Protection keeps every other deployment URL,
-including older builds, behind Vercel login.
+describes how the build is made and its provenance. Automatic Vercel Git
+deployments stay disabled in [`vercel.json`](vercel.json), so merging to
+`main` does not change the hosted demo. Standard Deployment Protection keeps
+every other deployment URL, including older builds, behind Vercel login.
 
 ## Documentation
 
