@@ -162,7 +162,8 @@ list confirms that nothing was deployed.
   `exportManifestSha256` (the SHA-256 of the exported files' checksum
   list).
 - The first such deployment, for `v0.1.0` (commit `df573e2`), was
-  `dpl_314eyrUMHanKt6rCXFe6SAjmfDNr` on 2026-10-25.
+  `dpl_314eyrUMHanKt6rCXFe6SAjmfDNr` on 2026-10-25. It was replaced the same
+  day by `dpl_Enj3bU6NuR6KvT9fPoR26XASpAnx`, for `v0.1.1` (commit `bcf4c56`).
 - The previous Production build (`5a04503`, the Phase 1A merge) predates
   every later phase. It no longer serves the public domain, and Standard
   Protection puts its deployment URL behind Vercel login. It was not
