@@ -29,6 +29,9 @@ const testEnv = {
   // The suite exercises the full booking flow; browse-only mode is tested
   // by switching this per test.
   CONTICX_MODE: "full",
+  // The suite creates many bookings on purpose; the demo's usage limits are
+  // switched on per test where they are what is being tested.
+  CONTICX_RATE_LIMITS: "off",
 };
 
 export default defineConfig({

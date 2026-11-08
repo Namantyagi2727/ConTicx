@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import { errorKind, runLogged, type RequestLog } from "@/lib/log";
-import { bookingEnabled, browseOnlyResponse } from "@/lib/app-mode";
+import { bookingUnavailable } from "@/lib/app-mode";
 import { getEvent } from "@/lib/events";
 import {
   GUEST_ORDER_LIST_LIMIT,
@@ -21,6 +21,7 @@ import { newPaymentRequestId } from "@/lib/hyperswitch";
 import { ensureOrderPayment } from "@/lib/booking";
 import { checkRequestOrigin } from "@/lib/app-origin";
 import { authenticateGuest, ownsOrder } from "@/lib/guest-session";
+import { limitNewBooking, rateLimitedResponse } from "@/lib/rate-limit";
 import {
   isValidAttemptId,
   jsonNoStore,
@@ -32,11 +33,17 @@ import type { Order } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
+function soldOutMessage(remaining: number, tierName: string): string {
+  if (remaining <= 0) return `${tierName} is sold out.`;
+  return `Only ${remaining} ${tierName} ${remaining === 1 ? "ticket is" : "tickets are"} left.`;
+}
+
 // Lists the current guest's own orders, newest first (My Tickets). Reads only
 // this guest's order index — no hold expiry, no provider call — and re-checks
 // ownership on every order before returning its allow-listed fields.
 export async function GET(request: Request) {
-  if (!bookingEnabled()) return browseOnlyResponse();
+  const unavailable = bookingUnavailable();
+  if (unavailable) return unavailable;
   const guest = await authenticateGuest(request);
   if (!guest) return sessionRequired();
   const orders = await listGuestOrders(guest.ownerHash, GUEST_ORDER_LIST_LIMIT);
@@ -76,7 +83,8 @@ export async function POST(request: Request) {
 }
 
 async function handleBooking(request: Request, log: RequestLog): Promise<Response> {
-  if (!bookingEnabled()) return browseOnlyResponse();
+  const unavailable = bookingUnavailable();
+  if (unavailable) return unavailable;
   const origin = checkRequestOrigin(request);
   if (!origin.ok) return originRejected(origin);
   const guest = await authenticateGuest(request);
@@ -117,6 +125,13 @@ async function handleBooking(request: Request, log: RequestLog): Promise<Respons
   // established safely (e.g. a lost counter), refuse rather than guess.
   const alreadyBound = await peekBookingAttempt(guest.ownerHash, attemptId);
   if (!alreadyBound) {
+    // Only a NEW booking attempt is charged against the demo's limits; a
+    // retry of an existing attempt always resumes it.
+    const limited = await limitNewBooking(request, guest.ownerHash);
+    if (!limited.ok) {
+      log.set({ reason: `rate_limited_${limited.bucket}` });
+      return rateLimitedResponse(limited);
+    }
     let remaining: number;
     try {
       remaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);
@@ -127,7 +142,7 @@ async function handleBooking(request: Request, log: RequestLog): Promise<Respons
       throw err;
     }
     if (quantity > remaining) {
-      return jsonNoStore({ code: "sold_out", error: `Only ${remaining} ${tier.name} ticket(s) left` }, 400);
+      return jsonNoStore({ code: "sold_out", error: soldOutMessage(remaining, tier.name) }, 400);
     }
   }
 
@@ -193,7 +208,7 @@ async function handleBooking(request: Request, log: RequestLog): Promise<Respons
       } catch (err) {
         if (!(err instanceof InventoryStateError)) throw err;
       }
-      return jsonNoStore({ code: "sold_out", error: `Only ${nowRemaining} ${tier.name} ticket(s) left` }, 400);
+      return jsonNoStore({ code: "sold_out", error: soldOutMessage(nowRemaining, tier.name) }, 400);
     }
     case "lost":
       return jsonNoStore({ code: "inventory_unavailable", error: "Inventory temporarily unavailable" }, 503);

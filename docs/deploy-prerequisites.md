@@ -138,19 +138,24 @@ list confirms that nothing was deployed.
   project's Root Directory ever moves away from the repository root, this
   file must move with it.
 
-### Demo mode and the hosted build (closeout)
+### Demo mode and the hosted build
 
-- `CONTICX_MODE=full` is the only setting that enables booking. A
+- `CONTICX_MODE=full` is the only setting that enables booking, and full
+  mode additionally refuses (`503 payments_unavailable`) unless the provider
+  settings are a Hyperswitch sandbox and the Redis namespace is valid. A
   deployment without it is browse-only: event pages work, every booking,
   order, ticket, and webhook route refuses with `503`, and no Redis,
-  Hyperswitch, or origin configuration is needed. This is the intended mode
-  for the public portfolio demo.
+  Hyperswitch, or origin configuration is needed.
 - The home page reads the mode at request time, so its description always
   matches what the server enforces.
-- **Production serves a browse-only build of the latest release tag** at
-  <https://conticx.vercel.app>, with Production `CONTICX_MODE=browse-only`.
-  Each such deployment is made manually and recorded in that version's
-  GitHub release (deployment id, tag, commit).
+- **Production serves the latest release tag in full sandbox mode** at
+  <https://conticx.vercel.app> (from v0.2.0; v0.1.x ran browse-only). Its
+  settings, the operator report, and the fresh-data procedure are in
+  [`operations.md`](operations.md). Each deployment is made manually and
+  recorded in that version's GitHub release (deployment id, tag, commit).
+- A **preview** verification deployment is behind Standard Protection, so
+  the provider's webhooks (configured for the Production URL) do not reach
+  it; webhook delivery is verified on Production.
 - **How it is built (provenance).** These are Vercel CLI deployments
   (source `cli`), so they carry **no Git metadata**. Each is built from a
   `git archive` export of the release tag into a new, empty directory.
@@ -168,9 +173,10 @@ list confirms that nothing was deployed.
   every later phase. It no longer serves the public domain, and Standard
   Protection puts its deployment URL behind Vercel login. It was not
   deleted.
-- Production still holds the earlier Redis and Hyperswitch variables.
-  Browse-only mode never reads them; a booking-enabled deployment would
-  additionally need the settings in the checklist below.
+- Production's Redis database is shared with data from the earlier
+  prototype (bare `order:*` / `inventory:*` keys). The demo runs under its
+  own `CONTICX_REDIS_PREFIX` namespace and never reads, writes, or counts
+  anything outside it; the old data was left untouched.
 
 ## Deployment checklist
 
@@ -184,9 +190,10 @@ manually — requires **all** of:
 3. Deployment access protection (Standard Protection) confirmed — this
    gates URL access and is *in addition to*, not a substitute for, (2).
 4. For a booking-enabled deployment only: `CONTICX_MODE=full`, `APP_ORIGIN`
-   set to the deployment's exact https origin, and
-   `HYPERSWITCH_WEBHOOK_SECRET` set (see above). A browse-only deployment
-   needs none of these.
+   set to the deployment's exact https origin, sandbox Hyperswitch keys,
+   `HYPERSWITCH_WEBHOOK_SECRET` set (see above), and a dedicated
+   `CONTICX_REDIS_PREFIX` if the database holds anything else. A browse-only
+   deployment needs none of these.
 
 This maps to addendum prerequisite **P1** (settle the Vercel
 preview-isolation and runtime questions before any branch push) and

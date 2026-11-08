@@ -2,7 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getEvent } from "@/lib/events";
 import { getRecentDemand, getRemainingInventory } from "@/lib/store";
-import { bookingEnabled } from "@/lib/app-mode";
+import { bookingReady } from "@/lib/app-mode";
 import { DEMAND_DISPLAY_THRESHOLD } from "@/lib/constants";
 import { formatDateStamp, formatDoorsTime, formatTime } from "@/lib/format";
 import { posterColorClasses } from "@/lib/theme";
@@ -28,7 +28,7 @@ export default async function EventPage({
   // lazy hold expiry (which can call the payment provider and write) and
   // seeds counters. The catalog's capacities stand in, and no availability
   // is shown.
-  const canBook = bookingEnabled();
+  const canBook = bookingReady();
   const [availability, recentDemand] = canBook
     ? await Promise.all([
         Promise.all(

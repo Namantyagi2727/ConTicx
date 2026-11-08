@@ -1,7 +1,8 @@
 import { checkRequestOrigin } from "@/lib/app-origin";
 import { errorKind, logEvent } from "@/lib/log";
-import { bookingEnabled, browseOnlyResponse } from "@/lib/app-mode";
-import { establishGuestSession } from "@/lib/guest-session";
+import { bookingUnavailable } from "@/lib/app-mode";
+import { authenticateGuest, establishGuestSession } from "@/lib/guest-session";
+import { limitNewGuestSession, rateLimitedResponse } from "@/lib/rate-limit";
 import { jsonNoStore, originRejected } from "@/lib/order-access";
 
 // Establishes (or renews) this browser's guest session BEFORE a booking is
@@ -14,11 +15,18 @@ import { jsonNoStore, originRejected } from "@/lib/order-access";
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
-  if (!bookingEnabled()) return browseOnlyResponse();
+  const unavailable = bookingUnavailable();
+  if (unavailable) return unavailable;
   const origin = checkRequestOrigin(request);
   if (!origin.ok) return originRejected(origin);
 
   try {
+    // Only issuing a NEW credential counts against the demo's limits; a
+    // browser that already holds a live session just renews it.
+    if (!(await authenticateGuest(request))) {
+      const limited = await limitNewGuestSession(request);
+      if (!limited.ok) return rateLimitedResponse(limited);
+    }
     const session = await establishGuestSession(request);
     return jsonNoStore({ ok: true }, 200, { "Set-Cookie": session.setCookie });
   } catch (err) {

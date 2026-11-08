@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { errorKind, runLogged, type RequestLog } from "@/lib/log";
-import { bookingEnabled, browseOnlyResponse } from "@/lib/app-mode";
+import { bookingUnavailable } from "@/lib/app-mode";
 import {
   isWebhookEventProcessed,
   markWebhookEventProcessed,
@@ -43,7 +43,8 @@ export async function POST(request: Request) {
 }
 
 async function handle(request: Request, log: RequestLog): Promise<Response> {
-  if (!bookingEnabled()) return browseOnlyResponse();
+  const unavailable = bookingUnavailable();
+  if (unavailable) return unavailable;
   // (1) Bounded raw-body read. Signature verification needs the exact
   // bytes, so we read once here and reuse the buffer for both the HMAC and
   // the JSON parse — never request.json(), which would re-serialize and

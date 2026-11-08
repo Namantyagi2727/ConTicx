@@ -841,6 +841,74 @@ Seven of the nine tests fail against the v0.1.0 formatters. The other two
 (catalog zone consistency, calendar instant) are invariants that hold on
 both. The checkout summary shows no date or time, so it is unaffected.
 
+## Public sandbox booking (v0.2.0)
+
+### Observed sandbox contract
+
+Observed against the Hyperswitch sandbox (`sandbox.hyperswitch.io`, merchant
+`merchant_1785973617`, profile `pro_CWcP0FYwJ2IYFEUK4cqn`, dummy card
+connector `fauxpay`) on 2026-11-08. These are observations of one sandbox
+profile, not documented guarantees:
+
+| Behaviour | Observed |
+| --- | --- |
+| Create with a merchant-chosen `payment_id`, `confirm: false` | `200`, `requires_payment_method`, carries `merchant_id` and `profile_id` |
+| Create again with the same `payment_id` | `400`, code `HE_01` — matches the creation-idempotency assumption (Phase 1B.5) |
+| Retrieve / cancel an unconfirmed payment | `200`; cancel → `cancelled` |
+| Read the payment's business profile with the secret key | `200`; `is_manual_retry_enabled: null`, webhook URL and hash key present |
+| Card `4242 4242 4242 4242` through the widget | `succeeded` |
+| Card `4000 0000 0000 0002` through the widget | `failed`, `DC_08` "Payment declined: Card declined"; the widget reports no error |
+| Confirming that failed payment again | refused: "You cannot confirm this payment because it has status failed, you can enable `manual_retry` in profile to try this payment again" |
+| Any request body containing `http://localhost…` or `http://127.0.0.1…` (e.g. the widget's `return_url`) | `403` from the API's CloudFront edge (HTML, not JSON); the widget's confirm promise never settles. `http://conticx.localhost:3000` and https origins pass |
+
+What changed because of it:
+
+- **Declined payments.** The policy used to retain every `failed` payment
+  (it "may still be retried"). On a profile without manual retry it cannot
+  be, so retaining it held the seats forever and the confirmation page spun.
+  `failedPaymentFinality` reads the payment's own profile and a failed
+  payment is released only when manual retry is off; with retry on, or when
+  the profile can't be read, it is retained and flagged as before. The fake
+  now models the profile endpoint (default `null`, as observed), and the
+  three tests that covered retention set retry *on* — the scenario they
+  describe.
+- **Checkout resume** reconciles a payment that already has an outcome
+  instead of handing back a client secret the provider will refuse.
+- **Checkout** shows the sandbox test cards, keeps Pay disabled until the
+  widget reports ready, and sends the shopper to the confirmation page after
+  45 s if the widget's confirm never settles (the page shows only verified
+  state). After a widget error it asks the server for the verified status.
+- **Local development against the real sandbox** must use a non-loopback
+  origin such as `http://conticx.localhost:3000`.
+
+### Isolation and guards
+
+- `CONTICX_REDIS_PREFIX` namespaces every key, including the two literal key
+  checks inside the reservation script (the prefix is passed as an
+  argument). `tests/integration/sandbox-mode.regression.test.ts` books,
+  pays, and lists under a prefix next to pre-existing bare keys (a nearly
+  sold-out counter and an order) and checks the bare keys are byte-for-byte
+  unchanged and the namespace starts at full capacity.
+- Full mode refuses unless the provider settings are a sandbox (sandbox host
+  or a loopback fake, `snd_` / `pk_snd_` keys); the same file checks the
+  accepted and refused shapes and that every entry point refuses before any
+  Redis or provider work.
+
+### Usage limits
+
+`lib/rate-limit.ts`: fixed-window counters, all buckets checked and charged
+in one script (a refused request charges nothing). New guest sessions: 20
+per client address and 500 overall per hour. New booking attempts: 6 per
+guest per 10 minutes, 15 per client address per hour, 60 overall per hour
+(`CONTICX_DEMO_BOOKINGS_PER_HOUR`) and 5× that per day. Status refreshes: 40
+per guest per minute, 3000 overall per hour. Client addresses are stored only
+as a truncated SHA-256. `tests/integration/usage-limits.regression.test.ts`
+covers the per-guest, overall, per-address, and status bounds; that a retry
+of an existing attempt is still served; and that renewals and webhooks are
+never limited. Checkout resume after a final and a retryable decline is in
+`tests/integration/sandbox-mode.regression.test.ts`. The rest of the suite
+runs with `CONTICX_RATE_LIMITS=off`.
+
 ## Known-defect characterization tests
 
 No characterization tests remain. The last one, `refund-authorization`

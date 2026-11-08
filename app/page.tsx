@@ -24,14 +24,14 @@ export default function Home() {
             CONTICX
           </span>
           <span className="font-mono text-xs text-text-faint">
-            {browseOnly ? "BROWSE-ONLY DEMO" : "BROOKLYN · TEST PAYMENTS"}
+            {browseOnly ? "BROWSE-ONLY DEMO" : "SANDBOX DEMO · TEST PAYMENTS"}
           </span>
         </div>
       </header>
 
       <section className="mx-auto max-w-5xl px-6 pt-16 pb-12 sm:px-10 sm:pt-24">
         <p className="font-mono text-xs tracking-[0.2em] text-flame">
-          {browseOnly ? "PORTFOLIO DEMO" : "NOW BOOKING"}
+          {browseOnly ? "PORTFOLIO DEMO" : "SANDBOX DEMO · NOW BOOKING"}
         </p>
         <h1 className="mt-3 font-display text-6xl leading-[0.92] font-black tracking-tight sm:text-8xl">
           SMALL ROOMS.
@@ -42,11 +42,17 @@ export default function Home() {
           Three shows, three rooms, this fall in Brooklyn. Tickets held for
           ten minutes at checkout — test payments, real urgency.
         </p>
-        {browseOnly && (
+        {browseOnly ? (
           <p className="mt-4 max-w-md border-l-2 border-acid pl-3 font-body text-sm text-text-muted">
             This public demo is browse-only: booking and payments are
             switched off. The complete checkout runs locally against a
             simulated payment provider — see the project README.
+          </p>
+        ) : (
+          <p className="mt-4 max-w-md border-l-2 border-acid pl-3 font-body text-sm text-text-muted">
+            A working sandbox demo: book a seat and pay with a Hyperswitch
+            test card — no real money moves, and the shows and tickets are
+            fictional. Checkout shows the test card to use.
           </p>
         )}
       </section>
@@ -174,7 +180,7 @@ export default function Home() {
               <p className="mt-2 font-body text-xs leading-relaxed text-text-muted">
                 {browseOnly
                   ? "Browse-only: nothing can be booked or paid for here, and no payment provider is contacted."
-                  : "Test environment: payments use Hyperswitch sandbox keys or a local simulated provider — no real cards, no real charges."}
+                  : "Hyperswitch sandbox: test cards only, no real charges. The shows and tickets are fictional."}
               </p>
             </div>
           </div>

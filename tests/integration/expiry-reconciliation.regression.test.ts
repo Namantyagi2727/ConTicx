@@ -129,9 +129,10 @@ describe("[regression] INV-01: a cancellation response never decides the outcome
     expect(await counter()).toBe(afterReserve); // seat kept
   });
 
-  it("cancel 400 followed by 'failed' retains the seat, flags it, and never marks paid", async () => {
+  it("cancel 400 followed by a retryable 'failed' retains the seat, flags it, and never marks paid", async () => {
     const { orderId, paymentId } = await createOrder();
     const afterReserve = await counter();
+    getFake().manualRetryEnabled = true;
     getFake().getPayment(paymentId)!.status = "processing";
     getFake().cancelRejectsWith400 = true;
     getFake().statusAfterCancel400 = "failed";
@@ -143,6 +144,21 @@ describe("[regression] INV-01: a cancellation response never decides the outcome
     expect(await counter()).toBe(afterReserve); // not released either
     expect((await getReconciliationFlag(orderId))?.reason).toBe("payment_failed_retryable");
     expect(await inIndex(orderId)).toBe(false); // stops reprocessing
+  });
+
+  it("cancel 400 followed by a final 'failed' releases the seat once", async () => {
+    const { orderId, paymentId } = await createOrder();
+    const afterReserve = await counter();
+    getFake().getPayment(paymentId)!.status = "processing";
+    getFake().cancelRejectsWith400 = true;
+    getFake().statusAfterCancel400 = "failed";
+    await expireHold(orderId);
+
+    await runExpiryPass();
+
+    expect(await statusOf(orderId)).toBe("failed");
+    expect(await counter()).toBe(afterReserve + 1);
+    expect(await inIndex(orderId)).toBe(false);
   });
 
   it("cancel 400 with the payment still processing retains, flags, and never marks paid", async () => {

@@ -47,6 +47,7 @@ describe("[regression] order status refresh uses the shared reconciliation polic
   it("retains (does not release) a retryable failed payment and flags it", async () => {
     const { orderId, paymentId, cookie } = await createOwnedOrder();
     const before = await counter();
+    getFake().manualRetryEnabled = true; // the profile allows confirming it again
     getFake().getPayment(paymentId)!.status = "failed";
 
     const res = await poll(orderId, cookie);
@@ -56,6 +57,19 @@ describe("[regression] order status refresh uses the shared reconciliation polic
     expect(await statusOf(orderId)).toBe("pending"); // not released
     expect(await counter()).toBe(before);
     expect((await getReconciliationFlag(orderId))?.reason).toBe("payment_failed_retryable");
+  });
+
+  it("reports a declined, non-retryable payment as failed and releases its seat", async () => {
+    const { orderId, paymentId, cookie } = await createOwnedOrder();
+    const afterReserve = await counter();
+    getFake().getPayment(paymentId)!.status = "failed";
+
+    const res = await poll(orderId, cookie);
+
+    expect((await res.json()).status).toBe("failed");
+    expect(await statusOf(orderId)).toBe("failed");
+    expect(await counter()).toBe(afterReserve + 1);
+    expect(await getReconciliationFlag(orderId)).toBeNull();
   });
 
   it("marks a verified, bound success paid without releasing", async () => {

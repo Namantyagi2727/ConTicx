@@ -50,6 +50,13 @@ export const HOLD_EXPIRY_PROVIDER_BUDGET_MS = 2_000;
 export const HOLD_EXPIRY_BUDGET_WINDOW_MS = 10_000;
 export const HOLD_EXPIRY_MIN_CALL_MS = 250;
 
+// Upper bound for reading a payment's business profile during hold expiry,
+// to learn whether a FAILED payment is final (lib/hyperswitch.ts
+// failedPaymentFinality). The answer is cached per profile, so this is paid
+// at most once every few minutes; a timeout means "unknown", and the order
+// is retained and flagged rather than released.
+export const FAILED_FINALITY_EXPIRY_TIMEOUT_MS = 1_000;
+
 // TTL for the per-order "a provider payment was attempted" marker, set just
 // before the payment is created and cleared once its id is attached. It is
 // DIAGNOSTIC ONLY: when an expired hold has no attached payment id, expiry

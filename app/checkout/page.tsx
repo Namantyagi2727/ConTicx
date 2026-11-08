@@ -42,6 +42,34 @@ const HYPER_APPEARANCE = {
   },
 };
 
+// How long to wait for the widget's confirm call before handing the shopper
+// to the confirmation page, which reports the provider-verified outcome.
+const CONFIRM_WATCHDOG_MS = 45_000;
+
+// The widget's own error text can be a raw provider message. Keep ordinary
+// card messages (they tell the shopper what to fix) and replace the rest.
+function friendlyPaymentError(message: string | undefined): string {
+  if (!message || message.length > 160 || /manual_retry|status failed|client_secret/i.test(message)) {
+    return "That payment didn't go through.";
+  }
+  return message;
+}
+
+// Hyperswitch sandbox test cards, from the provider's published list for its
+// dummy connector (the sandbox's test processor). No real money moves.
+function SandboxCardHelp() {
+  return (
+    <div className="mb-4 border border-acid/40 bg-acid/5 p-3 font-mono text-[11px] leading-relaxed text-text-muted">
+      <p className="font-bold tracking-wide text-acid">SANDBOX PAYMENT — NO REAL MONEY</p>
+      <p className="mt-1">
+        Pay with the test card <span className="text-text">4242 4242 4242 4242</span>, any future
+        expiry, any 3-digit CVC. To see a decline, use{" "}
+        <span className="text-text">4000 0000 0000 0002</span>. Don&apos;t enter a real card.
+      </p>
+    </div>
+  );
+}
+
 interface OrderCreateResponse {
   clientSecret: string;
   orderId: string;
@@ -494,6 +522,11 @@ function PaymentForm({
   const router = useRouter();
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // The hosted card form can take many seconds to appear (observed ~20 s in
+  // the sandbox). Pay stays disabled, with a visible loading line, until the
+  // widget reports it is ready, so a shopper cannot submit an empty form.
+  const [widgetReady, setWidgetReady] = useState(false);
+  const confirmationHref = `/confirmation/${encodeURIComponent(orderId)}`;
 
   // Wallet payment methods (PayPal, GPay, Apple Pay) render as their own
   // button inside the widget and handle their own click-to-redirect
@@ -527,30 +560,66 @@ function PaymentForm({
 
     // redirect: "if_required" keeps the shopper on this page unless the
     // connector needs a redirect (e.g. a 3DS challenge).
-    const { error } = await hyper.confirmPayment({
-      elements: widgets,
-      confirmParams: {
-        return_url: returnUrl,
-      },
-      redirect: "if_required",
-    });
-
-    setIsSubmitting(false);
+    //
+    // The widget's promise has been seen to never settle when the provider's
+    // edge rejects the confirm request. After CONFIRM_WATCHDOG_MS the shopper
+    // is sent to the confirmation page anyway: it shows only the outcome the
+    // server has verified with the provider, never an assumed one.
+    let settled = false;
+    const watchdog = setTimeout(() => {
+      if (!settled) router.push(confirmationHref);
+    }, CONFIRM_WATCHDOG_MS);
+    let error: { message?: string } | undefined;
+    try {
+      ({ error } = await hyper.confirmPayment({
+        elements: widgets,
+        confirmParams: {
+          return_url: returnUrl,
+        },
+        redirect: "if_required",
+      }));
+    } catch {
+      error = {};
+    } finally {
+      settled = true;
+      clearTimeout(watchdog);
+    }
 
     if (error) {
-      setErrorMessage(error.message ?? "That payment didn't go through.");
+      // An error can mean "fix the card details" or "the payment ended". Ask
+      // the server for the verified order state: if the booking is no longer
+      // payable, the confirmation page explains what happened.
+      const status = await fetch(`/api/orders/${encodeURIComponent(orderId)}/status`, { cache: "no-store" })
+        .then((res) => (res.ok ? (res.json() as Promise<{ status?: string }>) : null))
+        .catch(() => null);
+      if (status?.status && status.status !== "pending") {
+        router.push(confirmationHref);
+        return;
+      }
+      setIsSubmitting(false);
+      setErrorMessage(friendlyPaymentError(error.message));
       return;
     }
 
-    router.push(`/confirmation/${encodeURIComponent(orderId)}`);
+    router.push(confirmationHref);
   };
 
   return (
     <form onSubmit={handleSubmit}>
-      <UnifiedCheckout id="unified-checkout" options={unifiedCheckoutOptions} />
+      <SandboxCardHelp />
+      {!widgetReady && (
+        <p className="mb-3 flex items-center gap-2 font-mono text-xs text-text-muted" role="status">
+          <span className="spinner" aria-hidden /> Loading the secure sandbox payment form…
+        </p>
+      )}
+      <UnifiedCheckout
+        id="unified-checkout"
+        options={unifiedCheckoutOptions}
+        onReady={() => setWidgetReady(true)}
+      />
       <button
         type="submit"
-        disabled={isSubmitting}
+        disabled={isSubmitting || !widgetReady}
         className="mt-4 flex w-full items-center justify-center gap-2 bg-flame py-3 text-center font-display text-lg font-bold tracking-wide text-ink transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50"
       >
         {isSubmitting && <span className="spinner" aria-hidden />}
