@@ -23,7 +23,9 @@
 
   --color-text: #f3eee1;
   --color-text-muted: #a89fb0;
-  --color-text-faint: #6f6779;
+  /* 5.5:1 on ink, 5:1 on ink-raised — the quietest text that still reads at
+     small sizes (WCAG AA). Not for decoration-only lines. */
+  --color-text-faint: #908899;
 }
 
 @theme inline {
@@ -46,10 +48,29 @@
   --font-mono: var(--font-mono);
 }
 
+html {
+  /* No color-scheme: dark here — with it, Chrome paints the payment widget's
+     (light-scheme) iframe with an opaque white background. */
+  scrollbar-color: var(--color-ink-line) var(--color-ink);
+}
+
 body {
   background: var(--color-ink);
   color: var(--color-text);
   font-family: var(--font-body), ui-sans-serif, system-ui, sans-serif;
+  caret-color: var(--color-acid);
+}
+
+/* No double-tap zoom delay on controls. */
+a,
+button,
+[role="button"] {
+  touch-action: manipulation;
+}
+
+/* Prices, times, and countdowns line up digit for digit. */
+.font-mono {
+  font-variant-numeric: tabular-nums;
 }
 
 ::selection {
