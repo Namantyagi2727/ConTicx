@@ -149,6 +149,76 @@ export async function retrievePayment(
 }
 
 // ---------------------------------------------------------------------------
+// Is a FAILED payment final?
+//
+// Hyperswitch lists `failed` as a terminal intent status, but a failed
+// payment can be confirmed again when its business profile has manual retry
+// enabled. Observed in the sandbox: confirming a failed payment on a profile
+// without it is refused with "You cannot confirm this payment because it has
+// status failed, you can enable `manual_retry` in profile to try this payment
+// again". So a failed payment is final exactly when the profile it belongs to
+// (named on the payment itself) has `is_manual_retry_enabled` false or unset.
+//
+//   final      the profile was read and manual retry is off
+//   retryable  manual retry is on — the payment may still succeed
+//   unknown    no profile on the payment, malformed ids, or the profile could
+//              not be read — callers must treat this as NOT final
+//
+// The answer is cached per profile for a few minutes; a failed read is never
+// cached.
+// ---------------------------------------------------------------------------
+
+export type FailedPaymentFinality = "final" | "retryable" | "unknown";
+
+const PROVIDER_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const FINALITY_CACHE_MS = 5 * 60 * 1000;
+const finalityCache = new Map<string, { value: "final" | "retryable"; at: number }>();
+
+export function clearFailedPaymentFinalityCache(): void {
+  finalityCache.clear();
+}
+
+export async function failedPaymentFinality(
+  payment: Pick<ProviderPayment, "merchant_id" | "profile_id">,
+  options?: ProviderRequestOptions
+): Promise<FailedPaymentFinality> {
+  const merchantId = payment.merchant_id;
+  const profileId = payment.profile_id;
+  if (!merchantId || !profileId || !PROVIDER_ID_RE.test(merchantId) || !PROVIDER_ID_RE.test(profileId)) {
+    return "unknown";
+  }
+  const cacheKey = `${merchantId}/${profileId}`;
+  const cached = finalityCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < FINALITY_CACHE_MS) return cached.value;
+
+  let response: Response;
+  try {
+    response = await hyperswitchFetch(
+      `/account/${encodeURIComponent(merchantId)}/business_profile/${encodeURIComponent(profileId)}`,
+      undefined,
+      options
+    );
+  } catch {
+    return "unknown";
+  }
+  if (!response.ok) return "unknown";
+  let profile: Record<string, unknown>;
+  try {
+    profile = (await response.json()) as Record<string, unknown>;
+  } catch {
+    return "unknown";
+  }
+  if (profile?.profile_id !== profileId) return "unknown";
+  const flag = profile.is_manual_retry_enabled;
+  let value: "final" | "retryable";
+  if (flag === true) value = "retryable";
+  else if (flag === false || flag === null || flag === undefined) value = "final";
+  else return "unknown";
+  finalityCache.set(cacheKey, { value, at: Date.now() });
+  return value;
+}
+
+// ---------------------------------------------------------------------------
 // Payment creation under a caller-chosen payment_id (Phase 1B.5).
 //
 // Provider contract this relies on (see docs/testing.md for sources):

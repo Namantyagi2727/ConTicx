@@ -232,7 +232,7 @@ describe("[regression] checkout books once per checkout attempt under Strict Mod
     );
 
     expect(count("POST /api/orders")).toBe(1);
-    expect(page.container.textContent).toContain("Only 1 VIP ticket(s) left");
+    expect(page.container.textContent).toContain("Only 1 VIP ticket is left.");
     expect(widgetShown(page)).toBe(false);
     expect(providerCreates()).toBe(0);
     expect(await r.keys("order:*")).toEqual([]);

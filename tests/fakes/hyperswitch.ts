@@ -100,6 +100,16 @@ export class FakeHyperswitch {
   createResponseDelayMs = 0;
   createFailsAfterInsert = false;
   createRejection: { status: number; body: unknown } | null = null;
+
+  // The business profile every created payment belongs to, as the hosted
+  // provider reports it on the payment (merchant_id / profile_id) and at
+  // GET /account/:merchant/business_profile/:profile. is_manual_retry_enabled
+  // defaults to null — what the sandbox profile reported — and on that
+  // profile the provider refuses to confirm a failed payment again.
+  readonly merchantId = "merchant_fake";
+  readonly profileId = "pro_fake";
+  manualRetryEnabled: boolean | null = null;
+  profileReadFails = false;
   // Deterministic per-request gates for POST /payments, consumed one per
   // create request in arrival order (tests drive them with deferred
   // promises, never sleeps):
@@ -152,6 +162,8 @@ export class FakeHyperswitch {
     this.createFailsAfterInsert = false;
     this.createRejection = null;
     this.createGates.length = 0;
+    this.manualRetryEnabled = null;
+    this.profileReadFails = false;
   }
 
   // Create requests the fake received (accepted or not).
@@ -251,6 +263,8 @@ export class FakeHyperswitch {
         amount: input.amount ?? 0,
         currency: input.currency ?? "USD",
         metadata: input.metadata ?? null,
+        merchant_id: this.merchantId,
+        profile_id: this.profileId,
       };
       if (!gate?.skipStore) this.payments.set(id, payment);
       if (gate?.response) {
@@ -305,6 +319,20 @@ export class FakeHyperswitch {
       const payment = this.payments.get(id);
       if (!payment) return json(res, 404, { error: { message: "payment not found" } });
       return json(res, 200, payment);
+    }
+
+    // GET /account/:merchant/business_profile/:profile
+    const profileMatch = path.match(/^\/account\/([^/]+)\/business_profile\/([^/]+)$/);
+    if (method === "GET" && profileMatch) {
+      if (this.profileReadFails) return json(res, 500, { error: { message: "provider error" } });
+      if (decodeURIComponent(profileMatch[1]) !== this.merchantId || decodeURIComponent(profileMatch[2]) !== this.profileId) {
+        return json(res, 404, { error: { message: "profile not found" } });
+      }
+      return json(res, 200, {
+        merchant_id: this.merchantId,
+        profile_id: this.profileId,
+        is_manual_retry_enabled: this.manualRetryEnabled,
+      });
     }
 
     // POST /refunds

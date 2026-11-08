@@ -32,6 +32,8 @@ function sleep(ms: number) {
 
 function ConfirmationContent({ orderId }: { orderId: string }) {
   const [lookup, setLookup] = useState<Lookup>({ kind: "loading" });
+  // Bumped by "Check again" to start another round of polling.
+  const [checkRound, setCheckRound] = useState(0);
 
   useEffect(() => {
     // Per-run flag (not a shared ref): React Strict Mode can mount, clean
@@ -51,6 +53,12 @@ function ConfirmationContent({ orderId }: { orderId: string }) {
         }
         if (cancelled) return;
 
+        if (res.status === 429) {
+          // Rate limited: the demo's request bound, not an order outcome.
+          await sleep(POLL_INTERVAL_MS * 2);
+          if (cancelled) return;
+          continue;
+        }
         if (res.status === 401) return setLookup({ kind: "no_session" });
         if (res.status === 404) return setLookup({ kind: "not_found" });
         if (res.status === 503) {
@@ -75,7 +83,7 @@ function ConfirmationContent({ orderId }: { orderId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [orderId]);
+  }, [orderId, checkRound]);
 
   if (lookup.kind === "loading") {
     return <StatusLine showSpinner>Checking your order…</StatusLine>;
@@ -133,6 +141,15 @@ function ConfirmationContent({ orderId }: { orderId: string }) {
         Still confirming your payment — this usually only takes a few
         seconds. If it takes longer, check My Tickets in this browser
         shortly.
+        {!polling && (
+          <button
+            type="button"
+            onClick={() => setCheckRound((n) => n + 1)}
+            className="mt-4 block bg-flame px-4 py-2 font-display text-sm font-bold tracking-wide text-ink"
+          >
+            CHECK AGAIN
+          </button>
+        )}
         <span className="mt-3 block font-body text-xs text-text-faint">
           {SAME_BROWSER_NOTE}
         </span>
@@ -144,7 +161,7 @@ function ConfirmationContent({ orderId }: { orderId: string }) {
   const event = getEvent(order.eventId);
   return (
     <StatusLine title="That payment didn't go through">
-      Nothing was charged.
+      Nothing was charged, and these seats are no longer held for you.
       {event && (
         <Link
           href={`/events/${event.id}`}

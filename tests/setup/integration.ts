@@ -17,6 +17,7 @@ import { assertLocalTargetsFromProcessEnv } from "./target-guard";
 import { installNetworkGuard, restoreNetworkGuard } from "./network-guard";
 import { FakeHyperswitch } from "../fakes/hyperswitch";
 import { flushTestRedis, pingTestRedis } from "../helpers/redis";
+import { clearFailedPaymentFinalityCache } from "@/lib/hyperswitch";
 
 declare global {
   // Shared with tests via getFake() so each test can program and
@@ -51,6 +52,7 @@ beforeAll(async () => {
 beforeEach(async () => {
   await flushTestRedis();
   fake.reset();
+  clearFailedPaymentFinalityCache();
 });
 
 afterEach(() => {

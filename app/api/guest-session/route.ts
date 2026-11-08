@@ -1,6 +1,6 @@
 import { checkRequestOrigin } from "@/lib/app-origin";
 import { errorKind, logEvent } from "@/lib/log";
-import { bookingEnabled, browseOnlyResponse } from "@/lib/app-mode";
+import { bookingUnavailable } from "@/lib/app-mode";
 import { establishGuestSession } from "@/lib/guest-session";
 import { jsonNoStore, originRejected } from "@/lib/order-access";
 
@@ -14,7 +14,8 @@ import { jsonNoStore, originRejected } from "@/lib/order-access";
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
-  if (!bookingEnabled()) return browseOnlyResponse();
+  const unavailable = bookingUnavailable();
+  if (unavailable) return unavailable;
   const origin = checkRequestOrigin(request);
   if (!origin.ok) return originRejected(origin);
 

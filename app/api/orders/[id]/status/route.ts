@@ -1,6 +1,6 @@
 import { retrievePayment } from "@/lib/hyperswitch";
 import { errorKind, runLogged, type RequestLog } from "@/lib/log";
-import { bookingEnabled, browseOnlyResponse } from "@/lib/app-mode";
+import { bookingUnavailable } from "@/lib/app-mode";
 import { peekOrder, reconcileRetrievedPayment } from "@/lib/store";
 import { isValidPaymentId } from "@/lib/webhook-security";
 import {
@@ -39,7 +39,8 @@ async function handle(
   params: Promise<{ id: string }>,
   log: RequestLog
 ): Promise<Response> {
-  if (!bookingEnabled()) return browseOnlyResponse();
+  const unavailable = bookingUnavailable();
+  if (unavailable) return unavailable;
   const { id } = await params;
   const lookup = await loadOwnedOrder(request, id);
   if (lookup.kind === "no_session") return sessionRequired();

@@ -21,6 +21,7 @@
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { redis } from "./redis";
+import { rk } from "./redis-keys";
 import { trustedOriginIsSecure } from "./app-origin";
 import { GUEST_SESSION_TTL_SECONDS } from "./constants";
 import type { Order } from "./types";
@@ -34,7 +35,7 @@ export function guestCookieName(): string {
 }
 
 function sessionKey(ownerHash: string) {
-  return `guest_session:${ownerHash}`;
+  return rk(`guest_session:${ownerHash}`);
 }
 
 export function hashGuestCredential(credential: string): string {

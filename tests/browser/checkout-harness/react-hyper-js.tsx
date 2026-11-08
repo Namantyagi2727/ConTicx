@@ -60,14 +60,21 @@ export function HyperElements({
 export function UnifiedCheckout({
   id,
   options,
+  onReady,
 }: {
   id?: string;
   options?: { wallets?: { walletReturnUrl?: string } };
+  onReady?: () => void;
 }) {
   useEffect(() => {
     stubRecord().unifiedCheckout = { id, walletReturnUrl: options?.wallets?.walletReturnUrl };
     stubEvent("UnifiedCheckout", { walletReturnUrl: options?.wallets?.walletReturnUrl });
   }, [id, options]);
+
+  // The real widget reports readiness once its form has rendered.
+  useEffect(() => {
+    onReady?.();
+  }, [onReady]);
 
   return (
     <div

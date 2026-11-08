@@ -84,16 +84,19 @@ export type Decision =
 //                          success.
 //   cancelled | expired -> release. Terminal AND unpaid (voided / expired
 //                          before capture), so the seat is genuinely free.
-//   failed              -> RETAIN. Terminal at the intent level, but the
-//                          audit established a failed payment may still be
-//                          retried; no reliable finality rule is implemented
-//                          (we do not assume profile settings or guess a
-//                          cutoff), so we do not release.
+//   failed              -> release ONLY when `failedIsFinal` — the caller
+//                          read the payment's own business profile and
+//                          found manual retry off, so the payment can never
+//                          be confirmed again (lib/hyperswitch.ts
+//                          failedPaymentFinality; observed in the sandbox).
+//                          Otherwise RETAIN: with manual retry on, or when
+//                          the profile could not be read, a failed payment
+//                          may still be retried, so we do not release.
 //   anything else       -> no terminal outcome (processing, review,
 //                          requires_*, and the captured-funds cases
 //                          cancelled_post_capture / partially_*). Never
 //                          guessed.
-export function decideFromStatus(status: string): Decision {
+export function decideFromStatus(status: string, failedIsFinal = false): Decision {
   switch (status) {
     case "succeeded":
       return { action: "succeed", to: "succeeded", release: false, reason: "succeeded" };
@@ -102,7 +105,9 @@ export function decideFromStatus(status: string): Decision {
     case "expired":
       return { action: "release", to: "expired", release: true, reason: "expired" };
     case "failed":
-      return { action: "retain", reason: "payment_failed_retryable" };
+      return failedIsFinal
+        ? { action: "release", to: "failed", release: true, reason: "payment_failed_final" }
+        : { action: "retain", reason: "payment_failed_retryable" };
     default:
       return { action: "pending", reason: `non_terminal_${sanitizeStatus(status)}` };
   }

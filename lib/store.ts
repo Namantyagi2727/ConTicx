@@ -32,13 +32,16 @@ import { randomUUID } from "node:crypto";
 import { redis } from "./redis";
 import { errorKind, logEvent } from "./log";
 import {
+  failedPaymentFinality,
   hyperswitchFetch,
   retrievePayment,
   type ProviderPayment,
+  type ProviderRequestOptions,
   type RetrievePaymentResult,
 } from "./hyperswitch";
 import {
   DEMAND_WINDOW_SECONDS,
+  FAILED_FINALITY_EXPIRY_TIMEOUT_MS,
   HOLD_EXPIRY_BATCH_SIZE,
   HOLD_EXPIRY_BUDGET_WINDOW_MS,
   HOLD_EXPIRY_MIN_CALL_MS,
@@ -49,18 +52,21 @@ import {
 } from "./constants";
 import { bindPaymentToOrder, decideFromStatus, type Decision } from "./payment-policy";
 import type { Order, OrderStatus } from "./types";
+import { redisKeyPrefix, rk } from "./redis-keys";
 
 // ZSET of still-pending order ids, scored by holdExpiresAt. Lets reap
 // find "which holds expired" with a single ZRANGE instead of scanning
 // every order key (Redis has no cheap way to list all order:* keys).
-const PENDING_HOLDS_KEY = "pending_holds";
+function pendingHoldsKey() {
+  return rk("pending_holds");
+}
 
 function orderKey(id: string) {
-  return `order:${id}`;
+  return rk(`order:${id}`);
 }
 
 function inventoryKey(eventId: string, tierName: string) {
-  return `inventory:${eventId}:${tierName}`;
+  return rk(`inventory:${eventId}:${tierName}`);
 }
 
 // Persistent evidence that a tier's inventory was initialized. Set once,
@@ -69,11 +75,11 @@ function inventoryKey(eventId: string, tierName: string) {
 // record) apart from a tier whose counter was lost out-of-band (no
 // counter BUT init record present) — an absent counter alone cannot.
 function inventoryInitKey(eventId: string, tierName: string) {
-  return `inventory_init:${eventId}:${tierName}`;
+  return rk(`inventory_init:${eventId}:${tierName}`);
 }
 
 function demandKey(eventId: string) {
-  return `demand:${eventId}`;
+  return rk(`demand:${eventId}`);
 }
 
 // Durable "needs human/later reconciliation" record for one order, carrying
@@ -82,21 +88,23 @@ function demandKey(eventId: string) {
 // and never touches inventory. Persistent on purpose — it is a backlog item
 // the recovery phase owns, not a transient marker.
 function reconcileKey(id: string) {
-  return `reconcile:${id}`;
+  return rk(`reconcile:${id}`);
 }
 
 // ZSET of every order id that currently has a reconciliation flag, scored by
 // when it was (last) flagged. Written atomically with the flag, so unresolved
 // work stays enumerable (ZRANGE) after it leaves the pending-holds index —
 // a per-order key alone could only be found by scanning the keyspace.
-const RECONCILE_INDEX_KEY = "reconcile_needed";
+function reconcileIndexKey() {
+  return rk("reconcile_needed");
+}
 
 // Per-guest index of the orders that guest created (Phase 1B.4), scored by
 // createdAt. Written only inside RESERVE_AND_CREATE_SCRIPT, in the same step
 // as the order and its owner, so the My Tickets listing reads a guest's own
 // orders without scanning the keyspace.
 function guestOrdersKey(ownerHash: string) {
-  return `guest_orders:${ownerHash}`;
+  return rk(`guest_orders:${ownerHash}`);
 }
 
 // Per-guest booking-attempt record (Phase 1B.5): binds one attempt id to one
@@ -106,21 +114,21 @@ function guestOrdersKey(ownerHash: string) {
 // could be recreated as a fresh booking. Scoped by owner hash, so another
 // guest presenting the same attempt id addresses a different record.
 function bookingAttemptKey(ownerHash: string, attemptId: string) {
-  return `booking_attempt:${ownerHash}:${attemptId}`;
+  return rk(`booking_attempt:${ownerHash}:${attemptId}`);
 }
 
 // Payment-creation lease for one order (Phase 1B.5). See
 // BOOKING_PAYMENT_LEASE_MS: an optimisation against redundant provider
 // calls, never the justification for retrying one.
 function paymentLeaseKey(orderId: string) {
-  return `payment_create_lease:${orderId}`;
+  return rk(`payment_create_lease:${orderId}`);
 }
 
 // Per-order marker that a provider payment was ATTEMPTED (set just before
 // the create call, cleared once its id is attached). Read only when an
 // expired hold has no attached payment id.
 function paymentAttemptKey(id: string) {
-  return `payment_attempt:${id}`;
+  return rk(`payment_attempt:${id}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +172,8 @@ local attemptKey = KEYS[6]
 local orderJson = ARGV[1]
 local total = tonumber(ARGV[2])
 local maxInv = tonumber(ARGV[3])
+-- Key namespace (lib/redis-keys.ts); '' when unset.
+local ns = ARGV[4] or ''
 
 if not orderJson or orderJson == '' then return {'ERR', 'bad_order'} end
 if not maxInv or maxInv < 1 then return {'ERR', 'bad_max'} end
@@ -191,7 +201,7 @@ if not orderId or orderId == '' then return {'ERR', 'bad_order_id'} end
 if type(owner) ~= 'string' or #owner ~= 64 or not string.match(owner, '^[0-9a-f]+$') then
   return {'ERR', 'bad_owner'}
 end
-if ownerIndexKey ~= 'guest_orders:' .. owner then return {'ERR', 'bad_owner_index'} end
+if ownerIndexKey ~= ns .. 'guest_orders:' .. owner then return {'ERR', 'bad_owner_index'} end
 if not createdAt then return {'ERR', 'bad_created_at'} end
 -- Booking attempt: a lowercase UUID, and the attempt key must be this
 -- owner's record for it (attempts are scoped per guest).
@@ -199,7 +209,7 @@ local attemptId = incoming['attemptId']
 if type(attemptId) ~= 'string' or #attemptId ~= 36 or not string.match(attemptId, '^[0-9a-f-]+$') then
   return {'ERR', 'bad_attempt'}
 end
-if attemptKey ~= 'booking_attempt:' .. owner .. ':' .. attemptId then return {'ERR', 'bad_attempt_key'} end
+if attemptKey ~= ns .. 'booking_attempt:' .. owner .. ':' .. attemptId then return {'ERR', 'bad_attempt_key'} end
 -- Provider payment identity, fixed before any provider call.
 local payReq = incoming['paymentRequestId']
 if type(payReq) ~= 'string' or #payReq ~= 30 or not string.match(payReq, '^pay_[a-z0-9]+$') then
@@ -670,7 +680,7 @@ async function reapExpiredHolds(): Promise<void> {
     // Bounded batch, oldest-expired first. A large backlog or a provider
     // outage is worked off across many passes; one request never processes
     // every expired order.
-    const expiredIds = await redis.zrange<string[]>(PENDING_HOLDS_KEY, "-inf", now, {
+    const expiredIds = await redis.zrange<string[]>(pendingHoldsKey(), "-inf", now, {
       byScore: true,
       offset: 0,
       count: HOLD_EXPIRY_BATCH_SIZE,
@@ -716,7 +726,7 @@ async function reconcileExpiredHold(orderId: string): Promise<HoldOutcome> {
   if (!order || order.status !== "pending") {
     // Already resolved elsewhere (a webhook, another pass, or a stale
     // entry) — drop it so we stop re-checking.
-    await redis.zrem(PENDING_HOLDS_KEY, orderId);
+    await redis.zrem(pendingHoldsKey(), orderId);
     return "continue";
   }
 
@@ -757,7 +767,7 @@ async function reconcileExpiredHold(orderId: string): Promise<HoldOutcome> {
   }
   if (first.result === "retained" || first.result === "conflict") {
     // applyDecision already recorded the flag (and index entry).
-    await redis.zrem(PENDING_HOLDS_KEY, orderId);
+    await redis.zrem(pendingHoldsKey(), orderId);
     return "continue";
   }
   if (first.result !== "not_final") {
@@ -810,7 +820,7 @@ async function reconcileExpiredHold(orderId: string): Promise<HoldOutcome> {
     return "continue";
   }
   if (second.result === "retained" || second.result === "conflict") {
-    await redis.zrem(PENDING_HOLDS_KEY, orderId);
+    await redis.zrem(pendingHoldsKey(), orderId);
     return "continue";
   }
   // Still non-terminal (or anomalous) after a cancellation: retain, flag,
@@ -894,12 +904,12 @@ export async function reserveBookingAttempt(
     [
       inventoryKey(order.eventId, order.tierName),
       orderKey(order.id),
-      PENDING_HOLDS_KEY,
+      pendingHoldsKey(),
       inventoryInitKey(order.eventId, order.tierName),
       guestOrdersKey(order.ownerHash ?? ""),
       bookingAttemptKey(order.ownerHash ?? "", order.attemptId ?? ""),
     ],
-    [JSON.stringify(order), String(totalInventory), String(MAX_INVENTORY)]
+    [JSON.stringify(order), String(totalInventory), String(MAX_INVENTORY), redisKeyPrefix()]
   );
   const code = resultCode(result);
   if (code === "OK") return { result: "created" };
@@ -943,7 +953,7 @@ export async function transitionOrder(
 
   const result = await evalScript(
     TRANSITION_SCRIPT,
-    [orderKey(id), inventoryKey(order.eventId, order.tierName), PENDING_HOLDS_KEY],
+    [orderKey(id), inventoryKey(order.eventId, order.tierName), pendingHoldsKey()],
     [
       id,
       from,
@@ -1039,7 +1049,7 @@ export async function listGuestOrders(ownerHash: string, limit: number): Promise
 // lock, not a queue.
 // ---------------------------------------------------------------------------
 function webhookEventKey(eventId: string) {
-  return `webhook_event:${eventId}`;
+  return rk(`webhook_event:${eventId}`);
 }
 
 export async function isWebhookEventProcessed(eventId: string): Promise<boolean> {
@@ -1077,7 +1087,7 @@ async function recordReconciliation(
   const flag = JSON.stringify({ reason: reason.slice(0, 64), at });
   const result = await evalScript(
     RECORD_RECONCILE_SCRIPT,
-    [orderKey(orderId), PENDING_HOLDS_KEY, reconcileKey(orderId), RECONCILE_INDEX_KEY],
+    [orderKey(orderId), pendingHoldsKey(), reconcileKey(orderId), reconcileIndexKey()],
     [orderId, flag, String(at), mode, requireNoPaymentId ? "1" : "0"]
   );
   const code = resultCode(result);
@@ -1109,7 +1119,7 @@ async function retainAndDequeue(
 // consume the whole budget — cannot starve the rest of the queue. XX: never
 // re-adds a hold that a concurrent transition has already removed.
 async function deferHold(orderId: string): Promise<void> {
-  await redis.zadd(PENDING_HOLDS_KEY, { xx: true }, { score: Date.now(), member: orderId });
+  await redis.zadd(pendingHoldsKey(), { xx: true }, { score: Date.now(), member: orderId });
 }
 
 export async function getReconciliationFlag(orderId: string): Promise<ReconcileFlag | null> {
@@ -1219,7 +1229,15 @@ export async function reconcileRetrievedPayment(
   const bound = bindPaymentToOrder(order, pp, requestedPaymentId);
   if (bound.kind === "retry") return { result: "not_ready", reason: bound.reason };
   if (bound.kind === "reject") return { result: "mismatch", reason: bound.reason };
-  return applyDecision(order, decideFromStatus(pp.status));
+  return applyDecision(order, await decideForPayment(pp));
+}
+
+// The status decision for a bound payment. Only a FAILED payment needs more
+// than its status: it is final (and its seats released) only when its
+// profile has manual retry off — see failedPaymentFinality.
+async function decideForPayment(pp: ProviderPayment, options?: ProviderRequestOptions): Promise<Decision> {
+  if (pp.status !== "failed") return decideFromStatus(pp.status);
+  return decideFromStatus(pp.status, (await failedPaymentFinality(pp, options)) === "final");
 }
 
 // Retrieve + reconcile by payment id. Used by the webhook (which has only a
@@ -1251,7 +1269,10 @@ async function reconcileKnownOrder(
   const bound = bindPaymentToOrder(order, retrieved.payment, paymentId);
   if (bound.kind === "reject") return { result: "mismatch", reason: bound.reason };
   if (bound.kind === "retry") return { result: "not_ready", reason: bound.reason };
-  return applyDecision(order, decideFromStatus(retrieved.payment.status));
+  return applyDecision(
+    order,
+    await decideForPayment(retrieved.payment, { timeoutMs: FAILED_FINALITY_EXPIRY_TIMEOUT_MS })
+  );
 }
 
 // Lightweight "how much interest is this event getting right now"

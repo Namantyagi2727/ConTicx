@@ -315,7 +315,7 @@ describe("[regression] payment-to-order binding", () => {
   it("rejects a provider response MISSING the merchant id when one is configured (422)", async () => {
     const { orderId, paymentId } = await createOrder();
     getFake().getPayment(paymentId)!.status = "succeeded";
-    expect(getFake().getPayment(paymentId)!.merchant_id).toBeUndefined();
+    getFake().getPayment(paymentId)!.merchant_id = undefined;
     process.env.HYPERSWITCH_MERCHANT_ID = "merchant_expected";
 
     const res = await webhook(signed(bodyFor(paymentId)));
@@ -396,8 +396,9 @@ describe("[regression] justified transitions from authoritative status", () => {
     expect(await counter()).toBe(before); // still a single (no-release) effect
   });
 
-  it("retains inventory on a failed payment (failed may be retried) and acknowledges", async () => {
+  it("retains inventory on a failed payment its profile lets be retried, and acknowledges", async () => {
     const { orderId, paymentId } = await createOrder();
+    getFake().manualRetryEnabled = true;
     getFake().getPayment(paymentId)!.status = "failed";
     const before = await counter();
 
@@ -407,6 +408,37 @@ describe("[regression] justified transitions from authoritative status", () => {
     expect((await res.json()).reason).toBe("failed_retained");
     expect(await statusOf(orderId)).toBe("pending"); // not released
     expect(await counter()).toBe(before); // inventory NOT returned
+  });
+
+  it("releases inventory on a failed payment that can never be retried, and acknowledges", async () => {
+    // The sandbox profile: manual retry unset, and the provider refuses to
+    // confirm a failed payment again.
+    const { orderId, paymentId } = await createOrder();
+    const afterReserve = await counter();
+    getFake().getPayment(paymentId)!.status = "failed";
+
+    const res = await webhook(signed(bodyFor(paymentId)));
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).reason).toBe("released");
+    expect(await statusOf(orderId)).toBe("failed");
+    expect(await counter()).toBe(afterReserve + 1); // seat returned once
+    const again = await webhook(signed(bodyFor(paymentId)));
+    expect(again.status).toBe(200);
+    expect(await counter()).toBe(afterReserve + 1); // never twice
+  });
+
+  it("retains a failed payment when its profile cannot be read", async () => {
+    const { orderId, paymentId } = await createOrder();
+    getFake().profileReadFails = true;
+    getFake().getPayment(paymentId)!.status = "failed";
+    const before = await counter();
+
+    const res = await webhook(signed(bodyFor(paymentId)));
+
+    expect((await res.json()).reason).toBe("failed_retained");
+    expect(await statusOf(orderId)).toBe("pending");
+    expect(await counter()).toBe(before);
   });
 
   it("releases inventory on a cancelled (terminal, unpaid) payment", async () => {

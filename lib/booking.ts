@@ -38,8 +38,12 @@ import {
   flagForReconciliation,
   markPaymentAttempt,
   peekOrder,
+  reconcileRetrievedPayment,
   releasePaymentLease,
 } from "./store";
+
+// Provider statuses after which a payment cannot simply be confirmed again.
+const OUTCOME_STATUSES = new Set(["succeeded", "failed", "cancelled", "expired"]);
 import { isValidPaymentId } from "./webhook-security";
 import type { Order } from "./types";
 
@@ -107,6 +111,16 @@ async function resume(order: Order, paymentId: string): Promise<EnsurePaymentRes
     return processing(order, `attached_payment_${retrieved.category}`, retrieved.category === "not_found");
   }
   if (!bindsToOrder(order, retrieved.payment)) return processing(order, "payment_identity_mismatch", true);
+  // A payment that already reached an outcome is reconciled first (the same
+  // shared policy as the webhook and status paths), instead of handing the
+  // shopper a widget that the provider will refuse to confirm. If the order
+  // is still pending afterwards (e.g. a failed payment whose profile allows
+  // manual retry), the widget is offered as before.
+  if (OUTCOME_STATUSES.has(retrieved.payment.status)) {
+    await reconcileRetrievedPayment(retrieved.payment, paymentId);
+    const current = (await peekOrder(order.id)) ?? order;
+    if (current.status !== "pending") return { kind: "closed", order: current };
+  }
   if (!retrieved.payment.client_secret) return processing(order, "client_secret_unavailable", false);
   return { kind: "ready", order, clientSecret: retrieved.payment.client_secret };
 }
