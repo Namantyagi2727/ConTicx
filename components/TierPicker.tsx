@@ -3,11 +3,12 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { MAX_QUANTITY_PER_ORDER } from "@/lib/constants";
+import { HOLD_DURATION_MS, MAX_QUANTITY_PER_ORDER } from "@/lib/constants";
 import { formatCents } from "@/lib/format";
 import { posterColorClasses } from "@/lib/theme";
 import type { EventRecord, TierAvailability } from "@/lib/types";
 import { newBookingAttemptId } from "@/lib/guest-client";
+import { Icon } from "./Icon";
 
 // A tier reads as low-stock once fewer than a fifth of its total
 // inventory remains — real enough to be worth flagging, not so
@@ -63,7 +64,7 @@ export function TierPicker({
 
   return (
     <div className="mt-5">
-      <div className="grid gap-4 sm:grid-cols-2">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
         {availability.map((tier) => {
           const soldOut = tier.remaining === 0;
           const lowStock =
@@ -82,7 +83,7 @@ export function TierPicker({
                   ? "cursor-not-allowed border-ink-line opacity-40"
                   : isSelected
                     ? `${colors.border} bg-ink-raised`
-                    : "border-ink-line bg-ink-raised hover:border-text-faint"
+                    : "border-ink-line bg-ink-raised hover:border-text-muted"
               }`}
             >
               {isSelected && !soldOut && (
@@ -102,19 +103,19 @@ export function TierPicker({
 
               <div className="mt-4">
                 {!bookingEnabled ? (
-                  <span className="font-mono text-[11px] text-text-faint">
+                  <span className="font-mono text-xs text-text-faint">
                     {tier.totalInventory} capacity
                   </span>
                 ) : soldOut ? (
-                  <span className="font-mono text-[11px] font-bold text-text-faint">
+                  <span className="font-mono text-xs font-bold text-text-muted">
                     SOLD OUT
                   </span>
                 ) : lowStock ? (
-                  <span className="rounded-full bg-acid px-2 py-0.5 font-mono text-[11px] font-bold text-ink">
+                  <span className="rounded-full bg-acid px-2 py-0.5 font-mono text-xs font-bold text-ink">
                     ONLY {tier.remaining} LEFT
                   </span>
                 ) : (
-                  <span className="font-mono text-[11px] text-text-faint">
+                  <span className="font-mono text-xs text-text-faint">
                     {tier.remaining} available
                   </span>
                 )}
@@ -126,7 +127,7 @@ export function TierPicker({
 
       {!bookingEnabled ? (
         <div className="mt-6 border border-dashed border-ink-line p-4">
-          <p className="font-mono text-[11px] font-bold tracking-wide text-acid">
+          <p className="font-mono text-xs font-bold tracking-wide text-acid">
             BROWSE-ONLY DEMO
           </p>
           <p className="mt-1 font-body text-sm text-text-muted">
@@ -136,41 +137,50 @@ export function TierPicker({
           </p>
         </div>
       ) : maxSelectable > 0 ? (
-        <div className="mt-6 flex items-center gap-4">
-          <div className="flex items-center border border-ink-line">
+        <div className="mt-5">
+          <div className="flex items-stretch gap-3">
+            <div role="group" aria-label="Quantity" className="flex items-center border border-ink-line">
+              <button
+                type="button"
+                onClick={() => setQuantity((q) => Math.max(1, q - 1))}
+                disabled={quantity <= 1}
+                aria-label="Fewer tickets"
+                className="flex h-12 w-11 items-center justify-center text-text-muted transition-colors hover:text-text disabled:opacity-30"
+              >
+                <Icon name="minus" />
+              </button>
+              <output aria-live="polite" className="w-8 text-center font-mono text-lg font-bold">
+                {quantity}
+              </output>
+              <button
+                type="button"
+                onClick={() => setQuantity((q) => Math.min(maxSelectable, q + 1))}
+                disabled={quantity >= maxSelectable}
+                aria-label="More tickets"
+                className="flex h-12 w-11 items-center justify-center text-text-muted transition-colors hover:text-text disabled:opacity-30"
+              >
+                <Icon name="plus" />
+              </button>
+            </div>
+
             <button
-              type="button"
-              onClick={() => setQuantity((q) => Math.max(1, q - 1))}
-              disabled={quantity <= 1}
-              aria-label="Decrease quantity"
-              className="px-3 py-2 font-mono text-lg text-text-muted transition-colors hover:text-text disabled:opacity-30"
+              onClick={handleBuy}
+              disabled={isNavigating}
+              className="flex min-h-12 flex-1 items-center justify-center gap-2 bg-flame px-3 text-center font-display text-lg font-bold tracking-wide text-ink transition-[transform,filter] duration-150 hover:-translate-y-0.5 hover:brightness-110 active:translate-y-0 disabled:opacity-60"
             >
-              −
-            </button>
-            <span className="w-10 text-center font-mono text-lg font-bold">
-              {quantity}
-            </span>
-            <button
-              type="button"
-              onClick={() => setQuantity((q) => Math.min(maxSelectable, q + 1))}
-              disabled={quantity >= maxSelectable}
-              aria-label="Increase quantity"
-              className="px-3 py-2 font-mono text-lg text-text-muted transition-colors hover:text-text disabled:opacity-30"
-            >
-              +
+              {isNavigating && <span className="spinner" aria-hidden />}
+              {isNavigating
+                ? "RESERVING…"
+                : `GET TICKETS — ${formatCents(selected.priceCents * quantity)}`}
             </button>
           </div>
-
-          <button
-            onClick={handleBuy}
-            disabled={isNavigating}
-            className="flex flex-1 items-center justify-center gap-2 bg-flame py-3 text-center font-display text-lg font-bold tracking-wide text-ink transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-60"
-          >
-            {isNavigating && <span className="spinner" aria-hidden />}
-            {isNavigating
-              ? "RESERVING…"
-              : `GET TICKETS — ${formatCents(selected.priceCents * quantity)}`}
-          </button>
+          <p className="mt-3 flex items-start gap-2 font-body text-sm text-text-faint">
+            <Icon name="clock" size={16} className="mt-0.5 shrink-0" />
+            <span>
+              Seats are held for {Math.round(HOLD_DURATION_MS / 60_000)} minutes at checkout.
+              Sandbox test payment — no real charge.
+            </span>
+          </p>
         </div>
       ) : allSoldOut ? (
         <div className="mt-6">
@@ -180,9 +190,9 @@ export function TierPicker({
           </p>
           <Link
             href="/"
-            className="mt-2 inline-block font-mono text-xs text-text underline underline-offset-4"
+            className="mt-2 inline-flex min-h-11 items-center gap-1.5 font-body text-sm text-text underline underline-offset-4"
           >
-            ← Browse other shows
+            <Icon name="arrow-left" size={16} /> Browse other shows
           </Link>
         </div>
       ) : (

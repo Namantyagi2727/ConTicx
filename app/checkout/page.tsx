@@ -13,6 +13,7 @@ import {
 import { getEvent } from "@/lib/events";
 import { formatCents } from "@/lib/format";
 import { BROWSE_ONLY_NOTE, ensureGuestSession, newBookingAttemptId } from "@/lib/guest-client";
+import { Icon } from "@/components/Icon";
 
 // Load Hyper lazily and once: only when a booking is ready to pay. A page
 // that never gets that far — the browse-only demo, a refused or failed
@@ -57,14 +58,51 @@ function friendlyPaymentError(message: string | undefined): string {
 
 // Hyperswitch sandbox test cards, from the provider's published list for its
 // dummy connector (the sandbox's test processor). No real money moves.
+const TEST_CARDS = [
+  { label: "Payment succeeds", number: "4242 4242 4242 4242" },
+  { label: "Payment is declined", number: "4000 0000 0000 0002" },
+];
+
 function SandboxCardHelp() {
+  const [copied, setCopied] = useState<string | null>(null);
+
+  async function copy(number: string) {
+    try {
+      await navigator.clipboard.writeText(number.replace(/ /g, ""));
+      setCopied(number);
+      setTimeout(() => setCopied((c) => (c === number ? null : c)), 1800);
+    } catch {
+      // Clipboard blocked: the number is on screen to type instead.
+    }
+  }
+
   return (
-    <div className="mb-4 border border-acid/40 bg-acid/5 p-3 font-mono text-[11px] leading-relaxed text-text-muted">
-      <p className="font-bold tracking-wide text-acid">SANDBOX PAYMENT — NO REAL MONEY</p>
-      <p className="mt-1">
-        Pay with the test card <span className="text-text">4242 4242 4242 4242</span>, any future
-        expiry, any 3-digit CVC. To see a decline, use{" "}
-        <span className="text-text">4000 0000 0000 0002</span>. Don&apos;t enter a real card.
+    <div className="mb-5 rounded-sm border border-acid/40 bg-acid/[0.06] p-4">
+      <p className="font-body text-sm font-semibold text-acid">Sandbox payment — no real money</p>
+      <p className="mt-1 font-body text-sm text-text-muted">
+        Use a test card with any future expiry and any 3-digit CVC. Don&apos;t enter a real card.
+      </p>
+      <ul className="mt-3 divide-y divide-ink-line border-y border-ink-line">
+        {TEST_CARDS.map((card) => (
+          <li key={card.number} className="flex items-center justify-between gap-3 py-1.5">
+            <div>
+              <p className="font-mono text-sm font-bold text-text">{card.number}</p>
+              <p className="font-body text-xs text-text-muted">{card.label}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => copy(card.number)}
+              className="inline-flex min-h-11 items-center gap-1.5 px-2 font-body text-sm text-text-muted transition-colors hover:text-text"
+            >
+              <Icon name={copied === card.number ? "check" : "copy"} size={16} />
+              {copied === card.number ? "Copied" : "Copy"}
+              <span className="sr-only"> {card.number}</span>
+            </button>
+          </li>
+        ))}
+      </ul>
+      <p className="sr-only" aria-live="polite">
+        {copied ? `Copied ${copied}` : ""}
       </p>
     </div>
   );
@@ -275,8 +313,8 @@ function CheckoutContent() {
       <StatusCard title="That's not a valid order" tone="flame">
         We couldn&apos;t tell which tickets you meant. Head back and pick an
         event to start over.
-        <Link href="/" className="mt-4 block underline underline-offset-4">
-          ← All shows
+        <Link href="/" className="mt-4 inline-flex min-h-11 items-center gap-1.5 underline underline-offset-4">
+          <Icon name="arrow-left" size={16} /> All shows
         </Link>
       </StatusCard>
     );
@@ -400,6 +438,8 @@ function CheckoutContent() {
           CHECKOUT
         </h1>
         <div
+          role="timer"
+          aria-label="Time left on your seat hold"
           className={`font-mono text-2xl font-bold tabular-nums ${
             urgent ? "animate-pulse text-flame" : "text-text"
           }`}
@@ -407,7 +447,7 @@ function CheckoutContent() {
           {clock}
         </div>
       </div>
-      <p className="text-right font-body text-xs text-text-muted">
+      <p className="mt-1 text-right font-body text-sm text-text-muted">
         We&apos;re holding your tickets for {clock}
         {urgent ? " — check out now, they're about to be released." : "."}
       </p>
@@ -468,7 +508,7 @@ function CheckoutContent() {
 
       {/* Reloading this page resumes this same booking; a separate booking
           is a deliberate, different action. */}
-      <p className="mt-4 text-center font-body text-xs text-text-faint">
+      <p className="mt-4 text-center font-body text-sm text-text-faint">
         Reloading keeps this booking and its hold.{" "}
         <Link href={`/events/${event.id}`} className="text-text underline underline-offset-2">
           Start a separate booking
@@ -608,9 +648,20 @@ function PaymentForm({
     <form onSubmit={handleSubmit}>
       <SandboxCardHelp />
       {!widgetReady && (
-        <p className="mb-3 flex items-center gap-2 font-mono text-xs text-text-muted" role="status">
-          <span className="spinner" aria-hidden /> Loading the secure sandbox payment form…
-        </p>
+        <div role="status" className="mb-4">
+          <div aria-hidden className="space-y-3 motion-safe:animate-pulse">
+            <div className="h-12 rounded-sm bg-ink-line/70" />
+            <div className="h-11 rounded-sm bg-ink-line/50" />
+            <div className="grid grid-cols-2 gap-3">
+              <div className="h-11 rounded-sm bg-ink-line/50" />
+              <div className="h-11 rounded-sm bg-ink-line/50" />
+            </div>
+          </div>
+          <p className="mt-3 flex items-center gap-2 font-body text-sm text-text-muted">
+            <span className="spinner" aria-hidden /> Loading the secure payment form from
+            Hyperswitch — this can take a few seconds.
+          </p>
+        </div>
       )}
       <UnifiedCheckout
         id="unified-checkout"
@@ -620,7 +671,7 @@ function PaymentForm({
       <button
         type="submit"
         disabled={isSubmitting || !widgetReady}
-        className="mt-4 flex w-full items-center justify-center gap-2 bg-flame py-3 text-center font-display text-lg font-bold tracking-wide text-ink transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50"
+        className="mt-4 flex min-h-12 w-full items-center justify-center gap-2 bg-flame py-3 text-center font-display text-lg font-bold tracking-wide text-ink transition-[transform,filter] duration-150 hover:-translate-y-0.5 hover:brightness-110 active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:translate-y-0 disabled:hover:brightness-100"
       >
         {isSubmitting && <span className="spinner" aria-hidden />}
         {isSubmitting ? "PROCESSING…" : `PAY ${total}`}
@@ -644,7 +695,7 @@ function PaymentForm({
         </div>
       )}
 
-      <p className="mt-3 text-center font-mono text-[10px] tracking-wide text-text-faint">
+      <p className="mt-3 text-center font-mono text-xs tracking-wide text-text-faint">
         PAYMENTS SECURED BY HYPERSWITCH
       </p>
     </form>

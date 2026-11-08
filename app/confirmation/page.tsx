@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { Icon } from "@/components/Icon";
 import { SAME_BROWSER_NOTE } from "@/lib/guest-client";
 
 // Old confirmation links (Phase 1B.4 and earlier) identified a ticket by
@@ -18,13 +19,13 @@ export default function LegacyConfirmationPage() {
           Confirmation links like this one aren&apos;t used anymore. If you
           bought tickets in this browser, they&apos;re in My Tickets.
         </p>
-        <p className="mt-3 font-body text-xs text-text-faint">{SAME_BROWSER_NOTE}</p>
-        <div className="mt-4 flex justify-center gap-5">
-          <Link href="/my-tickets" className="font-mono text-xs text-text underline underline-offset-4">
-            My tickets
+        <p className="mt-3 font-body text-sm text-text-faint">{SAME_BROWSER_NOTE}</p>
+        <div className="mt-3 flex flex-wrap justify-center gap-x-6">
+          <Link href="/my-tickets" className="inline-flex min-h-11 items-center gap-1.5 font-body text-sm text-text underline underline-offset-4">
+            <Icon name="ticket" size={16} /> My tickets
           </Link>
-          <Link href="/" className="font-mono text-xs text-text underline underline-offset-4">
-            ← Browse shows
+          <Link href="/" className="inline-flex min-h-11 items-center gap-1.5 font-body text-sm text-text underline underline-offset-4">
+            <Icon name="arrow-left" size={16} /> Browse shows
           </Link>
         </div>
       </div>

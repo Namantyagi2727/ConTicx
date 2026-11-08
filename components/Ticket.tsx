@@ -5,6 +5,7 @@ import Link from "next/link";
 import QRCode from "qrcode";
 import { getEvent } from "@/lib/events";
 import { buildEventIcs, icsFileName } from "@/lib/calendar";
+import { Icon } from "./Icon";
 import { formatCents, formatDateStamp, formatDoorsTime, formatTime } from "@/lib/format";
 import { SAME_BROWSER_NOTE } from "@/lib/guest-client";
 import { posterColorClasses } from "@/lib/theme";
@@ -56,7 +57,7 @@ export function Ticket({ order }: { order: OrderView }) {
 
         <div className="p-6 pb-5">
           <div className="flex items-center justify-between">
-            <span className="font-mono text-[11px] font-bold tracking-widest text-paper-ink/50">
+            <span className="font-mono text-xs font-bold tracking-widest text-paper-ink/70">
               CONTICX · E-TICKET
             </span>
             {colors && (
@@ -73,7 +74,7 @@ export function Ticket({ order }: { order: OrderView }) {
                 {event.artist}
               </p>
               {stamp && (
-                <p className="mt-3 font-mono text-[11px] font-bold tracking-wide text-paper-ink/70">
+                <p className="mt-3 font-mono text-xs font-bold tracking-wide text-paper-ink/80">
                   {stamp.weekday} {stamp.month} {stamp.day} · DOORS{" "}
                   {formatDoorsTime(event.date, event.doorsMinutesBeforeShow, event.venueTimeZone)} · SHOW{" "}
                   {formatTime(event.date, event.venueTimeZone)} · {event.venue.toUpperCase()}
@@ -120,11 +121,11 @@ export function Ticket({ order }: { order: OrderView }) {
             )}
           </div>
           <div className="min-w-0">
-            <p className="font-mono text-[10px] tracking-widest text-paper-ink/50">
+            <p className="font-mono text-xs tracking-widest text-paper-ink/70">
               ORDER
             </p>
             <p className="truncate font-mono text-sm font-bold">{order.id}</p>
-            <p className="mt-3 font-mono text-[10px] tracking-widest text-paper-ink/50">
+            <p className="mt-3 font-mono text-xs tracking-widest text-paper-ink/70">
               STATUS
             </p>
             <p className="font-mono text-sm font-bold">
@@ -150,29 +151,30 @@ export function Ticket({ order }: { order: OrderView }) {
           <button
             type="button"
             onClick={() => downloadCalendarFile(event, order)}
-            className="mb-4 inline-flex items-center gap-2 border border-ink-line px-4 py-2 font-mono text-xs font-bold tracking-wide text-text transition-colors hover:border-flame hover:text-flame"
+            className="mb-4 inline-flex min-h-11 items-center gap-2 border border-ink-line px-4 font-mono text-sm font-bold tracking-wide text-text transition-colors hover:border-flame hover:text-flame"
           >
+            <Icon name="calendar" size={16} />
             ADD TO CALENDAR (.ics)
           </button>
         )}
         {!refunded && (
-          <p className="font-body text-xs text-text-faint">
+          <p className="font-body text-sm text-text-faint">
             Online cancellation and refunds aren&apos;t available yet.
           </p>
         )}
-        <p className="mt-2 font-body text-xs text-text-faint">{SAME_BROWSER_NOTE}</p>
-        <div className="mt-4 flex justify-center gap-5">
+        <p className="mt-2 font-body text-sm text-text-faint">{SAME_BROWSER_NOTE}</p>
+        <div className="mt-3 flex flex-wrap justify-center gap-x-6">
           <Link
             href="/my-tickets"
-            className="font-mono text-xs text-text underline underline-offset-4"
+            className="inline-flex min-h-11 items-center gap-1.5 font-body text-sm text-text underline underline-offset-4"
           >
-            My tickets
+            <Icon name="ticket" size={16} /> My tickets
           </Link>
           <Link
             href="/"
-            className="font-mono text-xs text-text underline underline-offset-4"
+            className="inline-flex min-h-11 items-center gap-1.5 font-body text-sm text-text underline underline-offset-4"
           >
-            ← Browse other shows
+            <Icon name="arrow-left" size={16} /> Browse other shows
           </Link>
         </div>
       </div>

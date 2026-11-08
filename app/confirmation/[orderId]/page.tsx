@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
+import { Icon } from "@/components/Icon";
 import { Ticket } from "@/components/Ticket";
 import { getEvent } from "@/lib/events";
 import { BROWSE_ONLY_NOTE, SAME_BROWSER_NOTE } from "@/lib/guest-client";
@@ -150,7 +151,7 @@ function ConfirmationContent({ orderId }: { orderId: string }) {
             CHECK AGAIN
           </button>
         )}
-        <span className="mt-3 block font-body text-xs text-text-faint">
+        <span className="mt-3 block font-body text-sm text-text-faint">
           {SAME_BROWSER_NOTE}
         </span>
       </StatusLine>
@@ -165,7 +166,7 @@ function ConfirmationContent({ orderId }: { orderId: string }) {
       {event && (
         <Link
           href={`/events/${event.id}`}
-          className="mt-4 inline-block bg-flame px-4 py-2 font-display text-sm font-bold tracking-wide text-ink no-underline"
+          className="mt-4 inline-flex min-h-11 items-center bg-flame px-4 font-display text-sm font-bold tracking-wide text-ink no-underline transition-[filter] hover:brightness-110"
         >
           TRY AGAIN — {event.name.toUpperCase()}
         </Link>
@@ -176,12 +177,12 @@ function ConfirmationContent({ orderId }: { orderId: string }) {
 
 function BackLinks() {
   return (
-    <span className="mt-4 flex justify-center gap-5">
-      <Link href="/my-tickets" className="font-mono text-xs text-text underline underline-offset-4">
-        My tickets
+    <span className="mt-3 flex flex-wrap justify-center gap-x-6">
+      <Link href="/my-tickets" className="inline-flex min-h-11 items-center gap-1.5 font-body text-sm text-text underline underline-offset-4">
+        <Icon name="ticket" size={16} /> My tickets
       </Link>
-      <Link href="/" className="font-mono text-xs text-text underline underline-offset-4">
-        ← Browse shows
+      <Link href="/" className="inline-flex min-h-11 items-center gap-1.5 font-body text-sm text-text underline underline-offset-4">
+        <Icon name="arrow-left" size={16} /> Browse shows
       </Link>
     </span>
   );
@@ -197,7 +198,7 @@ function StatusLine({
   showSpinner?: boolean;
 }) {
   return (
-    <div className="mx-auto max-w-sm border border-ink-line bg-ink-raised p-6 text-center">
+    <div role="status" className="mx-auto max-w-sm border border-ink-line bg-ink-raised p-6 text-center">
       {showSpinner && (
         <span className="spinner mb-2 inline-block text-text-muted" aria-hidden />
       )}
