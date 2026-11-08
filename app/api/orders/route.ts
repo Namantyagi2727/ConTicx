@@ -21,6 +21,7 @@ import { newPaymentRequestId } from "@/lib/hyperswitch";
 import { ensureOrderPayment } from "@/lib/booking";
 import { checkRequestOrigin } from "@/lib/app-origin";
 import { authenticateGuest, ownsOrder } from "@/lib/guest-session";
+import { limitNewBooking, rateLimitedResponse } from "@/lib/rate-limit";
 import {
   isValidAttemptId,
   jsonNoStore,
@@ -124,6 +125,13 @@ async function handleBooking(request: Request, log: RequestLog): Promise<Respons
   // established safely (e.g. a lost counter), refuse rather than guess.
   const alreadyBound = await peekBookingAttempt(guest.ownerHash, attemptId);
   if (!alreadyBound) {
+    // Only a NEW booking attempt is charged against the demo's limits; a
+    // retry of an existing attempt always resumes it.
+    const limited = await limitNewBooking(request, guest.ownerHash);
+    if (!limited.ok) {
+      log.set({ reason: `rate_limited_${limited.bucket}` });
+      return rateLimitedResponse(limited);
+    }
     let remaining: number;
     try {
       remaining = await getRemainingInventory(event.id, tier.name, tier.totalInventory);

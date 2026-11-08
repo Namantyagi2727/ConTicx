@@ -3,6 +3,7 @@ import { errorKind, runLogged, type RequestLog } from "@/lib/log";
 import { bookingUnavailable } from "@/lib/app-mode";
 import { peekOrder, reconcileRetrievedPayment } from "@/lib/store";
 import { isValidPaymentId } from "@/lib/webhook-security";
+import { limitStatusCheck, rateLimitedResponse } from "@/lib/rate-limit";
 import {
   jsonNoStore,
   loadOwnedOrder,
@@ -47,6 +48,13 @@ async function handle(
   if (lookup.kind === "not_found") return orderNotFound();
   // Only an order this caller owns is named in the log.
   log.set({ orderId: lookup.order.id });
+  // Each refresh reads the provider; bound how often a guest (and the demo
+  // as a whole) can trigger one.
+  const limited = await limitStatusCheck(lookup.order.ownerHash ?? "");
+  if (!limited.ok) {
+    log.set({ reason: `rate_limited_${limited.bucket}` });
+    return rateLimitedResponse(limited);
+  }
 
   let order = lookup.order;
   if (order.paymentId && !isValidPaymentId(order.paymentId)) {

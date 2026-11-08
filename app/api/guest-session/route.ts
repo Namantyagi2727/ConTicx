@@ -1,7 +1,8 @@
 import { checkRequestOrigin } from "@/lib/app-origin";
 import { errorKind, logEvent } from "@/lib/log";
 import { bookingUnavailable } from "@/lib/app-mode";
-import { establishGuestSession } from "@/lib/guest-session";
+import { authenticateGuest, establishGuestSession } from "@/lib/guest-session";
+import { limitNewGuestSession, rateLimitedResponse } from "@/lib/rate-limit";
 import { jsonNoStore, originRejected } from "@/lib/order-access";
 
 // Establishes (or renews) this browser's guest session BEFORE a booking is
@@ -20,6 +21,12 @@ export async function POST(request: Request) {
   if (!origin.ok) return originRejected(origin);
 
   try {
+    // Only issuing a NEW credential counts against the demo's limits; a
+    // browser that already holds a live session just renews it.
+    if (!(await authenticateGuest(request))) {
+      const limited = await limitNewGuestSession(request);
+      if (!limited.ok) return rateLimitedResponse(limited);
+    }
     const session = await establishGuestSession(request);
     return jsonNoStore({ ok: true }, 200, { "Set-Cookie": session.setCookie });
   } catch (err) {

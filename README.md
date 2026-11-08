@@ -17,12 +17,22 @@ listed below.
 
 There are two ways to see it.
 
-**1. Public demo — browse-only: <https://conticx.vercel.app>.** The site
-runs with booking switched off: the home and event pages work, and every
-booking, order, ticket, and webhook route refuses with `503 browse_only`
-*on the server* before touching Redis or Hyperswitch. Browsing cannot
-reserve seats, run hold expiry, or call the payment provider. It serves the
-latest release — see [Release and hosting status](#release-and-hosting-status).
+**1. Public sandbox demo: <https://conticx.vercel.app>.** The full booking
+flow, live, against the real **Hyperswitch sandbox** — no real money moves,
+and the shows and tickets are fictional. Pick a show and tier, press **Get
+tickets**, and pay in the Hyperswitch widget with a sandbox test card:
+
+| Card | Result |
+| --- | --- |
+| `4242 4242 4242 4242` | payment succeeds — you get a ticket |
+| `4000 0000 0000 0002` | payment is declined — nothing is charged, the seat is released |
+
+Any future expiry and any 3-digit CVC work (the provider's published test
+cards for its dummy test connector). Don't enter a real card. The ticket
+then shows on the confirmation page and in **My Tickets** in the same
+browser, with an **Add to calendar** download. The demo has modest usage
+limits; if it says it is busy, try again a few minutes later. See
+[Release and hosting status](#release-and-hosting-status).
 
 **2. Full booking flow — locally, with a simulated payment provider.** The
 checkout harness runs the real app against a local Redis and an in-process
@@ -103,12 +113,14 @@ flowchart LR
 | Prices are computed on the server from the catalog; the client sends only event, tier, quantity, and a booking-attempt id. | The browser never decides what it pays. |
 | Each state change is one Redis Lua script that validates inputs and key types *before* its first write. | Lua does not roll back; checking first means a failure can't leave a half-written reservation. Concurrent buyers can't oversell. |
 | Webhooks are authenticated (HMAC-SHA512 over the raw body) and treated only as notifications; the app re-reads the payment from Hyperswitch and binds it to the order (id, order, amount, currency) before acting. | A forged or stale webhook can't mark an order paid. |
-| One provider status → action policy for webhooks, status refreshes, and expiry; a failed payment is retained, not released. | The three paths can't disagree, and a retryable failure doesn't free a seat. |
+| One provider status → action policy for webhooks, status refreshes, and expiry. A failed payment releases its seat only when its business profile, read from the provider, has manual retry off; otherwise it is retained. | The three paths can't disagree, and a failure that could still be retried never frees a seat. |
 | Guest ownership instead of accounts: a 256-bit HttpOnly session cookie; only its SHA-256 hash is stored, bound to each order inside the reservation. | Order ids and payment ids are not access credentials. Missing and foreign orders get the same 404. |
 | A booking attempt id (per *Get tickets* click) is bound atomically to one order. | Reloads, retries, lost responses, and concurrent submissions return the same order, hold, and price instead of booking again. |
 | The provider `payment_id` is chosen and stored before any provider call; every creation retry reuses it. | Relies on Hyperswitch's documented creation idempotency for merchant-provided ids, so retries don't create unrelated payments. |
 | Payment creation never releases seats; uncertain or refused outcomes are kept and flagged for reconciliation. | No provider response proves a payment doesn't exist; seats are released only on authoritative evidence. |
-| `CONTICX_MODE=full` is the only way to enable booking. | A deployment that forgets the setting fails safe (browse-only). |
+| `CONTICX_MODE=full` is the only way to enable booking, and full mode refuses to run unless the provider settings are a Hyperswitch sandbox. | A deployment that forgets the setting fails safe (browse-only); one holding live keys can't take a payment. |
+| All Redis keys can live under a namespace (`CONTICX_REDIS_PREFIX`). | The public demo shares a database with older data without reading, writing, or counting it. |
+| Modest Redis-backed usage limits on new guest sessions, new bookings, and status refreshes; retries of an existing booking are never charged. | Bounds public traffic (and sandbox provider calls) without breaking idempotent retries or webhooks. |
 | Structured JSON logs with server-generated request ids and an allow-list of fields. | Requests can be correlated without logging cookies, owner hashes, client secrets, bodies, or provider payloads. |
 
 The full reasoning, failure tables, and provider-contract sources are in
@@ -177,14 +189,20 @@ npm run dev
 | Variable | Purpose |
 | --- | --- |
 | `CONTICX_MODE` | `full` enables booking; anything else is browse-only |
-| `APP_ORIGIN` | The app's exact origin, e.g. `http://localhost:3000`; browser mutations from any other origin are refused |
+| `APP_ORIGIN` | The app's exact origin; browser mutations from any other origin are refused. Use `http://conticx.localhost:3000` (and open that address) — see below |
+| `CONTICX_REDIS_PREFIX` | Optional key namespace, e.g. `dev1` |
+| `CONTICX_RATE_LIMITS` / `CONTICX_DEMO_BOOKINGS_PER_HOUR` | `off` disables the usage limits; the hourly overall booking cap (default 60, daily cap 5×) |
 | `HYPERSWITCH_API_KEY` / `NEXT_PUBLIC_HYPERSWITCH_PUBLISHABLE_KEY` | Sandbox keys (`snd_` / `pk_snd_`) |
 | `HYPERSWITCH_BASE_URL` | `https://sandbox.hyperswitch.io` |
 | `HYPERSWITCH_WEBHOOK_SECRET` | The business profile's `payment_response_hash_key`; without it webhooks are refused |
 | `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | A Redis database used only for this app |
 
-Use isolated test resources only. Real Hyperswitch behaviour has not been
-verified as part of this project (see limitations).
+Use isolated test resources only. **Don't use `http://localhost` with the
+real sandbox:** the sandbox API's edge rejects any request whose body
+contains a loopback URL (`localhost`, `127.0.0.1`) with a 403, and the
+widget's confirm call carries the return URL — so the payment never
+completes. A `*.localhost` name such as `conticx.localhost` resolves to
+your machine in Chrome and is accepted.
 
 ### Browse-only
 
@@ -201,7 +219,7 @@ npm test                   # unit + integration (Docker test Redis required)
 npm run build
 ```
 
-239 tests in 27 files (45 unit, 194 integration). Integration tests drive the
+263 tests in 30 files (54 unit, 209 integration). Integration tests drive the
 real route handlers against a dedicated local Redis (behind the same REST
 protocol as Upstash) and an in-process fake Hyperswitch, and assert on raw
 stored state and recorded provider calls — not only HTTP responses. A
@@ -216,7 +234,14 @@ real service. Highlights:
   window;
 - the real checkout component under React Strict Mode (jsdom);
 - calendar file content, structured logs and secret exclusion, and
-  browse-only enforcement.
+  browse-only enforcement;
+- the public-sandbox guards: key-namespace isolation, sandbox-only provider
+  settings, usage limits, and declined-payment finality read from the
+  payment's profile.
+
+The provider behaviour the code relies on was also checked against the real
+Hyperswitch sandbox; the observations are recorded in
+[`docs/testing.md`](docs/testing.md#observed-sandbox-contract).
 
 `scripts/spike-test.ts` fires concurrent bookings at a running local
 instance and checks the raw inventory counter. Details of what each suite
@@ -245,20 +270,24 @@ No external monitoring service or logging dependency is used.
 
 ## Known limitations and deferred work
 
-- **Not verified against real Hyperswitch.** Webhook delivery and signing,
-  redirect and wallet returns, duplicate-`payment_id` behaviour, and
-  retrieval semantics follow the documentation and upstream source, but have
-  not been exercised against the sandbox. Hosted Upstash parity is likewise
-  unverified.
+- **Sandbox only.** Verified against the Hyperswitch sandbox with its dummy
+  card connector (success, decline, cancellation, duplicate `payment_id`,
+  retrieval, profile reads); 3DS, redirect, and wallet flows have not been
+  exercised. Nothing here is set up for live payments.
 - **No background recovery.** Uncertain or refused payment outcomes, and
-  payment-less expired holds, stay held and flagged in `reconcile_needed`;
-  nothing resolves them yet, and flags are not cleared automatically.
+  payment-less expired holds, stay held and flagged in `reconcile_needed`
+  until a verified provider status resolves them; flags are not cleared
+  automatically. [`docs/operations.md`](docs/operations.md) has the operator
+  report and re-check.
+- **The hosted card form can be slow to appear** — the Hyperswitch widget
+  loads from the provider; Pay stays disabled until it is ready.
 - **Refunds and the organizer view are disabled.** The refund endpoint
   answers `503`; there is no admin login.
 - **Same-browser tickets only.** No accounts, email, or cross-device
   recovery; clearing browser data removes access. Two brand-new tabs racing
   on a first visit can end up with different guest sessions.
-- **No rate limiting** on any route.
+- **Usage limits are coarse.** Fixed windows per client address, guest, and
+  overall; clients behind one shared address share its allowance.
 - **Fictional catalog.** Three hard-coded shows dated autumn 2026, all at
   Brooklyn venues. Event dates, doors times, and show times are displayed in
   each venue's own IANA time zone (`America/New_York`) on every page and
@@ -268,20 +297,20 @@ No external monitoring service or logging dependency is used.
   viewer's zone. (v0.1.0 used the server's zone, which put times on the UTC
   host four hours late; fixed in v0.1.1.)
 - **Not production-ready.** No load testing, no production deployment
-  review, no real payments.
+  review, no live payments.
 
 ## Release and hosting status
 
 Releases are tagged and published on
 [GitHub](https://github.com/Namantyagi2727/ConTicx/releases):
-**v0.1.0** (portfolio release,
-[notes](docs/release-notes/v0.1.0.md)) and **v0.1.1** (venue-time display
-fix, [notes](docs/release-notes/v0.1.1.md)).
+**v0.1.0** (portfolio release, [notes](docs/release-notes/v0.1.0.md)),
+**v0.1.1** (venue-time display fix, [notes](docs/release-notes/v0.1.1.md)),
+and **v0.2.0** (public sandbox booking, [notes](docs/release-notes/v0.2.0.md)).
 
-The public demo at <https://conticx.vercel.app> is a browse-only Production
-build of the latest release tag, deployed manually with the Vercel CLI from
-a clean export of that tag. Each release's GitHub page records its
-deployment; [`docs/deploy-prerequisites.md`](docs/deploy-prerequisites.md)
+The public demo at <https://conticx.vercel.app> is a Production build of the
+latest release tag running in full sandbox mode, deployed manually with the
+Vercel CLI from a clean export of that tag (v0.1.x ran browse-only). Each
+release's GitHub page records its deployment; [`docs/deploy-prerequisites.md`](docs/deploy-prerequisites.md)
 describes how the build is made and its provenance. Automatic Vercel Git
 deployments stay disabled in [`vercel.json`](vercel.json), so merging to
 `main` does not change the hosted demo. Standard Deployment Protection keeps
@@ -293,4 +322,6 @@ every other deployment URL, including older builds, behind Vercel login.
   failure tables, provider-contract sources.
 - [`docs/deploy-prerequisites.md`](docs/deploy-prerequisites.md) — what must
   be true before anything is deployed.
+- [`docs/operations.md`](docs/operations.md) — keeping the public sandbox
+  demo usable: settings, the operator report, unresolved orders, fresh data.
 - [`docs/walkthrough.md`](docs/walkthrough.md) — demo recording script.
